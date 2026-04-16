@@ -38,6 +38,14 @@ DINV usage, can be used to find unused items in defined priorities. It can also 
 
 <img width="770" height="133" alt="2026-04-16 22_27_18-Aardwolf - Mudlet 4 20 1" src="https://github.com/user-attachments/assets/9adbc653-6b5e-46ce-a7eb-312bf75bc505" />
 
+DINV consumables, buying potions/pills
+
+<img width="1036" height="522" alt="2026-04-16 23_13_13-Aardwolf - Mudlet 4 20 1" src="https://github.com/user-attachments/assets/58ce4d22-5e51-4820-beaf-59205bfbf43c" />
+
+
+Most messages can be turned off.
+
+
 And much more! As always, use at your own risk! There may be bugs!
 
 
