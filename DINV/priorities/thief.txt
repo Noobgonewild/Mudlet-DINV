@@ -1,0 +1,38 @@
+-- DINV Priority: thief
+-- After editing, run: dinv priority import thief
+
+levels       1-291  
+str          1.50   
+int          0.00   
+wis          0.00   
+dex          2.00   
+con          0.00   
+luck         1.00   
+dam          2.00   
+hit          0.50   
+avedam       5.00   
+offhandDam   5.00   
+hp           0.00   
+mana         0.00   
+moves        0.00   
+sanctuary    500.00 
+haste        0.00   
+flying       0.00   
+invis        0.00   
+regeneration 0.00   
+detectinvis  0.00   
+detecthidden 0.00   
+detectevil   0.00   
+detectgood   0.00   
+dualwield    500.00 
+irongrip     500.00 
+shield       0.00   
+allmagic     0.00   
+allphys      0.00   
+maxint       0.00   
+maxwis       0.00   
+maxluck      0.00   
+maxstr       0.00   
+maxdex       0.00   
+maxcon       0.00   
+~second      0.00   

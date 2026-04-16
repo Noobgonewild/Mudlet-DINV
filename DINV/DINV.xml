@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE MudletPackage>
+<MudletPackage version="1.001">
+  <ScriptPackage>
+    <ScriptGroup isActive="yes" isFolder="yes">
+      <name>DINV</name>
+      <packageName>DINV</packageName>
+      <script></script>
+      <eventHandlerList/>
+      <Script isActive="yes" isFolder="no">
+        <name>DINV_Loader</name>
+        <packageName>DINV</packageName>
+        <script>----------------------------------------------------------------------------------------------------
+-- DINV - Durel's Inventory Manager for Mudlet
+-- Ported from MUSHclient plugin aard_inventory.xml
+----------------------------------------------------------------------------------------------------
+
+DINV = DINV or {}
+DINV.version = { major = 2, minor = 56 }
+
+-- Get the Mudlet profile directory for module loading
+local profilePath = getMudletHomeDir()
+DINV.modulePath = profilePath .. "/DINV/"
+
+----------------------------------------------------------------------------------------------------
+-- Module Loader
+----------------------------------------------------------------------------------------------------
+
+function DINV.loadModule(name)
+    local path = DINV.modulePath .. name .. ".lua"
+    local file = io.open(path, "r")
+    if file then
+        file:close()
+        local chunk, err = loadfile(path)
+        if chunk then
+            local ok, result = pcall(chunk)
+            if ok then
+                return true
+            else
+                cecho("&lt;red&gt;[DINV] Error executing " .. name .. ": " .. tostring(result) .. "\n")
+            end
+        else
+            cecho("&lt;red&gt;[DINV] Error loading " .. name .. ": " .. tostring(err) .. "\n")
+        end
+    else
+        cecho("&lt;orange&gt;[DINV] Module not found: " .. path .. "\n")
+    end
+    return false
+end
+
+----------------------------------------------------------------------------------------------------
+-- Initialize DINV
+----------------------------------------------------------------------------------------------------
+
+function DINV.initialize()
+    cecho("\n&lt;cyan&gt;[DINV] Initializing Durel's Inventory Manager v" .. 
+          DINV.version.major .. "." .. DINV.version.minor .. "\n")
+    
+    -- Load modules in order
+    local modules = {
+        "dinv_dbot",        -- Core utilities
+        "dinv_notify",      -- Notification channel controls
+        "dinv_inv_core",    -- Inventory core
+        "dinv_debug",       -- Debug utilities
+        "dinv_inv_config",  -- Configuration
+        "dinv_inv_items",   -- Item management
+        "dinv_discovery",   -- Inventory discovery triggers
+        "dinv_inv_cache",   -- Item cache
+        "dinv_inv_priority",-- Stat priorities
+        "dinv_inv_score",   -- Item scoring
+        "dinv_inv_set",     -- Equipment sets
+        "dinv_inv_weapon",  -- Weapon sets
+        "dinv_inv_snapshot",-- Snapshots
+        "dinv_inv_analyze", -- Analysis
+        "dinv_levelup",     -- Level-up notification mode/settings
+        "dinv_inv_usage",   -- Usage tracking
+        "dinv_inv_compare", -- Item comparison
+        "dinv_inv_statbonus",-- Stat bonuses
+        "dinv_inv_consume", -- Consumables
+        "dinv_inv_portal",  -- Portals
+        "dinv_inv_pass",    -- Area passes
+        "dinv_inv_regen",   -- Regen ring
+        "dinv_inv_organize",-- Organization
+        "dinv_inv_keyword", -- Keywords
+        "dinv_inv_tags",    -- Command tags
+        "dinv_inv_unused",  -- Unused items
+        "dinv_inv_discover",-- Discover command helpers
+        "dinv_inv_report",  -- Report output
+        "dinv_rid",         -- Rid test reporting
+        "dinv_cli",         -- CLI routing
+        "dinv_triggers",    -- Mudlet triggers
+        "dinv_aliases",     -- Mudlet aliases
+    }
+    
+    local loaded = 0
+    local failedModules = {}
+    for _, module in ipairs(modules) do
+        if DINV.loadModule(module) then
+            loaded = loaded + 1
+        else
+            table.insert(failedModules, module)
+        end
+    end
+
+    cecho("&lt;cyan&gt;[DINV] Loaded " .. loaded .. " modules\n")
+    if #failedModules &gt; 0 then
+        cecho("&lt;yellow&gt;[DINV] Failed to load " .. #failedModules .. " modules (" .. table.concat(failedModules, ", ") .. ")\n")
+    end
+    
+    -- Initialize if critical modules loaded
+    if dbot and inv then
+        -- Initialize dbot
+        if dbot.init and dbot.init.atInstall then
+            dbot.init.atInstall()
+        end
+        
+        -- Initialize inv
+        if inv.init and inv.init.atInstall then
+            inv.init.atInstall()
+        end
+        
+        -- Register triggers and aliases
+        if DINV.triggers and DINV.triggers.init then
+            DINV.triggers.init()
+        end
+
+        if DINV.discovery and DINV.discovery.init then
+            DINV.discovery.init()
+        end
+
+        if DINV.aliases and DINV.aliases.init then
+            DINV.aliases.init()
+        end
+
+        -- Register GMCP handlers (base/status)
+        DINV.registerGMCPHandlers()
+        
+        cecho("&lt;green&gt;[DINV] Initialization complete!\n\n")
+        return true
+    else
+        cecho("&lt;red&gt;[DINV] Critical modules failed to load!\n")
+        return false
+    end
+end
+
+----------------------------------------------------------------------------------------------------
+-- GMCP Event Handlers
+----------------------------------------------------------------------------------------------------
+
+function DINV.registerGMCPHandlers()
+    registerAnonymousEventHandler("gmcp.char.base", "DINV.onGMCPCharBase")
+    registerAnonymousEventHandler("gmcp.char.status", "DINV.onGMCPCharStatus")
+end
+
+function DINV.onGMCPCharBase()
+    if dbot and dbot.gmcp then
+        dbot.gmcp.isInitialized = true
+        if inv and inv.init and inv.init.atActive and not inv.init.initializedActive then
+            inv.init.atActive()
+        end
+    end
+end
+
+function DINV.onGMCPCharStatus()
+    if dbot and dbot.gmcp and dbot.gmcp.updateState then
+        dbot.gmcp.updateState()
+    end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Auto-start check
+----------------------------------------------------------------------------------------------------
+
+local checkPath = DINV.modulePath .. "dinv_dbot.lua"
+local checkFile = io.open(checkPath, "r")
+if checkFile then
+    checkFile:close()
+    tempTimer(1, function() DINV.initialize() end)
+else
+    cecho("\n&lt;orange&gt;DINV: Module files not found at: " .. DINV.modulePath .. "\n")
+    cecho("&lt;cyan&gt;DINV: Please copy DINV module files to that directory, then run:\n")
+    cecho("&lt;yellow&gt;       lua DINV.initialize()\n\n")
+end
+</script>
+        <eventHandlerList/>
+      </Script>
+    </ScriptGroup>
+  </ScriptPackage>
+  <TriggerPackage>
+    <TriggerGroup isActive="yes" isFolder="yes">
+      <name>DINV_Triggers</name>
+      <packageName>DINV</packageName>
+      <script></script>
+      <triggerType>0</triggerType>
+      <conditonLineDelta>0</conditonLineDelta>
+      <mStayOpen>0</mStayOpen>
+      <mCommand></mCommand>
+      <mFgColor>#ff0000</mFgColor>
+      <mBgColor>#ffff00</mBgColor>
+      <colorTriggerFg>false</colorTriggerFg>
+      <colorTriggerBg>false</colorTriggerBg>
+      <isMultiline>false</isMultiline>
+      <isPerlSlashGOption>false</isPerlSlashGOption>
+      <isColorizerTrigger>false</isColorizerTrigger>
+      <isFilterTrigger>false</isFilterTrigger>
+      <isSoundTrigger>false</isSoundTrigger>
+      <isColorTrigger>false</isColorTrigger>
+      <isColorTriggerFg>false</isColorTriggerFg>
+      <isColorTriggerBg>false</isColorTriggerBg>
+      <Trigger isActive="yes" isFolder="no">
+        <name>invmon</name>
+        <script>if inv and inv.items and inv.items.trigger and inv.items.trigger.invmon then
+    inv.items.trigger.invmon(matches[2], matches[3], matches[4], matches[5])
+end
+local allowOutput = DINV and DINV.debug and DINV.debug.isEnabled and DINV.debug.isEnabled("invmon")
+if not allowOutput then
+    deleteLine()
+end</script>
+        <triggerType>1</triggerType>
+        <conditonLineDelta>0</conditonLineDelta>
+        <mStayOpen>0</mStayOpen>
+        <mCommand></mCommand>
+        <regexCodeList>
+          <string>^\{invmon\}(.*?),(.*?),(.*?),(.*?)$</string>
+        </regexCodeList>
+        <regexCodePropertyList>
+          <integer>1</integer>
+        </regexCodePropertyList>
+      </Trigger>
+      <Trigger isActive="yes" isFolder="no">
+        <name>invitem</name>
+        <script>if inv and inv.items and inv.items.trigger and inv.items.trigger.invitem then
+    inv.items.trigger.invitem(matches[2], matches[3])
+end</script>
+        <triggerType>1</triggerType>
+        <conditonLineDelta>0</conditonLineDelta>
+        <mStayOpen>0</mStayOpen>
+        <mCommand></mCommand>
+        <regexCodeList>
+          <string>^\{invitem\}(.*?),(.*?)$</string>
+        </regexCodeList>
+        <regexCodePropertyList>
+          <integer>1</integer>
+        </regexCodePropertyList>
+      </Trigger>
+      <Trigger isActive="yes" isFolder="no">
+        <name>invdata</name>
+        <script>if inv and inv.items and inv.items.trigger and inv.items.trigger.invdata then
+    inv.items.trigger.invdata(matches[2])
+end</script>
+        <triggerType>1</triggerType>
+        <conditonLineDelta>0</conditonLineDelta>
+        <mStayOpen>0</mStayOpen>
+        <mCommand></mCommand>
+        <regexCodeList>
+          <string>^\{invdata\}(.*)$</string>
+        </regexCodeList>
+        <regexCodePropertyList>
+          <integer>1</integer>
+        </regexCodePropertyList>
+      </Trigger>
+      <Trigger isActive="yes" isFolder="no">
+        <name>eqdata</name>
+        <script>if inv and inv.items and inv.items.trigger and inv.items.trigger.eqdata then
+    inv.items.trigger.eqdata(matches[2])
+end</script>
+        <triggerType>1</triggerType>
+        <conditonLineDelta>0</conditonLineDelta>
+        <mStayOpen>0</mStayOpen>
+        <mCommand></mCommand>
+        <regexCodeList>
+          <string>^\{eqdata\}(.*)$</string>
+        </regexCodeList>
+        <regexCodePropertyList>
+          <integer>1</integer>
+        </regexCodePropertyList>
+      </Trigger>
+      <Trigger isActive="yes" isFolder="no" isTempTrigger="no" isMultiline="no" isPerlSlashGOption="no" isColorizerTrigger="no" isFilterTrigger="no" isSoundTrigger="no" isColorTrigger="no" isColorTriggerFg="no" isColorTriggerBg="no">
+        <name>You raise a level!</name>
+        <script>local mode = (inv and inv.levelup and inv.levelup.getArmedMode and inv.levelup.getArmedMode()) or nil
+local defaultPriority = (inv and inv.priority and inv.priority.getDefault and inv.priority.getDefault()) or "navi"
+
+if not mode then
+    if inv and inv.levelup and inv.levelup.getDebug and inv.levelup.getDebug() then
+        dbot.printRaw("@D[DINV DEBUG] XML levelup trigger fired but levelup mode is OFF; skipping dry run.@w")
+    end
+    return
+end
+
+if inv and inv.levelup and inv.levelup.getDebug and inv.levelup.getDebug() then
+    dbot.printRaw(string.format(
+        "@D[DINV DEBUG] XML levelup trigger fired: priority='@Y%s@D', mode='@W%s@D'.@w",
+        tostring(defaultPriority), tostring(mode)))
+end
+
+expandAlias("dinv set test " .. tostring(defaultPriority) .. " " .. tostring(mode), false)</script>
+        <triggerType>0</triggerType>
+        <conditonLineDelta>0</conditonLineDelta>
+        <mStayOpen>0</mStayOpen>
+        <mCommand></mCommand>
+        <packageName></packageName>
+        <mFgColor>#ff0000</mFgColor>
+        <mBgColor>#ffff00</mBgColor>
+        <mSoundFile></mSoundFile>
+        <colorTriggerFgColor>#000000</colorTriggerFgColor>
+        <colorTriggerBgColor>#000000</colorTriggerBgColor>
+        <regexCodeList>
+          <string>You raise a level*</string>
+        </regexCodeList>
+        <regexCodePropertyList>
+          <integer>1</integer>
+        </regexCodePropertyList>
+      </Trigger>
+    </TriggerGroup>
+  </TriggerPackage>
+  <AliasPackage/>
+  <KeyPackage/>
+  <TimerPackage/>
+</MudletPackage>
