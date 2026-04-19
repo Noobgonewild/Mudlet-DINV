@@ -505,6 +505,13 @@ function inv.organize.processInventory()
     local pkg = inv.organize.runPkg
     if not pkg then return end
 
+    local function isIgnoredDestination(containerId)
+        if containerId == nil then
+            return false
+        end
+        return inv.config and inv.config.isIgnored and inv.config.isIgnored(containerId) == true
+    end
+
     dbot.debug("Organize: Processing " .. #pkg.inventoryItems .. " inventory items", "organize")
 
     local ruleCount = 0
@@ -534,15 +541,22 @@ function inv.organize.processInventory()
                     dbot.debug(string.format("Organize: Item %s (%s) matches rule for container %s",
                         item.objId, item.typeName, rule.containerId), "organize")
 
-                    table.insert(pkg.pendingCommands, {
-                        itemId = item.objId,
-                        containerId = rule.containerId,
-                        itemName = item.itemName,
-                        containerName = rule.containerName,
-                        destination = "rule"
-                    })
-                    didMatchRule = true
-                    ruleCount = ruleCount + 1
+                    if isIgnoredDestination(rule.containerId) then
+                        dbot.debug(string.format("Organize: Skipping rule destination for item %s because container %s is ignored",
+                            tostring(item.objId), tostring(rule.containerId)), "organize")
+                        keptCount = keptCount + 1
+                        didMatchRule = true
+                    else
+                        table.insert(pkg.pendingCommands, {
+                            itemId = item.objId,
+                            containerId = rule.containerId,
+                            itemName = item.itemName,
+                            containerName = rule.containerName,
+                            destination = "rule"
+                        })
+                        didMatchRule = true
+                        ruleCount = ruleCount + 1
+                    end
                     break  -- Only organize to first matching container
                 end
             end
@@ -550,14 +564,20 @@ function inv.organize.processInventory()
             if not didMatchRule then
                 local fallbackContainer = inv.items.resolveStoreContainer(item.objId)
                 if fallbackContainer then
-                    table.insert(pkg.pendingCommands, {
-                        itemId = item.objId,
-                        containerId = fallbackContainer,
-                        itemName = item.itemName,
-                        containerName = fallbackContainer,
-                        destination = "fallback"
-                    })
-                    fallbackCount = fallbackCount + 1
+                    if isIgnoredDestination(fallbackContainer) then
+                        dbot.debug(string.format("Organize: Skipping fallback destination for item %s because container %s is ignored",
+                            tostring(item.objId), tostring(fallbackContainer)), "organize")
+                        keptCount = keptCount + 1
+                    else
+                        table.insert(pkg.pendingCommands, {
+                            itemId = item.objId,
+                            containerId = fallbackContainer,
+                            itemName = item.itemName,
+                            containerName = fallbackContainer,
+                            destination = "fallback"
+                        })
+                        fallbackCount = fallbackCount + 1
+                    end
                 else
                     keptCount = keptCount + 1
                 end

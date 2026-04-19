@@ -40,6 +40,13 @@ inv.items.progress = inv.items.progress or {
     startTime = 0,
     lastUpdate = 0,
 }
+inv.items.progress.reportMode = inv.items.progress.reportMode or "classic"
+if inv.items.progress.reportMode ~= "classic" and inv.items.progress.reportMode ~= "inline" then
+    inv.items.progress.reportMode = "classic"
+end
+inv.items.progress.inlineActive = inv.items.progress.inlineActive or false
+inv.items.progress.inlineLineNum = inv.items.progress.inlineLineNum or nil
+inv.items.progress.inlinePlainText = inv.items.progress.inlinePlainText or nil
 
 
 -- Refresh identify follow-up state
@@ -55,6 +62,113 @@ function inv.items.getProgressString()
     end
     local pct = math.floor((p.current / p.total) * 100)
     return string.format("%s: %d/%d (%d%%)", p.stage, p.current, p.total, pct)
+end
+
+function inv.items.getReportMode()
+    if inv.config and inv.config.getReportMode then
+        local configured = inv.config.getReportMode()
+        if configured == "classic" or configured == "inline" then
+            inv.items.progress.reportMode = configured
+            return configured
+        end
+    end
+    return inv.items.progress.reportMode or "classic"
+end
+
+function inv.items.setReportMode(mode)
+    local normalized = tostring(mode or ""):lower()
+    if normalized ~= "classic" and normalized ~= "inline" then
+        return DRL_RET_INVALID_PARAM
+    end
+
+    inv.items.clearInlineProgress()
+    inv.items.progress.reportMode = normalized
+
+    if inv.config and inv.config.setReportMode then
+        return inv.config.setReportMode(normalized)
+    end
+    return DRL_RET_SUCCESS
+end
+
+function inv.items.finalizeInlineProgress()
+    if not inv.items.progress then
+        return
+    end
+    inv.items.progress.inlineActive = false
+    inv.items.progress.inlineLineNum = nil
+    inv.items.progress.inlinePlainText = nil
+end
+
+local function deleteMainConsoleLine(lineNum)
+    if type(lineNum) ~= "number" or not moveCursor then
+        return false
+    end
+
+    if not moveCursor("main", 0, lineNum) then
+        return false
+    end
+
+    if deleteLine then
+        local ok = pcall(deleteLine, "main")
+        if ok then
+            return true
+        end
+
+        ok = pcall(deleteLine)
+        if ok then
+            return true
+        end
+    end
+
+    if selectCurrentLine and replace then
+        selectCurrentLine("main")
+        replace("")
+        return true
+    end
+
+    return false
+end
+
+function inv.items.deleteInlineProgressLine()
+    if not (inv.items.progress and inv.items.progress.inlineActive) then
+        return false
+    end
+
+    if getLines and getLineCount then
+        local targetText = inv.items.progress.inlinePlainText
+        local totalLines = getLineCount()
+
+        if targetText and targetText ~= "" and totalLines and totalLines > 0 then
+            local searchStart = math.max(0, totalLines - 30)
+            local lines = getLines("main", searchStart, totalLines) or {}
+            for lineNum = totalLines, searchStart, -1 do
+                local idx = (lineNum - searchStart) + 1
+                local lineText = lines[idx]
+                if lineText and lineText:find(targetText, 1, true) then
+                    if deleteMainConsoleLine(lineNum) then
+                        return true
+                    end
+                end
+            end
+        end
+
+        local lineNum = inv.items.progress.inlineLineNum
+        if lineNum and lineNum <= totalLines and deleteMainConsoleLine(lineNum) then
+            return true
+        end
+    end
+
+    return false
+end
+
+function inv.items.clearInlineProgress()
+    if not (inv.items.progress and inv.items.progress.inlineActive) then
+        return
+    end
+
+    inv.items.deleteInlineProgressLine()
+
+    inv.items.finalizeInlineProgress()
 end
 
 function inv.items.showProgress(stage, current, total, itemName)
@@ -83,25 +197,50 @@ function inv.items.showProgress(stage, current, total, itemName)
     local empty = barWidth - filled
     local bar = barColor .. string.rep("=", filled) .. "@w" .. string.rep("-", empty)
 
+    local mode = inv.items.getReportMode()
+
     -- Build message with Aardwolf color codes
     local msg = string.format("@w[%s@w] @W%d%% @w(%d/%d)", bar, pct, current, total)
 
+    local cleanedItemName = nil
     if itemName then
         -- Strip enchant text from display name
         local displayName = itemName:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%)%s*", "")
         displayName = displayName:gsub("%s+%(removable[^%)]*%)%s*", "")
-
-        local plainName = dbot.stripColors and dbot.stripColors(displayName) or displayName
-        if #plainName > 40 then
-            msg = msg .. " " .. plainName:sub(1, 37) .. "..."
-        else
-            msg = msg .. " " .. displayName
-        end
+        cleanedItemName = dbot.stripColors and dbot.stripColors(displayName) or displayName
+        msg = msg .. " " .. displayName
     end
 
     -- Convert Aardwolf codes and print
     local converted = dbot.convertColors and dbot.convertColors(msg) or msg
-    cecho("\n<cyan>[DINV] " .. stage .. ": <reset>" .. converted .. "\n")
+    local plainConverted = dbot.stripColors and dbot.stripColors(converted) or converted
+    local fullMsg = "<cyan>[DINV] " .. stage .. ": <reset>" .. converted
+
+    -- Inline mode is sensitive to missing/stripped color conversions. Force-append
+    -- the plain item name to guarantee it remains visible in the rendered line.
+    if mode == "inline"
+        and cleanedItemName and cleanedItemName ~= ""
+        and not (plainConverted and plainConverted:find(cleanedItemName, 1, true)) then
+        fullMsg = fullMsg .. " <reset>" .. cleanedItemName
+        plainConverted = plainConverted .. " " .. cleanedItemName
+    end
+
+    if mode == "inline" then
+        -- Always delete the previously tracked progress line (if any) before
+        -- printing the new one. Do NOT special-case 100% — progress.total can
+        -- grow mid-flow when new items are queued, so a "100%" update may be
+        -- followed by more updates, and those must still overwrite it.
+        inv.items.deleteInlineProgressLine()
+
+        cecho(fullMsg .. "\n")
+        inv.items.progress.inlineActive = true
+        inv.items.progress.inlineLineNum = (getLineCount and getLineCount()) or nil
+        inv.items.progress.inlinePlainText = "[DINV] " .. stage .. ": " .. plainConverted
+        return
+    end
+
+    inv.items.clearInlineProgress()
+    cecho(fullMsg .. "\n")
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -2153,6 +2292,7 @@ function inv.items.identifyPartialItems()
 end
 
 function inv.items.startIdentification()
+    inv.items.clearInlineProgress()
     inv.items.identifyQueue = {}
     inv.items.identifyIndex = 0
 
@@ -2565,6 +2705,7 @@ function inv.items.handleIdentifyFence(fallbackObjId)
 end
 
 function inv.items.buildComplete()
+    inv.items.finalizeInlineProgress()
     if inv.items.singleIdentifyMode then
         local singleId = inv.items.singleIdentifyId
         inv.items.singleIdentifyMode = false
@@ -2667,6 +2808,7 @@ function inv.items.buildAbort()
     end
 
     -- Stop everything
+    inv.items.clearInlineProgress()
     inv.items.buildInProgress = false
     inv.items.identifyInProgress = false
     inv.items.identifyQueue = {}
@@ -3141,7 +3283,7 @@ function inv.items.isWearableLoc(wearableLoc)
     if wearableLoc == nil or wearableLoc == "" then
         return false
     end
-    return inv.wearLoc and inv.wearLoc[wearableLoc] ~= nil
+    return inv.wearLocNames and inv.wearLocNames[wearableLoc] == true
 end
 
 function inv.items.isWearableType(wearableType)
@@ -4017,9 +4159,13 @@ function inv.items.put(containerName, query, endTag)
     local skipped = 0
     for _, objId in ipairs(itemIds) do
         local currentLoc = inv.items.getStatField(objId, invStatFieldLocation) or ""
-        local isWornLoc = inv.items.isWornLocation and inv.items.isWornLocation(objId, currentLoc) or (currentLoc == invItemLocWorn)
-        local normalizedLoc = inv.items.normalizeContainerId(currentLoc)
-        local containerLoc = isWornLoc and nil or normalizedLoc
+        local isWornLoc = inv.items.isWornLocation(objId, currentLoc)
+        local containerLoc
+        if isWornLoc then
+            containerLoc = nil
+        else
+            containerLoc = inv.items.normalizeContainerId(currentLoc)
+        end
 
         if containerLoc == targetContainerId then
             skipped = skipped + 1
@@ -4100,9 +4246,13 @@ function inv.items.store(query, endTag)
         local itemType = string.lower(tostring(inv.items.getStatField(objId, invStatFieldType) or ""))
         local targetContainerId = targetContainerByType[itemType]
         local currentLoc = tostring(inv.items.getStatField(objId, invStatFieldLocation) or "")
-        local isWornLoc = inv.items.isWornLocation and inv.items.isWornLocation(objId, currentLoc) or (currentLoc == invItemLocWorn)
-        local normalizedLoc = inv.items.normalizeContainerId(currentLoc)
-        local containerLoc = isWornLoc and nil or normalizedLoc
+        local isWornLoc = inv.items.isWornLocation(objId, currentLoc)
+        local containerLoc
+        if isWornLoc then
+            containerLoc = nil
+        else
+            containerLoc = inv.items.normalizeContainerId(currentLoc)
+        end
 
         if targetContainerId == nil then
             targetContainerId = inv.items.resolveStoreContainer(objId)
@@ -4233,47 +4383,53 @@ function inv.items.normalizeContainerId(containerId)
         return nil
     end
     local value = tostring(containerId)
-    if value == "" then
+    if value == "" or value == "0" then
         return nil
     end
     if not value:match("^%d+$") then
         return nil
     end
-    if value == "0" then
+    -- Wear-slot ids (0-32) are never container ids.
+    if inv.wearLoc and inv.wearLoc[tonumber(value)] ~= nil then
         return nil
     end
     return value
 end
 
-function inv.items.isWearLocId(locId)
-    local value = tonumber(locId)
-    if value == nil then
-        return false
+-- Returns the canonical wear-slot name for value, or nil if value is not a wear slot.
+-- Accepts: numeric id ("24"), slot name ("wielded"), or invItemLocWorn ("worn").
+function inv.items.resolveWearSlot(value)
+    if value == nil then return nil end
+    local s = tostring(value)
+    if s == "" or s == invItemLocInventory or s == invItemLocKeyring then
+        return nil
     end
-    return inv.items.wearLocById and inv.items.wearLocById[value] ~= nil
+    if s == invItemLocWorn then
+        return invItemLocWorn
+    end
+    local n = tonumber(s)
+    if n ~= nil then
+        if inv.wearLoc and inv.wearLoc[n] ~= nil then
+            return inv.wearLoc[n]
+        end
+        return nil
+    end
+    if inv.wearLocNames and inv.wearLocNames[s] then
+        return s
+    end
+    return nil
+end
+
+function inv.items.isWearSlot(value)
+    return inv.items.resolveWearSlot(value) ~= nil
 end
 
 function inv.items.isWornLocation(objId, locationValue)
-    local currentLoc = tostring(locationValue or "")
-    if currentLoc == invItemLocWorn then
+    if inv.items.isWearSlot(locationValue) then
         return true
     end
-
     local wornField = tostring(inv.items.getStatField(objId, invStatFieldWorn) or "")
-    if wornField ~= "" and wornField ~= "undefined" then
-        return true
-    end
-
-    local wearLocNum = tonumber(currentLoc)
-    if wearLocNum == nil then
-        return false
-    end
-
-    if inv.items.isWearLocId and inv.items.isWearLocId(wearLocNum) then
-        return true
-    end
-
-    return inv.wearLoc and inv.wearLoc[wearLocNum] ~= nil
+    return wornField ~= "" and wornField ~= "undefined"
 end
 
 function inv.items.wearItem(objId, wearLoc, commandArray)

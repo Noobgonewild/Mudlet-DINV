@@ -20,7 +20,7 @@ inv.cli.commands = {
     -- Equipment analysis
     "analyze", "usage", "compare", "covet",
     -- Advanced options
-    "backup", "notify", "debug", "levelup", "forget", "ignore", "reset", "cache", "tags", "regen",
+    "backup", "progress", "notify", "debug", "levelup", "forget", "ignore", "reset", "cache", "tags", "regen",
     -- Using equipment
     "portal", "consume", "pass",
     -- About the plugin
@@ -148,7 +148,7 @@ Usage:
     dinv help <command> - Show detailed help for a specific command
     
 Available topics: build, refresh, search, query, set, priority, analyze,
-                  report, compare, covet, snapshot, weapon, portal, consume,
+                  report, progress, compare, covet, snapshot, weapon, portal, consume,
                   backup, notify, debug, levelup, unused, and more.
 ]])
 end
@@ -203,6 +203,7 @@ function inv.cli.fullUsage()
     if inv.cli.cache and inv.cli.cache.usage then inv.cli.cache.usage() end
     if inv.cli.tags and inv.cli.tags.usage then inv.cli.tags.usage() end
     if inv.cli.regen and inv.cli.regen.usage then inv.cli.regen.usage() end
+    if inv.cli.progress and inv.cli.progress.usage then inv.cli.progress.usage() end
 
     dbot.printRaw("@CUsing Equipment:@w")
     if inv.cli.portal and inv.cli.portal.usage then inv.cli.portal.usage() end
@@ -498,7 +499,7 @@ inv.cli.report = {}
 
 function inv.cli.report.fn(name, line, wildcards)
     local tokens = wildcards or {}
-    local action = tokens[1]
+    local action = tostring(tokens[1] or ""):lower()
     local channel = inv.report and inv.report.getChannel and inv.report.getChannel() or "echo"
 
     if action == nil or action == "" then
@@ -566,6 +567,57 @@ Usage:
     dinv report @G<itemid>@W                 - Report an item summary to the configured channel
     dinv report @G<itemname>@W               - Run a search (reports require an id)
     dinv report set @G<priority> [level]@W   - Report set bonuses for a priority
+]])
+end
+
+----------------------------------------------------------------------------------------------------
+-- Progress Command
+----------------------------------------------------------------------------------------------------
+
+inv.cli.progress = {}
+
+function inv.cli.progress.fn(name, line, wildcards)
+    local mode = tostring((wildcards and wildcards[1]) or ""):lower()
+    if mode == "" or mode == "status" then
+        local current = (inv.items and inv.items.getReportMode and inv.items.getReportMode()) or "classic"
+        dbot.info("Progress mode is '" .. tostring(current) .. "'. Usage: dinv progress <classic|inline>")
+        return DRL_RET_SUCCESS
+    end
+
+    if mode ~= "classic" and mode ~= "inline" then
+        dbot.warn("Usage: dinv progress <classic|inline>")
+        return DRL_RET_INVALID_PARAM
+    end
+
+    if inv.items and inv.items.setReportMode then
+        local retval = inv.items.setReportMode(mode)
+        if retval == DRL_RET_SUCCESS then
+            dbot.info("Progress mode set to '" .. mode .. "'")
+            return DRL_RET_SUCCESS
+        end
+    end
+
+    dbot.warn("Unable to set progress mode to '" .. mode .. "'")
+    return DRL_RET_INVALID_PARAM
+end
+
+function inv.cli.progress.usage()
+    dbot.printRaw(string.format("@W    %-50s @w- %s",
+               pluginNameCmd .. " progress @G<classic|inline>", "Set identify progress display mode"))
+end
+
+function inv.cli.progress.examples()
+    local mode = (inv.items and inv.items.getReportMode and inv.items.getReportMode()) or "classic"
+    dbot.print([[@W
+Usage:
+    dinv progress @G<classic|inline>@W - Set identify progress style
+    dinv progress status                       - Show current progress style
+
+Current mode: @G]] .. tostring(mode) .. [[@W
+
+Modes:
+    classic - Default line-by-line progress output
+    inline  - Reuse a single progress line in the main console
 ]])
 end
 
@@ -1124,22 +1176,71 @@ end
 inv.cli.ignore = {}
 function inv.cli.ignore.fn(name, line, wildcards)
     local action = wildcards and wildcards[1] or ""
-    local containerId = wildcards and wildcards[2] or ""
+    local containerRef = wildcards and wildcards[2] or ""
+
+    local function resolveIgnoreTarget(ref)
+        local normalizedRef = tostring(ref or "")
+        if normalizedRef == "" then
+            return nil
+        end
+        if normalizedRef:lower() == tostring(invItemLocKeyring or "keyring") then
+            return tostring(invItemLocKeyring or "keyring")
+        end
+        if inv.items and inv.items.findContainerId then
+            return inv.items.findContainerId(normalizedRef)
+        end
+        return nil
+    end
+
+    local function formatIgnoredContainerLabel(objId)
+        local label = tostring(objId)
+        if label == tostring(invItemLocKeyring or "keyring") then
+            return label
+        end
+        if inv.items and inv.items.getStatField then
+            local colorName = inv.items.getStatField(objId, invStatFieldColorName)
+            if colorName == nil or tostring(colorName) == "" then
+                colorName = inv.items.getStatField(objId, invStatFieldName)
+            end
+            if colorName ~= nil and tostring(colorName) ~= "" then
+                label = label .. " (" .. tostring(colorName) .. ")"
+            end
+        end
+        return label
+    end
     
     if action == "add" then
-        return inv.config.addIgnore(containerId)
+        local containerId = resolveIgnoreTarget(containerRef)
+        if containerId == nil then
+            dbot.warn("Usage: dinv ignore add [containerId|relativeName|keyring]")
+            return DRL_RET_INVALID_PARAM
+        end
+        local retval = inv.config.addIgnore(containerId)
+        if retval == DRL_RET_SUCCESS then
+            dbot.info("Now ignoring container: " .. formatIgnoredContainerLabel(containerId))
+        end
+        return retval
     elseif action == "remove" then
-        return inv.config.removeIgnore(containerId)
+        local containerId = resolveIgnoreTarget(containerRef)
+        if containerId == nil then
+            dbot.warn("Usage: dinv ignore remove [containerId|relativeName|keyring]")
+            return DRL_RET_INVALID_PARAM
+        end
+        local retval = inv.config.removeIgnore(containerId)
+        if retval == DRL_RET_SUCCESS then
+            dbot.info("Removed ignored container: " .. formatIgnoredContainerLabel(containerId))
+        end
+        return retval
     elseif action == "list" or action == "" then
         return inv.config.listIgnored()
     else
-        dbot.warn("Usage: dinv ignore [add|remove|list] [containerId]")
+        dbot.warn("Usage: dinv ignore [add|remove|list] [containerRef]")
         return DRL_RET_INVALID_PARAM
     end
 end
 function inv.cli.ignore.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s", 
-               pluginNameCmd .. " ignore @G[add|remove|list] [id]", "Ignore containers"))
+               pluginNameCmd .. " ignore @G[add|remove|list] [containerRef]", "Ignore containers"))
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -2139,18 +2240,18 @@ function inv.cli.ignore.examples()
     inv.cli.ignore.usage()
     dbot.print(
 [[@W
-Ignore containers or the keyring during inventory scans.  Useful if you have containers
+Ignore containers or the keyring during inventory scans. Useful if you have locations
 with items you don't want tracked.
 
 Examples:
   1) Ignore your keyring
-     "@Gdinv ignore on keyring@W"
+     "@Gdinv ignore add keyring@W"
 
-  2) Ignore a specific container
-     "@Gdinv ignore on 3.bag@W"
+  2) Ignore a specific container by relative name
+     "@Gdinv ignore add 2.case@W"
 
   3) Stop ignoring a container
-     "@Gdinv ignore off 3.bag@W"
+     "@Gdinv ignore remove 2.case@W"
 
   4) List ignored locations
      "@Gdinv ignore list@W"

@@ -38,6 +38,7 @@ local configDefaults = {
 
     -- Report settings
     reportChannel = "echo",
+    reportMode = "classic",
 
     -- Priority defaults
     defaultPriorityName = nil,
@@ -193,6 +194,18 @@ function inv.config.setReportChannel(channel)
     return inv.config.set("reportChannel", channel)
 end
 
+function inv.config.getReportMode()
+    return inv.config.get("reportMode") or "classic"
+end
+
+function inv.config.setReportMode(mode)
+    local normalized = tostring(mode or ""):lower()
+    if normalized ~= "classic" and normalized ~= "inline" then
+        return DRL_RET_INVALID_PARAM
+    end
+    return inv.config.set("reportMode", normalized)
+end
+
 ----------------------------------------------------------------------------------------------------
 -- Ignore List Management
 ----------------------------------------------------------------------------------------------------
@@ -203,17 +216,39 @@ function inv.config.isIgnored(containerId)
 end
 
 function inv.config.addIgnore(containerId)
+    if inv.config.table == nil then
+        inv.config.reset()
+    end
     if inv.config.table.ignoreContainers == nil then
         inv.config.table.ignoreContainers = {}
     end
     inv.config.table.ignoreContainers[tostring(containerId)] = true
+
+    local saveRet = inv.config.save()
+    if saveRet ~= DRL_RET_SUCCESS and saveRet ~= DRL_RET_UNINITIALIZED then
+        dbot.warn("inv.config.addIgnore: Failed to persist ignored container '" ..
+                  tostring(containerId) .. "': " .. dbot.retval.getString(saveRet))
+        return saveRet
+    end
+
     return DRL_RET_SUCCESS
 end
 
 function inv.config.removeIgnore(containerId)
+    if inv.config.table == nil then
+        inv.config.reset()
+    end
     if inv.config.table.ignoreContainers then
         inv.config.table.ignoreContainers[tostring(containerId)] = nil
     end
+
+    local saveRet = inv.config.save()
+    if saveRet ~= DRL_RET_SUCCESS and saveRet ~= DRL_RET_UNINITIALIZED then
+        dbot.warn("inv.config.removeIgnore: Failed to persist ignored container '" ..
+                  tostring(containerId) .. "': " .. dbot.retval.getString(saveRet))
+        return saveRet
+    end
+
     return DRL_RET_SUCCESS
 end
 
@@ -221,9 +256,26 @@ function inv.config.listIgnored()
     local ignoreList = inv.config.get("ignoreContainers") or {}
     local count = 0
     
+    local function getIgnoredDisplayLabel(containerId)
+        local label = tostring(containerId)
+        if label == tostring(invItemLocKeyring or "keyring") then
+            return label
+        end
+        if inv.items and inv.items.getStatField then
+            local colorName = inv.items.getStatField(containerId, invStatFieldColorName)
+            if colorName == nil or tostring(colorName) == "" then
+                colorName = inv.items.getStatField(containerId, invStatFieldName)
+            end
+            if colorName ~= nil and tostring(colorName) ~= "" then
+                label = label .. " (" .. tostring(colorName) .. ")"
+            end
+        end
+        return label
+    end
+
     dbot.print("@WIgnored Containers:@w")
     for containerId, _ in pairs(ignoreList) do
-        dbot.print("  @G" .. containerId .. "@w")
+        dbot.print("  @G" .. getIgnoredDisplayLabel(containerId) .. "@w")
         count = count + 1
     end
     

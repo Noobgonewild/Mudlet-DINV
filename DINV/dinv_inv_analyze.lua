@@ -407,29 +407,11 @@ end
 
 function inv.analyze.getCurrentWornByLoc()
     local wornByLoc = {}
-    local wearableLocationLookup = {}
-
-    for _, loc in ipairs(inv.set.wearableLocations or {}) do
-        wearableLocationLookup[loc] = true
-    end
 
     for objId, _ in pairs(inv.items.table or {}) do
         local location = tostring(inv.items.getStatField(objId, invStatFieldLocation) or "")
-        local wornLoc = nil
-
-        if location ~= "" and location ~= invItemLocInventory then
-            if wearableLocationLookup[location] then
-                wornLoc = location
-            else
-                local wearLocNum = tonumber(location)
-                if wearLocNum ~= nil and inv.items.wearLocById then
-                    local mappedLoc = inv.items.wearLocById[wearLocNum]
-                    if mappedLoc and mappedLoc ~= "undefined" then
-                        wornLoc = mappedLoc
-                    end
-                end
-            end
-        end
+        local resolvedSlot = inv.items.resolveWearSlot(location)
+        local wornLoc = (resolvedSlot ~= invItemLocWorn) and resolvedSlot or nil
 
         if wornLoc then
             wornByLoc[wornLoc] = tostring(objId)

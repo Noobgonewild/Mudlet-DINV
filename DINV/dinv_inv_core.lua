@@ -175,51 +175,14 @@ invmon.action = {
 }
 
 ----------------------------------------------------------------------------------------------------
--- Wear Location Table
-----------------------------------------------------------------------------------------------------
-
-inv.wearLoc = {
-    [0]  = "light",
-    [1]  = "head",
-    [2]  = "eyes",
-    [3]  = "lear",
-    [4]  = "rear",
-    [5]  = "neck1",
-    [6]  = "neck2",
-    [7]  = "back",
-    [8]  = "medal1",
-    [9]  = "medal2",
-    [10] = "medal3",
-    [11] = "medal4",
-    [12] = "torso",
-    [13] = "body",
-    [14] = "waist",
-    [15] = "arms",
-    [16] = "lwrist",
-    [17] = "rwrist",
-    [18] = "hands",
-    [19] = "lfinger",
-    [20] = "rfinger",
-    [21] = "legs",
-    [22] = "feet",
-    [23] = "shield",
-    [24] = "wielded",
-    [25] = "second",
-    [26] = "hold",
-    [27] = "float",
-    [30] = "above",
-    [31] = "portal",
-    [32] = "sleeping",
-}
-----------------------------------------------------------------------------------------------------
--- Wear Location Constants
+-- Wear Location Constants  (values match Aardwolf protocol strings)
 ----------------------------------------------------------------------------------------------------
 
 invWearLocLight      = "light"
 invWearLocHead       = "head"
 invWearLocEyes       = "eyes"
-invWearLocEar1       = "ear1"
-invWearLocEar2       = "ear2"
+invWearLocEar1       = "lear"
+invWearLocEar2       = "rear"
 invWearLocNeck1      = "neck1"
 invWearLocNeck2      = "neck2"
 invWearLocBack       = "back"
@@ -231,82 +194,21 @@ invWearLocTorso      = "torso"
 invWearLocBody       = "body"
 invWearLocWaist      = "waist"
 invWearLocArms       = "arms"
-invWearLocWrist1     = "wrist1"
-invWearLocWrist2     = "wrist2"
+invWearLocWrist1     = "lwrist"
+invWearLocWrist2     = "rwrist"
 invWearLocHands      = "hands"
-invWearLocFinger1    = "finger1"
-invWearLocFinger2    = "finger2"
+invWearLocFinger1    = "lfinger"
+invWearLocFinger2    = "rfinger"
 invWearLocHold       = "hold"
 invWearLocLegs       = "legs"
 invWearLocFeet       = "feet"
 invWearLocShield     = "shield"
-invWearLocWield      = "wield"
+invWearLocWield      = "wielded"
 invWearLocSecond     = "second"
 invWearLocAbove      = "above"
 invWearLocFloat      = "float"
 invWearLocPortal     = "portal"
 
-----------------------------------------------------------------------------------------------------
--- Wear Location Tables
-----------------------------------------------------------------------------------------------------
-
-inv.wearLoc = {
-    [invWearLocLight]  = invWearLocLight,
-    [invWearLocHead]   = invWearLocHead,
-    [invWearLocEyes]   = invWearLocEyes,
-    [invWearLocEar1]   = invWearLocEar1,
-    [invWearLocEar2]   = invWearLocEar2,
-    [invWearLocNeck1]  = invWearLocNeck1,
-    [invWearLocNeck2]  = invWearLocNeck2,
-    [invWearLocBack]   = invWearLocBack,
-    [invWearLocMedal1] = invWearLocMedal1,
-    [invWearLocMedal2] = invWearLocMedal2,
-    [invWearLocMedal3] = invWearLocMedal3,
-    [invWearLocMedal4] = invWearLocMedal4,
-    [invWearLocTorso]  = invWearLocTorso,
-    [invWearLocBody]   = invWearLocBody,
-    [invWearLocWaist]  = invWearLocWaist,
-    [invWearLocArms]   = invWearLocArms,
-    [invWearLocWrist1] = invWearLocWrist1,
-    [invWearLocWrist2] = invWearLocWrist2,
-    [invWearLocHands]  = invWearLocHands,
-    [invWearLocFinger1]= invWearLocFinger1,
-    [invWearLocFinger2]= invWearLocFinger2,
-    [invWearLocHold]   = invWearLocHold,
-    [invWearLocLegs]   = invWearLocLegs,
-    [invWearLocFeet]   = invWearLocFeet,
-    [invWearLocShield] = invWearLocShield,
-    [invWearLocWield]  = invWearLocWield,
-    [invWearLocSecond] = invWearLocSecond,
-    [invWearLocAbove]  = invWearLocAbove,
-    [invWearLocFloat]  = invWearLocFloat,
-    [invWearLocPortal] = invWearLocPortal,
-}
-
-inv.wearables = {
-    light = { invWearLocLight },
-    head = { invWearLocHead },
-    eyes = { invWearLocEyes },
-    ear = { invWearLocEar1, invWearLocEar2 },
-    neck = { invWearLocNeck1, invWearLocNeck2 },
-    back = { invWearLocBack },
-    medal = { invWearLocMedal1, invWearLocMedal2, invWearLocMedal3, invWearLocMedal4 },
-    torso = { invWearLocTorso },
-    body = { invWearLocBody },
-    waist = { invWearLocWaist },
-    arms = { invWearLocArms },
-    wrist = { invWearLocWrist1, invWearLocWrist2 },
-    hands = { invWearLocHands },
-    finger = { invWearLocFinger1, invWearLocFinger2 },
-    legs = { invWearLocLegs },
-    feet = { invWearLocFeet },
-    shield = { invWearLocShield },
-    wield = { invWearLocWield, invWearLocSecond },
-    hold = { invWearLocHold },
-    float = { invWearLocFloat },
-    above = { invWearLocAbove },
-    portal = { invWearLocPortal },
-}
 
 ----------------------------------------------------------------------------------------------------
 -- Item Type Constants
@@ -443,6 +345,59 @@ inv.items.table   = inv.items.table or {}
 inv.priority.table = inv.priority.table or {}
 inv.cache.table   = inv.cache.table or {}
 inv.snapshot.table = inv.snapshot.table or {}
+
+----------------------------------------------------------------------------------------------------
+-- Wear Location Table  (numeric id -> slot name, matches Aardwolf invmon/eqdata protocol)
+----------------------------------------------------------------------------------------------------
+
+inv.wearLoc = {
+    [0]  = "light",   [1]  = "head",    [2]  = "eyes",    [3]  = "lear",
+    [4]  = "rear",    [5]  = "neck1",   [6]  = "neck2",   [7]  = "back",
+    [8]  = "medal1",  [9]  = "medal2",  [10] = "medal3",  [11] = "medal4",
+    [12] = "torso",   [13] = "body",    [14] = "waist",   [15] = "arms",
+    [16] = "lwrist",  [17] = "rwrist",  [18] = "hands",   [19] = "lfinger",
+    [20] = "rfinger", [21] = "legs",    [22] = "feet",    [23] = "shield",
+    [24] = "wielded", [25] = "second",  [26] = "hold",    [27] = "float",
+    [30] = "above",   [31] = "portal",  [32] = "sleeping",
+}
+
+-- Reverse lookup: slot name -> numeric id.
+inv.wearLocId = {}
+for id, name in pairs(inv.wearLoc) do
+    inv.wearLocId[name] = id
+end
+
+-- Name set for O(1) "is this a wear-slot name?" checks.
+inv.wearLocNames = {}
+for _, name in pairs(inv.wearLoc) do
+    inv.wearLocNames[name] = true
+end
+
+-- Wearable slot groups (slot-name strings, used by inv.set and inv.compare).
+inv.wearables = {
+    light  = { invWearLocLight },
+    head   = { invWearLocHead },
+    eyes   = { invWearLocEyes },
+    ear    = { invWearLocEar1, invWearLocEar2 },
+    neck   = { invWearLocNeck1, invWearLocNeck2 },
+    back   = { invWearLocBack },
+    medal  = { invWearLocMedal1, invWearLocMedal2, invWearLocMedal3, invWearLocMedal4 },
+    torso  = { invWearLocTorso },
+    body   = { invWearLocBody },
+    waist  = { invWearLocWaist },
+    arms   = { invWearLocArms },
+    wrist  = { invWearLocWrist1, invWearLocWrist2 },
+    hands  = { invWearLocHands },
+    finger = { invWearLocFinger1, invWearLocFinger2 },
+    legs   = { invWearLocLegs },
+    feet   = { invWearLocFeet },
+    shield = { invWearLocShield },
+    wield  = { invWearLocWield, invWearLocSecond },
+    hold   = { invWearLocHold },
+    float  = { invWearLocFloat },
+    above  = { invWearLocAbove },
+    portal = { invWearLocPortal },
+}
 
 inv.init.initializedInstall = false
 inv.init.initializedActive  = false

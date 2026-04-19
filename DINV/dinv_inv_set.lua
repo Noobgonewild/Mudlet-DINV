@@ -1116,26 +1116,8 @@ function inv.set.wear(priorityName, level, endTag)
     local desiredLocsById = {}
     local removedForReequip = {}
     local removedOrStoredById = {}
-    local wearableLocationLookup = {}
-
-    for _, loc in ipairs(inv.set.wearableLocations) do
-        wearableLocationLookup[loc] = true
-    end
-
     local function isKnownWearSlotLocation(locationValue)
-        local locationText = tostring(locationValue or "")
-        if locationText == "" then
-            return false
-        end
-        if wearableLocationLookup and wearableLocationLookup[locationText] then
-            return true
-        end
-        local wearLocNum = tonumber(locationText)
-        if wearLocNum ~= nil and inv.items and inv.items.wearLocById then
-            local mappedLoc = inv.items.wearLocById[wearLocNum]
-            return mappedLoc ~= nil and mappedLoc ~= "undefined"
-        end
-        return false
+        return inv.items.isWearSlot(locationValue)
     end
 
     local function resolveStoreContainer(objId)
@@ -1209,22 +1191,8 @@ function inv.set.wear(priorityName, level, endTag)
 
     for objId, item in pairs(inv.items.table) do
         local location = tostring(inv.items.getStatField(objId, invStatFieldLocation) or "")
-        local wornLoc = nil
-
-        -- Treat location as the source of truth for where an item is currently worn.
-        if location ~= "" and location ~= invItemLocInventory then
-            if wearableLocationLookup[location] then
-                wornLoc = location
-            else
-                local wearLocNum = tonumber(location)
-                if wearLocNum ~= nil and inv.items.wearLocById then
-                    local mappedLoc = inv.items.wearLocById[wearLocNum]
-                    if mappedLoc and mappedLoc ~= "undefined" then
-                        wornLoc = mappedLoc
-                    end
-                end
-            end
-        end
+        local resolvedSlot = inv.items.resolveWearSlot(location)
+        local wornLoc = (resolvedSlot ~= invItemLocWorn) and resolvedSlot or nil
 
         local isActuallyWorn = wornLoc ~= nil
 
