@@ -99,31 +99,55 @@ function inv.items.finalizeInlineProgress()
     inv.items.progress.inlinePlainText = nil
 end
 
-local function deleteMainConsoleLine(lineNum)
-    if type(lineNum) ~= "number" or not moveCursor then
+-- Returns true iff `text` is present anywhere in the last `depth` buffer lines.
+local function bufferContains(text, depth)
+    if not text or text == "" or not (getLines and getLineCount) then
         return false
     end
+    local totalLines = getLineCount() or 0
+    if totalLines <= 0 then
+        return false
+    end
+    local searchStart = math.max(0, totalLines - (depth or 200))
+    local ok, lines = pcall(getLines, "main", searchStart, totalLines)
+    if not ok or type(lines) ~= "table" then
+        return false
+    end
+    for _, lineText in ipairs(lines) do
+        if lineText and lineText:find(text, 1, true) then
+            return true
+        end
+    end
+    return false
+end
 
-    if not moveCursor("main", 0, lineNum) then
+-- Attempt to remove (or at least clear the text of) a specific buffer line.
+-- Mudlet's deleteLine() is primarily designed for trigger context and is
+-- unreliable on already-printed lines; selectCurrentLine+replace("") empties
+-- the line's text in place. We try deleteLine first (cleanest if it works)
+-- and verify by searching for the tracked plaintext in the recent buffer.
+local function clearMainConsoleLine(lineNum, targetText)
+    if type(lineNum) ~= "number" or lineNum < 0 or not moveCursor then
         return false
     end
 
     if deleteLine then
-        local ok = pcall(deleteLine, "main")
-        if ok then
-            return true
-        end
-
-        ok = pcall(deleteLine)
-        if ok then
-            return true
+        if moveCursor("main", 0, lineNum) then
+            pcall(deleteLine)
+            if not bufferContains(targetText) then
+                return true
+            end
         end
     end
 
     if selectCurrentLine and replace then
-        selectCurrentLine("main")
-        replace("")
-        return true
+        if moveCursor("main", 0, lineNum) then
+            selectCurrentLine("main")
+            pcall(replace, "")
+            if not bufferContains(targetText) then
+                return true
+            end
+        end
     end
 
     return false
@@ -134,27 +158,36 @@ function inv.items.deleteInlineProgressLine()
         return false
     end
 
-    if getLines and getLineCount then
-        local targetText = inv.items.progress.inlinePlainText
-        local totalLines = getLineCount()
+    if not (getLines and getLineCount) then
+        return false
+    end
 
-        if targetText and targetText ~= "" and totalLines and totalLines > 0 then
-            local searchStart = math.max(0, totalLines - 30)
-            local lines = getLines("main", searchStart, totalLines) or {}
-            for lineNum = totalLines, searchStart, -1 do
-                local idx = (lineNum - searchStart) + 1
-                local lineText = lines[idx]
-                if lineText and lineText:find(targetText, 1, true) then
-                    if deleteMainConsoleLine(lineNum) then
-                        return true
-                    end
-                end
+    local targetText = inv.items.progress.inlinePlainText
+    if not targetText or targetText == "" then
+        return false
+    end
+
+    local totalLines = getLineCount() or 0
+    if totalLines <= 0 then
+        return false
+    end
+
+    -- Search a generous window of recent buffer lines for the tracked
+    -- progress line. MUD output can arrive between identify steps, so
+    -- the stored line number drifts; a textual search is authoritative.
+    local searchDepth = 200
+    local searchStart = math.max(0, totalLines - searchDepth)
+    local lines = getLines("main", searchStart, totalLines) or {}
+
+    for lineNum = totalLines, searchStart, -1 do
+        local idx = (lineNum - searchStart) + 1
+        local lineText = lines[idx]
+        if lineText and lineText:find(targetText, 1, true) then
+            if clearMainConsoleLine(lineNum, targetText) then
+                return true
             end
-        end
-
-        local lineNum = inv.items.progress.inlineLineNum
-        if lineNum and lineNum <= totalLines and deleteMainConsoleLine(lineNum) then
-            return true
+            -- Clearing this match failed; keep scanning in case an
+            -- earlier occurrence can be cleared instead.
         end
     end
 
@@ -169,6 +202,21 @@ function inv.items.clearInlineProgress()
     inv.items.deleteInlineProgressLine()
 
     inv.items.finalizeInlineProgress()
+end
+
+-- Strip only Aardwolf @X codes, leaving angle-bracket characters intact.
+-- dbot.stripColors() additionally removes "<[^>]+>" which is greedy and
+-- consumes literal '<' characters from item names (e.g. ">.: foo :.<")
+-- when a color tag follows them. Using that here causes the tracked
+-- plaintext to diverge from what cecho actually renders to the buffer,
+-- breaking the find-and-delete search for the previous progress line.
+local function stripAardwolfCodes(s)
+    if s == nil then return "" end
+    s = s:gsub("@@", "\001AT\001")
+    s = s:gsub("@x%d+", "")
+    s = s:gsub("@[%a]", "")
+    s = s:gsub("\001AT\001", "@")
+    return s
 end
 
 function inv.items.showProgress(stage, current, total, itemName)
@@ -207,35 +255,52 @@ function inv.items.showProgress(stage, current, total, itemName)
         -- Strip enchant text from display name
         local displayName = itemName:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%)%s*", "")
         displayName = displayName:gsub("%s+%(removable[^%)]*%)%s*", "")
-        cleanedItemName = dbot.stripColors and dbot.stripColors(displayName) or displayName
+        cleanedItemName = stripAardwolfCodes(displayName)
         msg = msg .. " " .. displayName
     end
 
-    -- Convert Aardwolf codes and print
+    -- Compute the plaintext shadow of the rendered line from the source
+    -- message (stripping only @X codes). cecho renders angle-bracket
+    -- characters inside item names literally, so the buffer text should
+    -- match this value exactly — enabling reliable find-and-delete.
+    local plainMsg = stripAardwolfCodes(msg)
     local converted = dbot.convertColors and dbot.convertColors(msg) or msg
-    local plainConverted = dbot.stripColors and dbot.stripColors(converted) or converted
     local fullMsg = "<cyan>[DINV] " .. stage .. ": <reset>" .. converted
 
     -- Inline mode is sensitive to missing/stripped color conversions. Force-append
     -- the plain item name to guarantee it remains visible in the rendered line.
     if mode == "inline"
         and cleanedItemName and cleanedItemName ~= ""
-        and not (plainConverted and plainConverted:find(cleanedItemName, 1, true)) then
+        and not plainMsg:find(cleanedItemName, 1, true) then
         fullMsg = fullMsg .. " <reset>" .. cleanedItemName
-        plainConverted = plainConverted .. " " .. cleanedItemName
+        plainMsg = plainMsg .. " " .. cleanedItemName
     end
 
     if mode == "inline" then
-        -- Always delete the previously tracked progress line (if any) before
-        -- printing the new one. Do NOT special-case 100% — progress.total can
-        -- grow mid-flow when new items are queued, so a "100%" update may be
-        -- followed by more updates, and those must still overwrite it.
-        inv.items.deleteInlineProgressLine()
+        -- Try to remove the previously tracked progress line before printing
+        -- the new one. Advance to the new line only once the previous one is
+        -- confirmed gone (or was never tracked). If removal can't be confirmed,
+        -- drop the stale reference so the next update doesn't try to find a
+        -- ghost line — that way we still show progress cleanly rather than
+        -- corrupting the display with half-overwrites.
+        local hadActive = inv.items.progress.inlineActive
+        local removed = hadActive and inv.items.deleteInlineProgressLine() or false
+        if hadActive and not removed then
+            inv.items.finalizeInlineProgress()
+        end
 
         cecho(fullMsg .. "\n")
         inv.items.progress.inlineActive = true
-        inv.items.progress.inlineLineNum = (getLineCount and getLineCount()) or nil
-        inv.items.progress.inlinePlainText = "[DINV] " .. stage .. ": " .. plainConverted
+        -- Store the 0-based index of the line we just printed. After
+        -- cecho("...\n") getLineCount() reflects the new end position, so the
+        -- printed line sits at lineCount - 1.
+        local lineCount = getLineCount and getLineCount() or nil
+        if type(lineCount) == "number" and lineCount > 0 then
+            inv.items.progress.inlineLineNum = lineCount - 1
+        else
+            inv.items.progress.inlineLineNum = nil
+        end
+        inv.items.progress.inlinePlainText = "[DINV] " .. stage .. ": " .. plainMsg
         return
     end
 
@@ -387,6 +452,7 @@ inv.items.discoveryContainers = {}
 inv.items.containerIndex = 0
 inv.items.inEqdata = false
 inv.items.inInvdata = false
+inv.items.eqdataSeen = {}
 
 inv.items.identifyAdditiveFields = {
     invStatFieldHitroll,
@@ -821,6 +887,7 @@ function inv.items.refresh(delay, refreshLoc, endTag, callback)
     inv.state = invStateDiscovery
     inv.items.refreshInProgress = true
     inv.items.refreshSeen = {}
+    inv.items.eqdataSeen = {}
     inv.items.expectedInvdataContainerId = nil
 
     -- Ensure discovery triggers are registered for refresh scans
@@ -892,6 +959,7 @@ function inv.items.build(endTag)
     inv.items.expectedInvdataContainerId = nil
     inv.items.inEqdata = false
     inv.items.inInvdata = false
+    inv.items.eqdataSeen = {}
     inv.items.forceIdentify = true
 
     -- Reset progress
@@ -1601,6 +1669,10 @@ function inv.items._parseDataLine(dataLine, source)
     if source == "invdata" then
         inv.items.markInvdataSeen(objId)
     end
+    if source == "eqdata" then
+        inv.items.eqdataSeen = inv.items.eqdataSeen or {}
+        inv.items.eqdataSeen[tostring(objId)] = true
+    end
     if inv.items.refreshInProgress and source ~= "invitem" then
         inv.items.markRefreshSeen(objId)
     end
@@ -1900,6 +1972,7 @@ function inv.items.discoverChain()
     inv.items.currentInvdataSeen = nil
     inv.items.inEqdata = false
     inv.items.inInvdata = false
+    inv.items.eqdataSeen = {}
 
     cecho("\n<cyan>[DINV] Stage 1/4: Scanning worn equipment...\n")
     inv.items.progress.stage = "Scanning equipment"
@@ -2184,6 +2257,8 @@ function inv.items.finishDiscovery()
             if identifyRet ~= DRL_RET_SUCCESS then
                 dbot.warn("Refresh complete: unable to start partial identification (" .. tostring(identifyRet) .. ")")
             end
+        else
+            inv.items.eqdataSeen = {}
         end
         return
     end
@@ -2409,14 +2484,19 @@ function inv.items.identifyNext()
 
     -- Determine item location
     local containerId = item.stats and item.stats[invStatFieldContainer]
-    local wornLoc = item.stats and item.stats[invStatFieldWorn]
+    local location = item.stats and item.stats[invStatFieldLocation]
+    local seenInEqdata = inv.items.eqdataSeen and inv.items.eqdataSeen[tostring(objId)] == true
+    local isWorn = seenInEqdata
+    if not isWorn and inv.items.isWornLocation then
+        isWorn = inv.items.isWornLocation(objId, location)
+    end
 
     local normalizedContainerId = inv.items.normalizeContainerId(containerId)
     if normalizedContainerId then
         -- Item is in a container
         inv.items.identifyCurrentContainer = normalizedContainerId
         inv.items.identifyFromContainer(objId, normalizedContainerId)
-    elseif wornLoc and wornLoc ~= "" and wornLoc ~= "undefined" and wornLoc ~= "unknown" then
+    elseif isWorn then
         -- Item is worn - identify directly (no need to remove for identify)
         inv.items.identifyCurrentContainer = nil
         inv.items.identifyDirect(objId, true)
@@ -2713,6 +2793,7 @@ function inv.items.buildComplete()
         inv.items.buildInProgress = false
         inv.items.identifyInProgress = false
         inv.items.forceIdentify = false
+        inv.items.eqdataSeen = {}
         inv.state = invStateIdle
         if DINV and DINV.setBuildPhase then
             DINV.setBuildPhase(0)
@@ -2736,6 +2817,7 @@ function inv.items.buildComplete()
     inv.items.partialIdentifyMode = false
     inv.items.identifyPartialOnly = false
     inv.items.refreshIdentifyPartials = false
+    inv.items.eqdataSeen = {}
     inv.state = invStateIdle
     if DINV and DINV.setBuildPhase then
         DINV.setBuildPhase(0)
@@ -2814,6 +2896,7 @@ function inv.items.buildAbort()
     inv.items.identifyQueue = {}
     inv.items.identifyWaitForInvmon = nil
     inv.items.identifyWaitForFence = nil
+    inv.items.eqdataSeen = {}
     inv.items.identifyCurrentId = nil
     inv.items.identifyCurrentContainer = nil
     inv.items.identifyIndex = nil
@@ -3003,6 +3086,9 @@ function inv.items.onInvmon(dataLine)
             item.stats = item.stats or {}
             item.stats[invStatFieldWorn] = nil
             item.stats[invStatFieldLocation] = "inventory"
+            if inv.items.eqdataSeen then
+                inv.items.eqdataSeen[tostring(objId)] = nil
+            end
             dbot.debug("onInvmon: Item removed from worn slot", "inv.items")
             shouldSave = true
 
@@ -3017,12 +3103,17 @@ function inv.items.onInvmon(dataLine)
                 item.stats[invStatFieldLocation] = wornLoc
             end
             item.stats[invStatFieldContainer] = nil
+            inv.items.eqdataSeen = inv.items.eqdataSeen or {}
+            inv.items.eqdataSeen[tostring(objId)] = true
             dbot.debug("onInvmon: Item worn at " .. tostring(wornLoc), "inv.items")
             shouldSave = true
 
         elseif actionNum == invmonActionRemovedFromInv then
             -- Action 3 means item is gone from inventory (dropped/given away).
             inv.items.cancelPendingRemoval(objId)
+            if inv.items.eqdataSeen then
+                inv.items.eqdataSeen[tostring(objId)] = nil
+            end
             inv.items.removeItemFromCache(objId, item)
             inv.items.removeItem(objId)
             item = nil
@@ -3035,6 +3126,9 @@ function inv.items.onInvmon(dataLine)
             item.stats[invStatFieldLocation] = "inventory"
             item.stats[invStatFieldContainer] = nil
             item.stats[invStatFieldWorn] = nil
+            if inv.items.eqdataSeen then
+                inv.items.eqdataSeen[tostring(objId)] = nil
+            end
             dbot.debug("onInvmon: Item added to inventory", "inv.items")
             shouldSave = true
 
@@ -3044,6 +3138,10 @@ function inv.items.onInvmon(dataLine)
             local normalizedContainerId = inv.items.normalizeContainerId(containerId)
             item.stats[invStatFieldLocation] = "inventory"
             item.stats[invStatFieldContainer] = nil
+            item.stats[invStatFieldWorn] = nil
+            if inv.items.eqdataSeen then
+                inv.items.eqdataSeen[tostring(objId)] = nil
+            end
             if normalizedContainerId then
                 item.stats[invStatFieldLastStored] = normalizedContainerId
             end
@@ -3059,6 +3157,10 @@ function inv.items.onInvmon(dataLine)
                 item.stats[invStatFieldContainer] = normalizedContainerId
                 item.stats[invStatFieldLastStored] = normalizedContainerId
             end
+            item.stats[invStatFieldWorn] = nil
+            if inv.items.eqdataSeen then
+                inv.items.eqdataSeen[tostring(objId)] = nil
+            end
             dbot.debug("onInvmon: Item put into container " .. tostring(containerId), "inv.items")
             shouldSave = true
 
@@ -3069,6 +3171,9 @@ function inv.items.onInvmon(dataLine)
             item.stats[invStatFieldContainer] = invItemLocKeyring
             item.stats[invStatFieldLastStored] = invItemLocKeyring
             item.stats[invStatFieldWorn] = nil
+            if inv.items.eqdataSeen then
+                inv.items.eqdataSeen[tostring(objId)] = nil
+            end
             dbot.debug("onInvmon: Item put into keyring", "inv.items")
             shouldSave = true
 
@@ -3078,17 +3183,26 @@ function inv.items.onInvmon(dataLine)
             item.stats[invStatFieldLocation] = invItemLocInventory
             item.stats[invStatFieldContainer] = nil
             item.stats[invStatFieldWorn] = nil
+            if inv.items.eqdataSeen then
+                inv.items.eqdataSeen[tostring(objId)] = nil
+            end
             dbot.debug("onInvmon: Item removed from keyring", "inv.items")
             shouldSave = true
         elseif actionNum == invmonActionConsumed then
             -- Item was consumed (quaffed, eaten, rotted) - action 7
             inv.items.cancelPendingRemoval(objId)
+            if inv.items.eqdataSeen then
+                inv.items.eqdataSeen[tostring(objId)] = nil
+            end
             inv.items.removeItemAndSaveNow(objId, "invmon_consumed")
             dbot.debug("onInvmon: Item consumed: " .. tostring(objId), "inv.items")
             shouldSave = false
         end
     elseif actionNum == invmonActionAddedToInv then
         -- New item added - create an entry for it
+        if inv.items.eqdataSeen then
+            inv.items.eqdataSeen[tostring(objId)] = nil
+        end
         if inv.items.add then
             inv.items.add(objId)
             local newItem = inv.items.getItem(objId)

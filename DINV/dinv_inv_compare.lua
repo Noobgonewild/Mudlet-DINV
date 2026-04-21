@@ -677,8 +677,12 @@ function inv.compare.covet(priorityName, auctionNum, skipLevels, endTag)
         end)
     end
 
-    if tempExactMatchTrigger then
-        inv.compare.covetPkg.fenceTriggerId = tempExactMatchTrigger(fence, function()
+    if tempRegexTrigger then
+        -- Use a regex trigger with leading/trailing whitespace tolerance.
+        -- Aardwolf's `echo` command prefixes the echoed text with a space,
+        -- which would break a strict tempExactMatchTrigger on the fence.
+        local fencePattern = "^\\s*" .. fence:gsub("([^%w%s])", "\\%1") .. "\\s*$"
+        inv.compare.covetPkg.fenceTriggerId = tempRegexTrigger(fencePattern, function()
             if tempTimer then
                 tempTimer(0.05, function()
                     inv.compare._covetFinishFromMarket()

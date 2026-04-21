@@ -228,6 +228,28 @@ end</script>
         </regexCodePropertyList>
       </Trigger>
       <Trigger isActive="yes" isFolder="no">
+        <name>invmon_malformed_warn</name>
+        <script>local line = getCurrentLine and getCurrentLine() or ""
+local canonical = line:match("^%s*%{invmon%}%d+,[%-%d]+,[%-%d]+,[%-%d]+%s*$")
+if not canonical then
+    if dbot and dbot.warn then
+        dbot.warn("Malformed invmon line detected (not processed; prompt may be misconfigured): " .. tostring(line))
+    else
+        ColourNote("white", "red", "Malformed invmon line detected (not processed; prompt may be misconfigured): " .. tostring(line))
+    end
+end</script>
+        <triggerType>1</triggerType>
+        <conditonLineDelta>0</conditonLineDelta>
+        <mStayOpen>0</mStayOpen>
+        <mCommand></mCommand>
+        <regexCodeList>
+          <string>^.+\{invmon\}.*$</string>
+        </regexCodeList>
+        <regexCodePropertyList>
+          <integer>1</integer>
+        </regexCodePropertyList>
+      </Trigger>
+      <Trigger isActive="yes" isFolder="no">
         <name>invitem</name>
         <script>if inv and inv.items and inv.items.trigger and inv.items.trigger.invitem then
     inv.items.trigger.invitem(matches[2], matches[3])
