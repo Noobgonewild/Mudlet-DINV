@@ -43,9 +43,7 @@ DINV consumables, buying potions/pills
 <img width="1036" height="522" alt="2026-04-16 23_13_13-Aardwolf - Mudlet 4 20 1" src="https://github.com/user-attachments/assets/58ce4d22-5e51-4820-beaf-59205bfbf43c" />
 
 
-Added inline progress bar
 
-https://github.com/user-attachments/assets/38afa8cf-a31c-45de-a3bb-57fae7e99841
 
 
 Most messages can be turned off.
