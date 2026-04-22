@@ -588,10 +588,12 @@ function inv.compare.items(priorityName, itemName, skipLevels, endTag)
     local wornId = compareId
     if not wornId then
         for objId, _ in pairs(inv.items.table or {}) do
-            local wornLoc = inv.items.getStatField(objId, invStatFieldWorn)
-            if wornLoc and wornLoc ~= "" and string.find(targetWear, wornLoc, 1, true) then
-                wornId = objId
-                break
+            if inv.items.isWorn(objId) then
+                local wornLoc = inv.items.getStatField(objId, invStatFieldWorn)
+                if wornLoc and string.find(targetWear, wornLoc, 1, true) then
+                    wornId = objId
+                    break
+                end
             end
         end
     end

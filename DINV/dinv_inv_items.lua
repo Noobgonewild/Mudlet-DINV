@@ -121,11 +121,6 @@ local function bufferContains(text, depth)
     return false
 end
 
--- Attempt to remove (or at least clear the text of) a specific buffer line.
--- Mudlet's deleteLine() is primarily designed for trigger context and is
--- unreliable on already-printed lines; selectCurrentLine+replace("") empties
--- the line's text in place. We try deleteLine first (cleanest if it works)
--- and verify by searching for the tracked plaintext in the recent buffer.
 local function clearMainConsoleLine(lineNum, targetText)
     if type(lineNum) ~= "number" or lineNum < 0 or not moveCursor then
         return false
@@ -204,12 +199,7 @@ function inv.items.clearInlineProgress()
     inv.items.finalizeInlineProgress()
 end
 
--- Strip only Aardwolf @X codes, leaving angle-bracket characters intact.
--- dbot.stripColors() additionally removes "<[^>]+>" which is greedy and
--- consumes literal '<' characters from item names (e.g. ">.: foo :.<")
--- when a color tag follows them. Using that here causes the tracked
--- plaintext to diverge from what cecho actually renders to the buffer,
--- breaking the find-and-delete search for the previous progress line.
+-- Strip @X codes only; dbot.stripColors also consumes literal '<' characters.
 local function stripAardwolfCodes(s)
     if s == nil then return "" end
     s = s:gsub("@@", "\001AT\001")
@@ -259,16 +249,10 @@ function inv.items.showProgress(stage, current, total, itemName)
         msg = msg .. " " .. displayName
     end
 
-    -- Compute the plaintext shadow of the rendered line from the source
-    -- message (stripping only @X codes). cecho renders angle-bracket
-    -- characters inside item names literally, so the buffer text should
-    -- match this value exactly — enabling reliable find-and-delete.
     local plainMsg = stripAardwolfCodes(msg)
     local converted = dbot.convertColors and dbot.convertColors(msg) or msg
     local fullMsg = "<cyan>[DINV] " .. stage .. ": <reset>" .. converted
 
-    -- Inline mode is sensitive to missing/stripped color conversions. Force-append
-    -- the plain item name to guarantee it remains visible in the rendered line.
     if mode == "inline"
         and cleanedItemName and cleanedItemName ~= ""
         and not plainMsg:find(cleanedItemName, 1, true) then
@@ -277,12 +261,6 @@ function inv.items.showProgress(stage, current, total, itemName)
     end
 
     if mode == "inline" then
-        -- Try to remove the previously tracked progress line before printing
-        -- the new one. Advance to the new line only once the previous one is
-        -- confirmed gone (or was never tracked). If removal can't be confirmed,
-        -- drop the stale reference so the next update doesn't try to find a
-        -- ghost line — that way we still show progress cleanly rather than
-        -- corrupting the display with half-overwrites.
         local hadActive = inv.items.progress.inlineActive
         local removed = hadActive and inv.items.deleteInlineProgressLine() or false
         if hadActive and not removed then
@@ -291,9 +269,6 @@ function inv.items.showProgress(stage, current, total, itemName)
 
         cecho(fullMsg .. "\n")
         inv.items.progress.inlineActive = true
-        -- Store the 0-based index of the line we just printed. After
-        -- cecho("...\n") getLineCount() reflects the new end position, so the
-        -- printed line sits at lineCount - 1.
         local lineCount = getLineCount and getLineCount() or nil
         if type(lineCount) == "number" and lineCount > 0 then
             inv.items.progress.inlineLineNum = lineCount - 1
@@ -396,41 +371,6 @@ inv.items.typeId = {
     ["Campfire"] = 25,
     ["Forge"] = 26,
     ["Runestone"] = 27,
-}
-
-inv.items.wearLocById = {
-    [-1] = "undefined",
-    [0] = "light",
-    [1] = "head",
-    [2] = "eyes",
-    [3] = "lear",
-    [4] = "rear",
-    [5] = "neck1",
-    [6] = "neck2",
-    [7] = "back",
-    [8] = "medal1",
-    [9] = "medal2",
-    [10] = "medal3",
-    [11] = "medal4",
-    [12] = "torso",
-    [13] = "body",
-    [14] = "waist",
-    [15] = "arms",
-    [16] = "lwrist",
-    [17] = "rwrist",
-    [18] = "hands",
-    [19] = "lfinger",
-    [20] = "rfinger",
-    [21] = "legs",
-    [22] = "feet",
-    [23] = "shield",
-    [24] = "wielded",
-    [25] = "second",
-    [26] = "hold",
-    [27] = "float",
-    [30] = "above",
-    [31] = "portal",
-    [32] = "sleeping",
 }
 
 inv.items.currentIdentifyId = nil
@@ -599,13 +539,11 @@ function inv.items.loadPersistentItemsTable()
                 local loc = tostring(stats[invStatFieldLocation] or "")
                 local wornLoc = tostring(stats[invStatFieldWorn] or "")
 
-                if loc == invItemLocWorn and wornLoc ~= "" and wornLoc ~= "undefined" then
-                    for wearNum, wearName in pairs(inv.items.wearLocById or {}) do
-                        if type(wearNum) == "number" and wearName == wornLoc then
-                            stats[invStatFieldLocation] = tostring(wearNum)
-                            loc = tostring(wearNum)
-                            break
-                        end
+                if loc == invItemLocWorn and wornLoc ~= "" and wornLoc ~= "undefined" and wornLoc ~= invItemWornNotWorn then
+                    local wearNum = inv.wearLocId and inv.wearLocId[wornLoc]
+                    if wearNum ~= nil then
+                        stats[invStatFieldLocation] = tostring(wearNum)
+                        loc = tostring(wearNum)
                     end
                 end
 
@@ -658,6 +596,30 @@ function inv.items.reset()
     inv.items.table = {}
     inv.items.pendingForget = nil
     return DRL_RET_SUCCESS
+end
+
+-- One-shot: normalize legacy worn values (nil/""/"undefined") to the sentinel and save.
+function inv.items.normalizeWornState()
+    if not inv.items.table then
+        cecho("<yellow>[DINV] No items loaded; nothing to normalize.\n")
+        return 0
+    end
+    local changed = 0
+    for _, entry in pairs(inv.items.table) do
+        local stats = entry and entry.stats
+        if stats then
+            local rawWorn = stats[invStatFieldWorn]
+            if rawWorn == nil or rawWorn == "" or rawWorn == "undefined" then
+                stats[invStatFieldWorn] = invItemWornNotWorn
+                changed = changed + 1
+            end
+        end
+    end
+    if changed > 0 then
+        inv.items.save()
+    end
+    cecho(string.format("<cyan>[DINV] Normalized %d item(s) to '%s'.\n", changed, invItemWornNotWorn))
+    return changed
 end
 
 function inv.items.clearPendingForget()
@@ -751,7 +713,7 @@ function inv.items.schedulePendingRemoval(objId, source)
             local item = inv.items.getItem(key)
             if item and item.stats then
                 if not inv.items.normalizeKeyringLocation(item) then
-                    item.stats[invStatFieldWorn] = nil
+                    item.stats[invStatFieldWorn] = invItemWornNotWorn
                     item.stats[invStatFieldContainer] = ""
                     inv.items.updateLocation(item, "unknown")
                 end
@@ -1594,7 +1556,7 @@ function inv.items.normalizeKeyringLocation(item)
     item.stats[invStatFieldLocation] = invItemLocKeyring
     item.stats[invStatFieldContainer] = invItemLocKeyring
     item.stats[invStatFieldLastStored] = invItemLocKeyring
-    item.stats[invStatFieldWorn] = nil
+    item.stats[invStatFieldWorn] = invItemWornNotWorn
     return true
 end
 
@@ -1723,7 +1685,7 @@ function inv.items._parseDataLine(dataLine, source)
     end
 
     local typeName = inv.items.typeStr[typeField] or "Unknown"
-    local wearLocText = inv.items.wearLocById[wearLoc] or "unknown"
+    local wearLocText = (wearLoc == -1 and "undefined") or inv.wearLoc[wearLoc] or "unknown"
 
     local item = inv.items.getItem(objId)
     if item == nil then
@@ -1769,8 +1731,10 @@ function inv.items._parseDataLine(dataLine, source)
         item.unique = unique
     end
 
+    local wornValue = (wearLoc and wearLoc >= 0) and wearLocText or invItemWornNotWorn
+
     if source == "eqdata" then
-        item.stats[invStatFieldWorn] = wearLocText
+        item.stats[invStatFieldWorn] = wornValue
         item.stats[invStatFieldContainer] = nil
         if wearLoc and wearLoc > 0 then
             inv.items.updateLocation(item, tostring(wearLoc))
@@ -1778,7 +1742,7 @@ function inv.items._parseDataLine(dataLine, source)
             inv.items.updateLocation(item, wearLocText)
         end
     else
-        item.stats[invStatFieldWorn] = nil
+        item.stats[invStatFieldWorn] = wornValue
         -- Only trust container context while we are actively inside an invdata block.
         -- This guards against stale currentContainerId values leaking into standalone
         -- invdata/itemDataStats callbacks after refresh/build boundaries.
@@ -2058,7 +2022,7 @@ function inv.items.applyMainInvdataInventoryLocations()
     for objId, _ in pairs(seen) do
         local item = inv.items.getItem(objId)
         if item and item.stats then
-            item.stats[invStatFieldWorn] = nil
+            item.stats[invStatFieldWorn] = invItemWornNotWorn
             item.stats[invStatFieldContainer] = ""
             inv.items.updateLocation(item, "inventory")
             inv.items.setItem(objId, item)
@@ -3084,7 +3048,7 @@ function inv.items.onInvmon(dataLine)
             end
             -- Item was removed (un-worn)
             item.stats = item.stats or {}
-            item.stats[invStatFieldWorn] = nil
+            item.stats[invStatFieldWorn] = invItemWornNotWorn
             item.stats[invStatFieldLocation] = "inventory"
             if inv.items.eqdataSeen then
                 inv.items.eqdataSeen[tostring(objId)] = nil
@@ -3125,7 +3089,7 @@ function inv.items.onInvmon(dataLine)
             item.stats = item.stats or {}
             item.stats[invStatFieldLocation] = "inventory"
             item.stats[invStatFieldContainer] = nil
-            item.stats[invStatFieldWorn] = nil
+            item.stats[invStatFieldWorn] = invItemWornNotWorn
             if inv.items.eqdataSeen then
                 inv.items.eqdataSeen[tostring(objId)] = nil
             end
@@ -3138,7 +3102,7 @@ function inv.items.onInvmon(dataLine)
             local normalizedContainerId = inv.items.normalizeContainerId(containerId)
             item.stats[invStatFieldLocation] = "inventory"
             item.stats[invStatFieldContainer] = nil
-            item.stats[invStatFieldWorn] = nil
+            item.stats[invStatFieldWorn] = invItemWornNotWorn
             if inv.items.eqdataSeen then
                 inv.items.eqdataSeen[tostring(objId)] = nil
             end
@@ -3157,7 +3121,7 @@ function inv.items.onInvmon(dataLine)
                 item.stats[invStatFieldContainer] = normalizedContainerId
                 item.stats[invStatFieldLastStored] = normalizedContainerId
             end
-            item.stats[invStatFieldWorn] = nil
+            item.stats[invStatFieldWorn] = invItemWornNotWorn
             if inv.items.eqdataSeen then
                 inv.items.eqdataSeen[tostring(objId)] = nil
             end
@@ -3170,7 +3134,7 @@ function inv.items.onInvmon(dataLine)
             item.stats[invStatFieldLocation] = invItemLocKeyring
             item.stats[invStatFieldContainer] = invItemLocKeyring
             item.stats[invStatFieldLastStored] = invItemLocKeyring
-            item.stats[invStatFieldWorn] = nil
+            item.stats[invStatFieldWorn] = invItemWornNotWorn
             if inv.items.eqdataSeen then
                 inv.items.eqdataSeen[tostring(objId)] = nil
             end
@@ -3182,7 +3146,7 @@ function inv.items.onInvmon(dataLine)
             item.stats = item.stats or {}
             item.stats[invStatFieldLocation] = invItemLocInventory
             item.stats[invStatFieldContainer] = nil
-            item.stats[invStatFieldWorn] = nil
+            item.stats[invStatFieldWorn] = invItemWornNotWorn
             if inv.items.eqdataSeen then
                 inv.items.eqdataSeen[tostring(objId)] = nil
             end
@@ -3400,6 +3364,15 @@ function inv.items.isWearableLoc(wearableLoc)
     return inv.wearLocNames and inv.wearLocNames[wearableLoc] == true
 end
 
+-- Returns true when the item's `worn` stat is a real slot (not the not-worn sentinel).
+function inv.items.isWorn(objId)
+    local worn = inv.items.getStatField and inv.items.getStatField(objId, invStatFieldWorn)
+    if worn == nil or worn == "" or worn == invItemWornNotWorn or worn == "undefined" then
+        return false
+    end
+    return true
+end
+
 function inv.items.isWearableType(wearableType)
     if wearableType == nil or wearableType == "" then
         return false
@@ -3511,7 +3484,7 @@ function inv.items.search(query, displayMode)
                         relativeName = target
                     end
                 elseif key == "worn" then
-                    match = tostring(wornLoc) ~= "" and tostring(wornLoc) ~= "undefined"
+                    match = inv.items.isWorn(objId)
                 elseif key == "minlevel" then
                     match = level >= tonumber(value or 0)
                 elseif key == "maxlevel" then
@@ -4542,8 +4515,7 @@ function inv.items.isWornLocation(objId, locationValue)
     if inv.items.isWearSlot(locationValue) then
         return true
     end
-    local wornField = tostring(inv.items.getStatField(objId, invStatFieldWorn) or "")
-    return wornField ~= "" and wornField ~= "undefined"
+    return inv.items.isWorn(objId)
 end
 
 function inv.items.wearItem(objId, wearLoc, commandArray)
@@ -4581,10 +4553,8 @@ function inv.items.removeWornItem(objId, commandArray)
 end
 
 function inv.items.storeItem(objId, commandArray)
-    -- Store item in its home container
     local container = inv.items.resolveStoreContainer(objId)
-    local wornLoc = inv.items.getStatField(objId, invStatFieldWorn)
-    if wornLoc and wornLoc ~= "" and wornLoc ~= "undefined" then
+    if inv.items.isWorn(objId) then
         if commandArray then
             table.insert(commandArray, "remove " .. objId)
         else

@@ -1146,12 +1146,12 @@ function inv.set.wear(priorityName, level, endTag)
     end
 
     local function markItemInventory(objId)
-        inv.items.setStatField(objId, invStatFieldWorn, "undefined")
+        inv.items.setStatField(objId, invStatFieldWorn, invItemWornNotWorn)
         inv.items.setStatField(objId, invStatFieldLocation, invItemLocInventory)
     end
 
     local function markItemStored(objId, containerId)
-        inv.items.setStatField(objId, invStatFieldWorn, "undefined")
+        inv.items.setStatField(objId, invStatFieldWorn, invItemWornNotWorn)
         inv.items.setStatField(objId, invStatFieldLocation, tostring(containerId))
         inv.items.setStatField(objId, invStatFieldLastStored, tostring(containerId))
     end
