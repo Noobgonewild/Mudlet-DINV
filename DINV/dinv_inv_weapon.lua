@@ -170,8 +170,7 @@ local function ensureItemAvailable(objId)
     if not objId then
         return
     end
-    local wornLoc = inv.items.getStatField(objId, invStatFieldWorn) or ""
-    if wornLoc ~= "" then
+    if inv.items.isWorn(objId) then
         return
     end
 

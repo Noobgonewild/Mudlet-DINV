@@ -53,9 +53,9 @@ function inv.snapshot.create(name, endTag)
     local equipment = {}
 
     for objId, item in pairs(inv.items.table or {}) do
-        local worn = inv.items.getStatField(objId, invStatFieldWorn) or item.worn
-        local wearLoc = inv.items.getStatField(objId, invStatFieldWearable)
-        if worn then
+        if inv.items.isWorn(objId) then
+            local worn = inv.items.getStatField(objId, invStatFieldWorn) or item.worn
+            local wearLoc = inv.items.getStatField(objId, invStatFieldWearable)
             if type(worn) == "string" and worn ~= "" then
                 equipment[worn] = objId
             elseif wearLoc and wearLoc ~= "" then
@@ -152,7 +152,7 @@ function inv.snapshot.wear(name, endTag)
 
         if currentlyWorn ~= wearLoc then
             local location = inv.items.getStatField(objIdStr, invStatFieldLocation) or ""
-            if currentlyWorn == "" and location ~= "" and location ~= "inventory" then
+            if not inv.items.isWorn(objIdStr) and location ~= "" and location ~= "inventory" then
                 inv.items.sendActionCommand("dinv get id " .. objIdStr)
             end
             inv.items.wearItem(objIdStr, wearLoc)

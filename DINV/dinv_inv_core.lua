@@ -248,6 +248,8 @@ invItemLocInventory = "inventory"
 invItemLocWorn      = "worn"
 invItemLocKeyring   = "keyring"
 
+invItemWornNotWorn  = "not-worn"
+
 ----------------------------------------------------------------------------------------------------
 -- Identification Levels
 ----------------------------------------------------------------------------------------------------

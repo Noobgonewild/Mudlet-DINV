@@ -379,7 +379,7 @@ function inv.cli.refresh.fn(name, line, wildcards)
 
     for objId, item in pairs(inv.items.table or {}) do
         if item.stats then
-            if item.stats[invStatFieldWorn] and item.stats[invStatFieldWorn] ~= "" and item.stats[invStatFieldWorn] ~= "undefined" then
+            if inv.items.isWorn(objId) then
                 wornCount = wornCount + 1
             elseif item.stats[invStatFieldContainer] and item.stats[invStatFieldContainer] ~= "" then
                 containerCount = containerCount + 1
