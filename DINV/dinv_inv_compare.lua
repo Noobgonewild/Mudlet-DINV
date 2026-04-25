@@ -276,6 +276,7 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels)
     end
 
     local targetName = inv.items.getStatField(targetId, invStatFieldName) or ("Auction #" .. tostring(targetId))
+    local targetAuctionLabel = "Auction #" .. tostring(targetId)
     local targetLocs = inv.compare._expandWearLocations(targetId)
     do
         local locList = {}
@@ -317,11 +318,17 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels)
         }
     end
 
-    local function calcItemDelta(targetObjId, wornObjId, level)
+    local function calcItemDelta(targetObjId, wornObjId, level, loc)
         local effectiveLevel = (tonumber(level) or 1) + tierBonus
-        local targetScore = inv.score.getItemScore(targetObjId, priorityName, effectiveLevel)
-        local wornScore = inv.score.getItemScore(wornObjId, priorityName, effectiveLevel)
+        local targetScore = inv.score.getItemScoreForLoc(targetObjId, priorityName, effectiveLevel, loc)
+        local wornScore = inv.score.getItemScoreForLoc(wornObjId, priorityName, effectiveLevel, loc)
         return (tonumber(targetScore) or 0) - (tonumber(wornScore) or 0)
+    end
+
+    local function calcWeaponAveDelta(targetObjId, wornObjId)
+        local targetAve = tonumber(inv.items.getStatField(targetObjId, invStatFieldAveDam)) or 0
+        local wornAve = tonumber(inv.items.getStatField(wornObjId, invStatFieldAveDam)) or 0
+        return targetAve - wornAve
     end
 
     local function roundInt(v)
@@ -350,25 +357,6 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels)
         return s .. string.rep(" ", pad)
     end
 
-    local function colorizeDelta(v)
-        local n = roundInt(v)
-        if n > 0 then
-            return "@G" .. tostring(n) .. "@w"
-        end
-        if n < 0 then
-            return "@R" .. tostring(n) .. "@w"
-        end
-        return "@D0@w"
-    end
-
-    local function colorizeStat(v)
-        local n = roundInt(v)
-        if n == 0 then
-            return "@D0@w"
-        end
-        return "@G" .. tostring(n) .. "@w"
-    end
-
     for level = minLevel, maxLevel, skip do
         local entry = analysisData.levels[tostring(level)]
         if entry and entry.equipment then
@@ -380,7 +368,7 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels)
             for loc, _ in pairs(targetLocs) do
                 local wornId = tonumber(entry.equipment[loc])
                 if wornId then
-                    local itemDelta = calcItemDelta(targetId, wornId, level)
+                    local itemDelta = calcItemDelta(targetId, wornId, level, loc)
                     if itemDelta <= 0 then
                         dbot.debug(string.format("covet L%d [%s] target item score not improved vs worn item (delta=%0.2f)",
                             level,
@@ -401,6 +389,7 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels)
                             bestDelta = delta
                             bestLoc = loc
                             bestAgainstId = wornId
+                            diff.weaponAveDelta = calcWeaponAveDelta(targetId, wornId)
                             bestDiff = diff
                         end
                     end
@@ -432,79 +421,89 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels)
     end
 
     dbot.print("@WCovet Results:@w")
-    dbot.print("  @CTarget@W: " .. targetName .. " @Y(level " .. tostring(itemLevel) .. ")@w")
+    if cecho and cechoLink then
+        cecho("  <cyan>Target<white>: <reset>")
+        cechoLink(
+            "<yellow>" .. tostring(targetId) .. "<reset>",
+            "send([[lbid " .. tostring(targetId) .. "]])",
+            "Run: lbid " .. tostring(targetId),
+            true
+        )
+        cecho("<white> " .. targetAuctionLabel .. " <yellow>(level " .. tostring(itemLevel) .. ")<reset>\n")
+    else
+        dbot.print("  @CTarget@W: " .. tostring(targetId) .. " " .. targetAuctionLabel .. " @Y(level " .. tostring(itemLevel) .. ")@w")
+    end
     dbot.print("  @CComparison source@W: analyzed equipment snapshots for priority '" .. tostring(priorityName) .. "' only")
     dbot.print("")
-    local topColumns = {
-        { title = "Lvl", key = "lvl", width = 3, align = "right" },
-        { title = "Name of Armor", key = "name", width = 24, align = "left" },
-        { title = "Type", key = "type", width = 10, align = "left" },
-        { title = "HR", key = "hr", width = 4, align = "right" },
-        { title = "DR", key = "dr", width = 4, align = "right" },
-        { title = "Int", key = "int", width = 3, align = "right" },
-        { title = "Wis", key = "wis", width = 3, align = "right" },
-        { title = "Lck", key = "lck", width = 3, align = "right" },
-        { title = "Str", key = "str", width = 3, align = "right" },
-        { title = "Dex", key = "dex", width = 3, align = "right" },
-        { title = "Con", key = "con", width = 3, align = "right" },
-        { title = "Res", key = "res", width = 3, align = "right" },
-        { title = "HitP", key = "hp", width = 5, align = "right" },
-        { title = "Mana", key = "mana", width = 5, align = "right" },
-        { title = "Move", key = "move", width = 5, align = "right" },
-    }
-    local function renderHeader(columns)
-        local parts = {}
-        for i, col in ipairs(columns) do
-            table.insert(parts, padCell("@W" .. col.title .. "@w", col.width, col.align))
-            if i < #columns then
-                table.insert(parts, " ")
-            end
+
+    -- Collect every objId that will appear in the output so column widths
+    -- align across the target row, each worn item row, and the delta rows.
+    local displayIds = { targetId }
+    local seenAgainst = {}
+    for _, r in ipairs(rows) do
+        if r.againstId and not seenAgainst[r.againstId] then
+            seenAgainst[r.againstId] = true
+            displayIds[#displayIds + 1] = r.againstId
         end
-        return table.concat(parts, "")
     end
 
-    dbot.print(renderHeader(topColumns))
-    local targetLoc = "item"
-    do
-        local targetLocList = {}
-        for loc in pairs(targetLocs) do
-            table.insert(targetLocList, tostring(loc))
+    local maxNameWidth = 18
+    local maxWeaponTypeWidth = 6
+    local maxWearLocWidth = 8
+    local armorOnly = true
+    local anyWeapon = false
+    for _, id in ipairs(displayIds) do
+        local rawName = inv.items.getStatField(id, invStatFieldColorName)
+            or inv.items.getStatField(id, invStatFieldName)
+            or "Unknown"
+        local plain = dbot.stripColors(rawName)
+        if #plain > maxNameWidth then
+            maxNameWidth = #plain
         end
-        table.sort(targetLocList)
-        if #targetLocList > 0 then
-            targetLoc = targetLocList[1]
+        local itemType = string.lower(tostring(inv.items.getStatField(id, invStatFieldType) or ""))
+        if itemType ~= "armor" then armorOnly = false end
+        if itemType == "weapon" then anyWeapon = true end
+        local wearLoc = tostring(inv.items.getStatField(id, invStatFieldWearable) or "")
+        if #wearLoc > maxWearLocWidth then maxWearLocWidth = #wearLoc end
+        if itemType == "weapon" then
+            local wType = tostring(inv.items.getStatField(id, invStatFieldWeaponType) or "-")
+            if #wType > maxWeaponTypeWidth then maxWeaponTypeWidth = #wType end
         end
     end
-    local auctionRow = {
-        lvl = tostring(itemLevel),
-        name = "@GAuction #" .. tostring(targetId) .. "@w",
-        type = "@C" .. tostring(targetLoc) .. "@w",
-        hr = colorizeStat(inv.items.getStatField(targetId, invStatFieldHitroll)),
-        dr = colorizeStat(inv.items.getStatField(targetId, invStatFieldDamroll)),
-        int = colorizeStat(inv.items.getStatField(targetId, invStatFieldInt)),
-        wis = colorizeStat(inv.items.getStatField(targetId, invStatFieldWis)),
-        lck = colorizeStat(inv.items.getStatField(targetId, invStatFieldLuck)),
-        str = colorizeStat(inv.items.getStatField(targetId, invStatFieldStr)),
-        dex = colorizeStat(inv.items.getStatField(targetId, invStatFieldDex)),
-        con = colorizeStat(inv.items.getStatField(targetId, invStatFieldCon)),
-        res = colorizeStat(inv.items.getStatField(targetId, invStatFieldAllPhys)),
-        hp = colorizeStat(inv.items.getStatField(targetId, invStatFieldHp)),
-        mana = colorizeStat(inv.items.getStatField(targetId, invStatFieldMana)),
-        move = colorizeStat(inv.items.getStatField(targetId, invStatFieldMoves)),
+    maxNameWidth = math.min(maxNameWidth, 28)
+
+    local displayOptions = {
+        columnWidths = {
+            name = maxNameWidth,
+            level = 5,
+            wearLoc = math.min(maxWearLocWidth, 12),
+            weaponType = maxWeaponTypeWidth,
+            weaponDam = 7,
+            stat = 5,
+            roll = 5,
+            resource = 5,
+            ris = 3,
+            cellPad = 1,
+        },
+        includeWearLoc = armorOnly,
+        truncateName = true,
     }
 
-    local function renderRow(columns, row)
-        local parts = {}
-        for i, col in ipairs(columns) do
-            table.insert(parts, padCell(row[col.key] or "", col.width, col.align))
-            if i < #columns then
-                table.insert(parts, " ")
-            end
-        end
-        return table.concat(parts, "")
+    local function displayAuctionTargetRow()
+        local oldName = inv.items.getStatField(targetId, invStatFieldName)
+        local oldColorName = inv.items.getStatField(targetId, invStatFieldColorName)
+        inv.items.setStatField(targetId, invStatFieldName, targetAuctionLabel)
+        inv.items.setStatField(targetId, invStatFieldColorName, targetAuctionLabel)
+        inv.items.displayItem(targetId, "itemid", displayOptions)
+        inv.items.setStatField(targetId, invStatFieldName, oldName)
+        inv.items.setStatField(targetId, invStatFieldColorName, oldColorName)
     end
 
-    dbot.print(renderRow(topColumns, auctionRow))
+    -- Render the auction target once at the top using the dinv-search row
+    -- format so the stats carry inline labels.
+    inv.items.displayLastType = ""
+    displayAuctionTargetRow()
+
     if not found then
         dbot.print("  @YNo upgrades found in analyzed levels " .. minLevel .. "-" .. maxLevel .. ".@w")
         return DRL_RET_SUCCESS
@@ -512,46 +511,130 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels)
 
     dbot.print("")
     dbot.print("@WPriority '" .. tostring(priorityName) .. "' advantages with auction #" .. tostring(targetId) .. ":@w")
-    local advColumns = {
-        { title = "", key = "prefix", width = 10, align = "left" },
-        { title = "Ave", key = "ave", width = 5, align = "right" },
-        { title = "Sec", key = "sec", width = 5, align = "right" },
-        { title = "HR", key = "hr", width = 4, align = "right" },
-        { title = "DR", key = "dr", width = 4, align = "right" },
-        { title = "Str", key = "str", width = 4, align = "right" },
-        { title = "Int", key = "int", width = 4, align = "right" },
-        { title = "Wis", key = "wis", width = 4, align = "right" },
-        { title = "Dex", key = "dex", width = 4, align = "right" },
-        { title = "Con", key = "con", width = 4, align = "right" },
-        { title = "Lck", key = "lck", width = 4, align = "right" },
-        { title = "Res", key = "res", width = 4, align = "right" },
-        { title = "HitP", key = "hp", width = 5, align = "right" },
-        { title = "Mana", key = "mana", width = 5, align = "right" },
-        { title = "Move", key = "move", width = 5, align = "right" },
-        { title = "Effects", key = "effects", width = 7, align = "right" },
-    }
-    dbot.print(renderHeader(advColumns))
-    for _, row in ipairs(rows) do
-        local d = row.diff or {}
-        local advRow = {
-            prefix = string.format("@WLevel %3d:@w", row.level),
-            ave = colorizeDelta(d.ave),
-            sec = colorizeDelta(d.sec),
-            hr = colorizeDelta(d.hr),
-            dr = colorizeDelta(d.dr),
-            str = colorizeDelta(d.str),
-            int = colorizeDelta(d.int),
-            wis = colorizeDelta(d.wis),
-            dex = colorizeDelta(d.dex),
-            con = colorizeDelta(d.con),
-            lck = colorizeDelta(d.lck),
-            res = colorizeDelta(d.res),
-            hp = colorizeDelta(d.hp),
-            mana = colorizeDelta(d.mana),
-            move = colorizeDelta(d.move),
-            effects = colorizeDelta(d.effects),
+
+    local widths = displayOptions.columnWidths
+    local cellPad = widths.cellPad
+    local sep = string.rep(" ", cellPad)
+    local effectiveNameWidth = widths.name
+    if not anyWeapon then
+        effectiveNameWidth = widths.name + widths.weaponType + widths.weaponDam + (cellPad * 2)
+    end
+
+    local function deltaCell(value, suffix)
+        local n = roundInt(value)
+        local magnitude = math.abs(n)
+        if n > 0 then
+            return string.format("@G%d@D%s@w", magnitude, suffix)
+        elseif n < 0 then
+            return string.format("@R%d@D%s@w", magnitude, suffix)
+        end
+        return string.format("@D0%s@w", suffix)
+    end
+
+    local function renderDeltaLine(diff)
+        local d = diff or {}
+        local idBlank = string.rep(" ", 11)
+        local cells = {
+            idBlank, " ",
+            padCell("@WDelta:@w", effectiveNameWidth, "left"), sep,
+            padCell("", widths.level, "left"), sep,
         }
-        dbot.print(renderRow(advColumns, advRow))
+        if displayOptions.includeWearLoc then
+            table.insert(cells, padCell("", widths.wearLoc, "left"))
+            table.insert(cells, sep)
+        end
+        if anyWeapon then
+            table.insert(cells, padCell("", widths.weaponType, "left"))
+            table.insert(cells, sep)
+            local weaponDamDelta = d.weaponAveDelta
+            if weaponDamDelta == nil then
+                weaponDamDelta = d.ave
+            end
+            table.insert(cells, padCell(deltaCell(weaponDamDelta, "dam"), widths.weaponDam, "left"))
+            table.insert(cells, sep)
+        end
+        local statCells = {
+            { d.str,  "str",  widths.stat },
+            { d.int,  "int",  widths.stat },
+            { d.wis,  "wis",  widths.stat },
+            { d.dex,  "dex",  widths.stat },
+            { d.con,  "con",  widths.stat },
+            { d.lck,  "luc",  widths.stat },
+            { d.hr,   "hr",   widths.roll },
+            { d.dr,   "dr",   widths.roll },
+            { d.hp,   "hp",   widths.resource },
+            { d.mana, "mn",   widths.resource },
+            { d.move, "mv",   widths.resource },
+        }
+        for _, c in ipairs(statCells) do
+            table.insert(cells, padCell(deltaCell(c[1], c[2]), c[3], "left"))
+            table.insert(cells, sep)
+        end
+        table.insert(cells, padCell("", widths.ris, "left"))
+        return table.concat(cells, "")
+    end
+
+    local function diffSignature(row)
+        local d = row.diff or {}
+        return table.concat({
+            tostring(row.againstId or ""),
+            tostring(row.loc or ""),
+            tostring(roundInt(d.ave)),
+            tostring(roundInt(d.sec)),
+            tostring(roundInt(d.hr)),
+            tostring(roundInt(d.dr)),
+            tostring(roundInt(d.str)),
+            tostring(roundInt(d.int)),
+            tostring(roundInt(d.wis)),
+            tostring(roundInt(d.dex)),
+            tostring(roundInt(d.con)),
+            tostring(roundInt(d.lck)),
+            tostring(roundInt(d.res)),
+            tostring(roundInt(d.hp)),
+            tostring(roundInt(d.mana)),
+            tostring(roundInt(d.move)),
+            tostring(roundInt(d.effects)),
+        }, "|")
+    end
+
+    local function renderBanner(startLvl, endLvl, scoreDelta)
+        local n = roundInt(scoreDelta or 0)
+        local scoreTxt
+        if n > 0 then
+            scoreTxt = "@Gscore +" .. n .. "@w"
+        elseif n < 0 then
+            scoreTxt = "@Rscore " .. n .. "@w"
+        else
+            scoreTxt = "@Dscore 0@w"
+        end
+        local lvlPart
+        if startLvl == endLvl then
+            lvlPart = string.format("@WLevel %d@w", startLvl)
+        else
+            lvlPart = string.format("@WLevels %d-%d @Y(%d lvls)@w",
+                startLvl, endLvl, endLvl - startLvl + 1)
+        end
+        return string.format("@D-- @w%s  %s", lvlPart, scoreTxt)
+    end
+
+    local i = 1
+    while i <= #rows do
+        local startIdx = i
+        local sig = diffSignature(rows[i])
+        while i + 1 <= #rows
+            and rows[i + 1].level - rows[i].level == skip
+            and diffSignature(rows[i + 1]) == sig do
+            i = i + 1
+        end
+        local headRow = rows[startIdx]
+        local d = headRow.diff or {}
+
+        dbot.print("")
+        dbot.print(renderBanner(rows[startIdx].level, rows[i].level, d.scoreDelta))
+        displayAuctionTargetRow()
+        inv.items.displayItem(headRow.againstId, "itemid", displayOptions)
+        dbot.print(renderDeltaLine(d))
+        i = i + 1
     end
 
     return DRL_RET_SUCCESS
@@ -649,7 +732,7 @@ function inv.compare.covet(priorityName, auctionNum, skipLevels, endTag)
     local marketCmd = (objId < threshold) and "bid " or "lbid "
     local fence = "DINV covet fence " .. tostring(objId) .. " " .. tostring(os.time())
 
-    inv.items.setItem(objId, { stats = { [invStatFieldId] = tostring(objId), identifyLevel = invIdLevelNone } })
+    inv.items.setItem(objId, { stats = { [invStatFieldId] = tostring(objId), identifyLevel = invIdLevelNone, [invStatFieldLocation] = "auction" } })
     inv.compare.covetPkg = {
         priorityName = priorityName,
         auctionNum = objId,

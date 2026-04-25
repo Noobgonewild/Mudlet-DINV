@@ -232,23 +232,6 @@ function inv.items.parseIdentifyLine(item, line)
 
     item.stats = item.stats or {}
 
-    local function stripColors(str)
-        if not str then
-            return ""
-        end
-        str = tostring(str)
-        -- Strip all Aardwolf color codes comprehensively (order matters!)
-        str = str:gsub("@x%d%d%d", "")  -- Extended colors @x123
-        str = str:gsub("@x%d%d", "")    -- Extended colors @x12
-        str = str:gsub("@x%d", "")      -- Extended colors @x1
-        str = str:gsub("@[bBcCrRmMgGwWyYdD]", "")  -- Basic colors
-        str = str:gsub("@[A-Za-z]", "") -- Any remaining single-char codes
-        str = str:gsub("@@", "@")       -- Escaped @ becomes literal @
-        str = str:gsub("\027%[[%d;]*m", "")  -- ANSI escapes
-        str = str:gsub("\x1b%[[%d;]*m", "")  -- ANSI escapes (hex)
-        return str
-    end
-
     ---------------------------------------------------------------------------
     -- Character-by-character extraction (ported from RID module)
     ---------------------------------------------------------------------------
@@ -386,7 +369,7 @@ function inv.items.parseIdentifyLine(item, line)
 
     -- Clean up the line
     local trimmed = tostring(line):gsub("^%s+", ""):gsub("%s+$", "")
-    local cleanLine = stripColors(trimmed)
+    local cleanLine = dbot.stripColors(trimmed)
     local lowerLine = cleanLine:lower()
     local lowerTrimmed = cleanLine:lower()
     local originalLine = line
@@ -424,10 +407,9 @@ function inv.items.parseIdentifyLine(item, line)
         -- Strip enchant text that may have been appended (e.g., "Wisdom +4 (removable...)")
         name = name:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%)%s*", "")
         name = name:gsub("%s+%(removable[^%)]*%)%s*", "")
-        item.stats[invStatFieldName] = stripColors(name)
+        item.stats[invStatFieldName] = dbot.stripColors(name)
         if not item.stats[invStatFieldColorName] or item.stats[invStatFieldColorName] == "" then
             local colorName = tostring(originalLine):match("Name%s+:%s+(.-)%s*|$") or name
-            -- Strip enchant text from colorname too
             colorName = colorName:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%)%s*", "")
             colorName = colorName:gsub("%s+%(removable[^%)]*%)%s*", "")
             item.stats[invStatFieldColorName] = colorName
@@ -821,7 +803,9 @@ function inv.items.parseIdentifyLine(item, line)
             item.stats[invStatFieldName] = (item.stats[invStatFieldName] or "") .. " " .. continuation
             local existingColor = item.stats[invStatFieldColorName]
             if existingColor and existingColor ~= "" then
-                item.stats[invStatFieldColorName] = existingColor .. " " .. continuation
+                if dbot.stripColors(existingColor) ~= item.stats[invStatFieldName] then
+                    item.stats[invStatFieldColorName] = existingColor .. " " .. continuation
+                end
             else
                 item.stats[invStatFieldColorName] = item.stats[invStatFieldName]
             end

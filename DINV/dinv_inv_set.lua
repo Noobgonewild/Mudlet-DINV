@@ -96,11 +96,7 @@ local function getItemEffectText(objId)
     local flags = tostring(inv.items.getStatField(objId, invStatFieldFlags) or "")
     local combined = string.lower(affects .. " " .. spells .. " " .. flags)
 
-    local itemName = tostring(inv.items.getStatField(objId, invStatFieldName) or "")
-    if dbot and dbot.stripColors then
-        itemName = dbot.stripColors(itemName)
-    end
-    itemName = string.lower(itemName)
+    local itemName = string.lower(dbot.stripColors(inv.items.getStatField(objId, invStatFieldName) or ""))
 
     local questEffects = invSetQuestEffectMap[itemName]
     if questEffects then

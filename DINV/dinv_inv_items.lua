@@ -199,16 +199,6 @@ function inv.items.clearInlineProgress()
     inv.items.finalizeInlineProgress()
 end
 
--- Strip @X codes only; dbot.stripColors also consumes literal '<' characters.
-local function stripAardwolfCodes(s)
-    if s == nil then return "" end
-    s = s:gsub("@@", "\001AT\001")
-    s = s:gsub("@x%d+", "")
-    s = s:gsub("@[%a]", "")
-    s = s:gsub("\001AT\001", "@")
-    return s
-end
-
 function inv.items.showProgress(stage, current, total, itemName)
     inv.items.progress.stage = stage
     inv.items.progress.current = current
@@ -245,11 +235,11 @@ function inv.items.showProgress(stage, current, total, itemName)
         -- Strip enchant text from display name
         local displayName = itemName:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%)%s*", "")
         displayName = displayName:gsub("%s+%(removable[^%)]*%)%s*", "")
-        cleanedItemName = stripAardwolfCodes(displayName)
+        cleanedItemName = dbot.stripColors(displayName)
         msg = msg .. " " .. displayName
     end
 
-    local plainMsg = stripAardwolfCodes(msg)
+    local plainMsg = dbot.stripColors(msg)
     local converted = dbot.convertColors and dbot.convertColors(msg) or msg
     local fullMsg = "<cyan>[DINV] " .. stage .. ": <reset>" .. converted
 
@@ -1698,12 +1688,12 @@ function inv.items._parseDataLine(dataLine, source)
     item.stats = item.stats or {}
     local existingColorName = item.stats[invStatFieldColorName]
     item.stats[invStatFieldId] = objId
-    item.stats[invStatFieldName] = dbot.stripColors and dbot.stripColors(itemName) or itemName
+    item.stats[invStatFieldName] = dbot.stripColors(itemName)
     -- Always update colorname from invdata if we have a valid name
     -- Only keep existing if the new itemName is empty or worse
     if itemName and itemName ~= "" then
-        local existingPlain = existingColorName and (dbot.stripColors and dbot.stripColors(existingColorName) or existingColorName) or ""
-        local newPlain = dbot.stripColors and dbot.stripColors(itemName) or itemName
+        local existingPlain = existingColorName and dbot.stripColors(existingColorName) or ""
+        local newPlain = dbot.stripColors(itemName)
         local existingHasColorCodes = existingColorName and tostring(existingColorName):find("@", 1, true) ~= nil
         local newHasColorCodes = tostring(itemName):find("@", 1, true) ~= nil
         if existingHasColorCodes and not newHasColorCodes and newPlain == existingPlain then
@@ -3631,10 +3621,20 @@ function inv.items.displayItem(objId, displayMode, options)
         if cechoLink then
             local idPrefix = "@Y" .. formattedId .. "@W "
             if raw:sub(1, #idPrefix) == idPrefix then
-                local linkCommand = string.format("inv.items.runReportFromLink(%q)", tostring(objId))
-                local tooltip = "Run: dinv report " .. tostring(objId)
+                local location = tostring(inv.items.getStatField(objId, invStatFieldLocation) or "")
                 local remainder = raw:sub(#idPrefix + 1)
-                cechoLink("<yellow>" .. formattedId .. "<reset>", linkCommand, tooltip, true)
+                local auctionLabelPrefix = "Auction #" .. tostring(objId)
+                if location == "auction" and remainder:sub(1, #auctionLabelPrefix) == auctionLabelPrefix then
+                    local linkCommand = string.format("send([[lbid %s]])", tostring(objId))
+                    local tooltip = "Run: lbid " .. tostring(objId)
+                    cechoLink("<yellow>" .. formattedId .. "<reset>", linkCommand, tooltip, true)
+                elseif location ~= "auction" then
+                    local linkCommand = string.format("inv.items.runReportFromLink(%q)", tostring(objId))
+                    local tooltip = "Run: dinv report " .. tostring(objId)
+                    cechoLink("<yellow>" .. formattedId .. "<reset>", linkCommand, tooltip, true)
+                else
+                    cecho("<yellow>" .. formattedId .. "<reset>")
+                end
                 cecho(" " .. dbot.convertColors(remainder) .. "\n")
                 return
             end
@@ -3756,25 +3756,25 @@ function inv.items.displayItem(objId, displayMode, options)
         }
         for _, stat in ipairs(statLabels) do
             local val = tonumber(inv.items.getStatField(objId, stat.field)) or 0
-            table.insert(baseStats, string.format("@G%d@D%s@w", val, stat.label))
+            table.insert(baseStats, string.format("%s%d@D%s@w", val < 0 and "@R" or "@G", val, stat.label))
         end
 
         local rollStats = {}
-        table.insert(rollStats, string.format("@G%d@Dhr@w", hr))
-        table.insert(rollStats, string.format("@G%d@Ddr@w", dr))
+        table.insert(rollStats, string.format("%s%d@Dhr@w", hr < 0 and "@R" or "@G", hr))
+        table.insert(rollStats, string.format("%s%d@Ddr@w", dr < 0 and "@R" or "@G", dr))
 
         local resourceStats = {}
         local hpVal = tonumber(inv.items.getStatField(objId, invStatFieldHp)) or 0
         local manaVal = tonumber(inv.items.getStatField(objId, invStatFieldMana)) or 0
         local movesVal = tonumber(inv.items.getStatField(objId, invStatFieldMoves)) or 0
         if hpVal ~= 0 then
-            table.insert(resourceStats, string.format("@G%d@Dhp@w", hpVal))
+            table.insert(resourceStats, string.format("%s%d@Dhp@w", hpVal < 0 and "@R" or "@G", hpVal))
         end
         if manaVal ~= 0 then
-            table.insert(resourceStats, string.format("@G%d@Dmn@w", manaVal))
+            table.insert(resourceStats, string.format("%s%d@Dmn@w", manaVal < 0 and "@R" or "@G", manaVal))
         end
         if movesVal ~= 0 then
-            table.insert(resourceStats, string.format("@G%d@Dmv@w", movesVal))
+            table.insert(resourceStats, string.format("%s%d@Dmv@w", movesVal < 0 and "@R" or "@G", movesVal))
         end
 
         local statText = buildStatBlock(baseStats)
@@ -3847,19 +3847,9 @@ function inv.items.displayItem(objId, displayMode, options)
                 risChannel
             }, "")
         else
-            local function stripColorCodes(value)
-                if dbot.stripColors then
-                    return dbot.stripColors(value or "")
-                end
-                local text = tostring(value or "")
-                text = text:gsub("@x%d+", "")
-                text = text:gsub("@.", "")
-                return text
-            end
-
             local function padColored(value, width)
                 local raw = tostring(value or "")
-                local plain = stripColorCodes(raw)
+                local plain = dbot.stripColors(raw)
                 local pad = math.max(0, (width or 0) - #plain)
                 return raw .. string.rep(" ", pad)
             end
@@ -3942,7 +3932,7 @@ function inv.items.displayItem(objId, displayMode, options)
             end
 
             local widths = (options and options.columnWidths) or {}
-            local nameWidth = widths.name or 42
+            local nameWidth = widths.name or 40
             local levelWidth = widths.level or 5
             local wearLocWidth = widths.wearLoc or 8
             local weaponTypeWidth = widths.weaponType or 6
@@ -3959,7 +3949,8 @@ function inv.items.displayItem(objId, displayMode, options)
                 if num == 0 then
                     return string.format("@D%d%s@w", num, suffix)
                 end
-                return string.format("@G%d@D%s@w", num, suffix)
+                local valueColor = num < 0 and "@R" or "@G"
+                return string.format("%s%d@D%s@w", valueColor, num, suffix)
             end
 
             local levelText = string.format("@Wlv@G%d@w", level)
@@ -3985,7 +3976,18 @@ function inv.items.displayItem(objId, displayMode, options)
                 effectiveNameWidth = nameWidth + weaponTypeWidth + weaponDamWidth + (cellPad * 2)
             end
 
-            local wrappedNameLines = wrapColoredText(nameText, effectiveNameWidth)
+            local wrappedNameLines
+            if options and options.truncateName then
+                local plainName = dbot.stripColors(nameText)
+                local limit = tonumber(effectiveNameWidth) or 0
+                if limit > 0 and #plainName > limit then
+                    local keep = math.max(1, limit - 1)
+                    plainName = plainName:sub(1, keep) .. "…"
+                end
+                wrappedNameLines = { plainName }
+            else
+                wrappedNameLines = wrapColoredText(nameText, effectiveNameWidth)
+            end
 
             local cells = {
                 "@Y", formattedId, "@W ",
@@ -4101,7 +4103,7 @@ function inv.items.displayResults(itemIds, displayMode, options)
             or inv.items.getStatField(objId, invStatFieldName)
             or "Unknown"
         rawName = rawName:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%).*", "")
-        local plainName = dbot.stripColors and dbot.stripColors(rawName) or rawName
+        local plainName = dbot.stripColors(rawName)
         if #plainName > maxNameWidth then
             maxNameWidth = #plainName
         end
@@ -4124,7 +4126,7 @@ function inv.items.displayResults(itemIds, displayMode, options)
             end
         end
     end
-    maxNameWidth = math.min(maxNameWidth, 48)
+    maxNameWidth = math.min(maxNameWidth, 35)
 
     local displayOptions = {
         columnWidths = {
