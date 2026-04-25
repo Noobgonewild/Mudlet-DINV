@@ -196,6 +196,7 @@ function inv.score.extended(itemStats, priorityName, handicap, level, isOffhand)
         moves = "moves",
         allphys = "allphys",
         allmagic = "allmagic",
+        offhandDam = "offhandDam",
     }
 
     -- Calculate stat contribution with equipment cap per stat
@@ -253,13 +254,7 @@ function inv.score.extended(itemStats, priorityName, handicap, level, isOffhand)
         local spells = tostring(itemStats[invStatFieldSpells] or itemStats.spells or "")
         local flags = tostring(itemStats[invStatFieldFlags] or itemStats.flags or "")
         local combined = string.lower(affects .. " " .. spells .. " " .. flags)
-        local itemName = tostring(itemStats[invStatFieldName] or itemStats.name or "")
-
-        if dbot and dbot.stripColors then
-            itemName = dbot.stripColors(itemName)
-        end
-
-        itemName = string.lower(itemName)
+        local itemName = string.lower(dbot.stripColors(itemStats[invStatFieldName] or itemStats.name or ""))
 
         local questEffectMap = {
             ["aardwolf gloves of dexterity"] = { "dualwield" },
@@ -414,6 +409,14 @@ end
 function inv.score.getItemScore(objId, priorityName, level)
     local score, _, _ = inv.score.item(objId, priorityName, nil, level)
     return score
+end
+
+function inv.score.getItemScoreForLoc(objId, priorityName, level, loc)
+    local primaryScore, offhandScore = inv.score.item(objId, priorityName, nil, level)
+    if tostring(loc or "") == "second" then
+        return offhandScore or 0
+    end
+    return primaryScore or 0
 end
 
 function inv.score.getSetScore(itemIds, priorityName, level)

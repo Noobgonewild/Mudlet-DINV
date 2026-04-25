@@ -250,13 +250,18 @@ function dbot.convertColors(str)
     return str
 end
 
--- Strip color codes for width calculations
+-- Strip Aardwolf @ color codes and ANSI escape sequences. Single source
+-- of truth for color stripping across the plugin. Must NOT remove other
+-- punctuation such as '<...>' substrings, which are part of some item
+-- names (e.g. "<! Jenny's Magical Pendant !>").
 function dbot.stripColors(str)
     if str == nil then return "" end
-    str = str:gsub("@@", "@")
-    str = str:gsub("@x%d+", "")
-    str = str:gsub("@[%a]", "")
-    str = str:gsub("<[^>]+>", "")
+    str = tostring(str)
+    str = str:gsub("@@", "\001AT\001")   -- protect escaped @
+    str = str:gsub("@x%d+", "")           -- extended color codes
+    str = str:gsub("@[%a]", "")           -- single-letter color codes
+    str = str:gsub("\027%[[%d;]*m", "")   -- ANSI escape sequences
+    str = str:gsub("\001AT\001", "@")     -- restore escaped @
     return str
 end
 

@@ -127,6 +127,25 @@ function DINV.aliases.register()
         end
     )
 
+    -- dinvcovet <priority> <auction #> [skip] - quick covet via alias bridge
+    DINV.aliases.ids.dinvcovet = tempAlias(
+        "^dinvcovet(.*)$",
+        function()
+            if not (inv and inv.cli and inv.cli.main) then
+                cecho("<red>DINV: Not initialized.\n")
+                return
+            end
+
+            local args = matches and matches[2] or ""
+            args = args:match("^%s*(.-)%s*$")
+            if args ~= "" then
+                inv.cli.main("covet " .. args)
+            else
+                dbot.warn("Usage: dinvcovet <priority> <auction #> [skip]")
+            end
+        end
+    )
+
     -- NOTE: no dedicated `dinv unused` alias is needed.
     -- It is handled by the main `^dinv(.*)$` alias via inv.cli.main().
     -- Keeping a second direct alias causes duplicate execution/output.

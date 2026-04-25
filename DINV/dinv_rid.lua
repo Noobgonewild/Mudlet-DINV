@@ -27,19 +27,6 @@ inv.rid.suppressIdentifyOutput = true
 -- Helper Functions
 ----------------------------------------------------------------------------------------------------
 
-local function stripColors(text)
-    local str = tostring(text or "")
-    str = str:gsub("@x%d%d%d", "")
-    str = str:gsub("@x%d%d", "")
-    str = str:gsub("@x%d", "")
-    str = str:gsub("@[bBcCrRmMgGwWyYdD]", "")
-    str = str:gsub("@[A-Za-z]", "")
-    str = str:gsub("@@", "@")
-    str = str:gsub("\027%[[%d;]*m", "")
-    str = str:gsub("\x1b%[[%d;]*m", "")
-    return str
-end
-
 local function trim(str)
     if not str then return "" end
     return str:match("^%s*(.-)%s*$") or ""
@@ -238,7 +225,7 @@ local knownProperties = {
 
 local function parseLine(line, data, state)
     local parseState = state or inv.rid
-    local clean = stripColors(line)
+    local clean = dbot.stripColors(line)
     
     -- Must start with |
     if not clean:match("^%s*|") then
@@ -897,7 +884,7 @@ function inv.rid.sendReport()
     end
 
     local report = inv.rid.buildCompactReport()
-    local message = stripColors(report)
+    local message = dbot.stripColors(report)
     
     if channel.type == "gt" or channel.type == "gtell" then
         send("gt " .. message)

@@ -278,28 +278,231 @@ local function discoverEligiblePriorities(priorityFilter)
 end
 
 local function emitScoredRow(entry)
-    local summaryParts = {}
-    for _, priorityName in ipairs(entry.betterFor or {}) do
-        local priorityScore = roundInt((entry.priorityScores or {})[priorityName] or 0)
-        local levelRange = (entry.priorityLevelRanges or {})[priorityName]
-        if levelRange and levelRange ~= "" then
-            summaryParts[#summaryParts + 1] = string.format("%s (%+d @ %s)", tostring(priorityName), priorityScore, levelRange)
-        else
-            summaryParts[#summaryParts + 1] = string.format("%s (%+d)", tostring(priorityName), priorityScore)
+    local function countLevelsInRanges(rangeText)
+        local total = 0
+        local text = tostring(rangeText or "")
+        if text == "" then
+            return 0
+        end
+        for chunk in string.gmatch(text, "[^,]+") do
+            local token = trim(chunk)
+            local startLvl, endLvl = token:match("^(%-?%d+)%s*%-%s*(%-?%d+)$")
+            if startLvl and endLvl then
+                local a = tonumber(startLvl) or 0
+                local b = tonumber(endLvl) or a
+                if b < a then
+                    a, b = b, a
+                end
+                total = total + (b - a + 1)
+            else
+                local single = tonumber(token)
+                if single then
+                    total = total + 1
+                end
+            end
+        end
+        return total
+    end
+
+    local function prioritySummaryPart(priorityName)
+        local pr = tostring(priorityName)
+        local score = roundInt((entry.priorityScores or {})[pr] or 0)
+        local ranges = tostring((entry.priorityLevelRanges or {})[pr] or "")
+        local levelCount = countLevelsInRanges(ranges)
+        return string.format("%s(+%d over %d levels)", pr, math.abs(score), levelCount)
+    end
+
+    local function appendAuctionTimingText()
+        local timeLeft = tostring(entry.timeLeft or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if timeLeft ~= "" then
+            cecho("<white> Auction will end in " .. timeLeft .. "<reset>")
         end
     end
-    local summary = (#summaryParts > 0) and table.concat(summaryParts, " / ") or "-"
-    if cecho and cechoLink then
+
+    if cecho then
         cecho("<cyan>[<reset>")
-        cechoLink("<yellow>" .. tostring(entry.num) .. "<reset>", "send([[lbid " .. tostring(entry.num) .. "]])", "Run: lbid " .. tostring(entry.num), true)
+        local lbidCmd = "lbid " .. tostring(entry.num)
+        local idColor = entry.isWinningBid and "<green>" or "<yellow>"
+        local visible = idColor .. tostring(entry.num) .. "<reset>"
+        if cechoLink then
+            cechoLink(visible, "send([[" .. lbidCmd .. "]])", "Run: " .. lbidCmd, true)
+        else
+            cecho(visible)
+        end
         cecho("<cyan>]<reset> ")
         cecho("<white>" .. tostring(entry.name) .. "<reset> ")
-        cecho("<magenta>" .. summary .. "<reset>\n")
+
+        local priorities = entry.betterFor or {}
+        if #priorities > 0 and cechoLink then
+            for i, priorityName in ipairs(priorities) do
+                if i > 1 then
+                    cecho("<white> / <reset>")
+                end
+
+                local pr = tostring(priorityName)
+                local label = string.format("<cyan>%s<reset>", prioritySummaryPart(pr))
+                local command = string.format("inv.discover.showPriorityAnalysis(%q, %q)", tostring(entry.num), pr)
+                cechoLink(label, command, "Show discover analysis for " .. pr, true)
+            end
+            appendAuctionTimingText()
+            cecho("\n")
+        elseif #priorities > 0 then
+            local parts = {}
+            for _, priorityName in ipairs(priorities) do
+                parts[#parts + 1] = prioritySummaryPart(priorityName)
+            end
+            cecho("<white>" .. table.concat(parts, " / ") .. "<reset>")
+            appendAuctionTimingText()
+            cecho("\n")
+        else
+            cecho("-\n")
+        end
     else
-        dbot.print(string.format("@C[%s]@w %s @M%s@w", tostring(entry.num), tostring(entry.name), summary))
+        local parts = {}
+        for _, priorityName in ipairs(entry.betterFor or {}) do
+            parts[#parts + 1] = prioritySummaryPart(priorityName)
+        end
+        local summary = (#parts > 0) and table.concat(parts, " / ") or "-"
+        local timingSuffix = ""
+        local timeLeft = tostring(entry.timeLeft or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if timeLeft ~= "" then
+            timingSuffix = " Auction will end in " .. timeLeft
+        end
+        local idColor = entry.isWinningBid and "@G" or "@Y"
+        dbot.print(string.format("@C[%s%s@C]@w %s @M%s@w%s", idColor, tostring(entry.num), tostring(entry.name), summary, timingSuffix))
     end
+    return nil
 end
 
+function inv.discover.showPriorityAnalysis(auctionNum, priorityName)
+    local entry = findCachedEntryByAuctionNum(auctionNum)
+    local pr = tostring(priorityName or "")
+    if not entry then
+        dbot.warn("No cached discover result found for auction #" .. tostring(auctionNum))
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    local details = entry.priorityDetails and entry.priorityDetails[pr] or nil
+    if not details or #details == 0 then
+        dbot.warn("No cached discover analysis for auction #" .. tostring(auctionNum) .. " priority '" .. pr .. "'.")
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    dbot.print("@WDiscover Analysis:@w")
+    if cecho and cechoLink then
+        cecho("  <cyan>Target<white>: <reset>")
+        cechoLink(
+            "<yellow>" .. tostring(auctionNum) .. "<reset>",
+            "send([[lbid " .. tostring(auctionNum) .. "]])",
+            "Run: lbid " .. tostring(auctionNum),
+            true
+        )
+        cecho("<white> Auction #" .. tostring(auctionNum) .. " <yellow>(level " .. tostring(entry.level or "?") .. ")<reset>\n")
+    else
+        dbot.print("  @CTarget@W: " .. tostring(auctionNum) .. " Auction #" .. tostring(auctionNum) .. " @Y(level " .. tostring(entry.level or "?") .. ")@w")
+    end
+    dbot.print("  @CPriority@W: " .. pr)
+    dbot.print("  @CBest score delta@W: @G+" .. tostring(roundInt((entry.priorityScores or {})[pr] or 0)) .. "@w")
+    dbot.print("  @CPositive levels@W: " .. tostring((entry.priorityLevelRanges or {})[pr] or "-"))
+    dbot.print("")
+
+    local idx = 1
+    while idx <= #details do
+        local start = idx
+        local delta = roundInt(details[idx].scoreDelta or 0)
+        while idx + 1 <= #details
+            and (details[idx + 1].level == details[idx].level + 1)
+            and roundInt(details[idx + 1].scoreDelta or 0) == delta do
+            idx = idx + 1
+        end
+
+        local startLvl = details[start].level
+        local endLvl = details[idx].level
+        if startLvl == endLvl then
+            dbot.print(string.format("  @D-- @WLevel %d@w  @Gscore +%d@w", startLvl, delta))
+        else
+            dbot.print(string.format("  @D-- @WLevels %d-%d@w  @Gscore +%d@w", startLvl, endLvl, delta))
+        end
+        idx = idx + 1
+    end
+
+    return DRL_RET_SUCCESS
+end
+local function findCachedEntryByAuctionNum(auctionNum)
+    local st = inv.discover.state
+    local key = tostring(auctionNum or "")
+    for _, entry in ipairs(st.cachedResults or {}) do
+        if tostring(entry.num or "") == key then
+            return entry
+        end
+    end
+    return nil
+end
+local function findCachedEntryByAuctionNum(auctionNum)
+    local st = inv.discover.state
+    local key = tostring(auctionNum or "")
+    for _, entry in ipairs(st.cachedResults or {}) do
+        if tostring(entry.num or "") == key then
+            return entry
+        end
+    end
+    return nil
+end
+
+function inv.discover.showPriorityAnalysis(auctionNum, priorityName)
+    local entry = findCachedEntryByAuctionNum(auctionNum)
+    local pr = tostring(priorityName or "")
+    if not entry then
+        dbot.warn("No cached discover result found for auction #" .. tostring(auctionNum))
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    local details = entry.priorityDetails and entry.priorityDetails[pr] or nil
+    if not details or #details == 0 then
+        dbot.warn("No cached discover analysis for auction #" .. tostring(auctionNum) .. " priority '" .. pr .. "'.")
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    if not inv.compare or not inv.compare.covetAnalyze then
+        dbot.warn("Discover analysis renderer is unavailable.")
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    local st = inv.discover.state
+    local key = tostring(auctionNum or "")
+    local sourceItem = (st.itemCache and st.itemCache[key]) or entry.itemData
+    if not sourceItem then
+        dbot.warn("No cached market item payload found for auction #" .. tostring(auctionNum))
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    local previous = copyTable(inv.items.getItem(key))
+    local tempItem = copyTable(sourceItem)
+    tempItem.stats = copyTable(tempItem.stats or {})
+    tempItem.stats[invStatFieldId] = key
+    tempItem.stats[invStatFieldName] = "Auction #" .. key
+    tempItem.stats[invStatFieldColorName] = "Auction #" .. key
+    tempItem.stats[invStatFieldLocation] = "auction"
+
+    inv.items.setItem(key, tempItem)
+
+    local ok, retval = pcall(function()
+        return inv.compare.covetAnalyze(pr, tonumber(key) or key, 1)
+    end)
+
+    if previous then
+        inv.items.setItem(key, previous)
+    else
+        inv.items.removeItem(key)
+    end
+
+    if not ok then
+        dbot.warn("Failed to render discover analysis for auction #" .. tostring(auctionNum))
+        return DRL_RET_OPERATION_FAILED
+    end
+
+    return retval or DRL_RET_SUCCESS
+end
 local function formatLevelRanges(levels)
     if not levels or #levels == 0 then
         return ""
@@ -399,6 +602,7 @@ local function scoreItemAgainstPriorities(item, priorities)
     local betterFor = {}
     local priorityScores = {}
     local priorityLevelRanges = {}
+    local priorityDetails = {}
     local totalScore = 0
     local itemLevel = getItemLevelForScore(item)
     local tier = (dbot.gmcp and dbot.gmcp.getTier and dbot.gmcp.getTier()) or 0
@@ -411,19 +615,22 @@ local function scoreItemAgainstPriorities(item, priorities)
         local levels = analysis and analysis.levels or nil
         local bestDelta = 0
         local positiveLevels = {}
+        local rows = {}
+        local positiveDeltaSum = 0
+        local positiveDeltaCount = 0
 
         if levels then
             for lvl = minLevel, maxLevel do
                 local entry = levels[tostring(lvl)]
                 if entry and entry.equipment then
                     local effectiveLevel = lvl + tierBonus
-                    local targetScore = inv.score.getItemScore(objId, priorityName, effectiveLevel)
                     local levelBestDelta = nil
 
                     for loc in pairs(locs) do
                         local wornId = entry.equipment[loc]
                         if wornId then
-                            local wornScore = inv.score.getItemScore(wornId, priorityName, effectiveLevel)
+                            local targetScore = inv.score.getItemScoreForLoc(objId, priorityName, effectiveLevel, loc)
+                            local wornScore = inv.score.getItemScoreForLoc(wornId, priorityName, effectiveLevel, loc)
                             local delta = (tonumber(targetScore) or 0) - (tonumber(wornScore) or 0)
                             if not levelBestDelta or delta > levelBestDelta then
                                 levelBestDelta = delta
@@ -436,6 +643,12 @@ local function scoreItemAgainstPriorities(item, priorities)
                     end
                     if levelBestDelta and levelBestDelta > 0 then
                         positiveLevels[#positiveLevels + 1] = lvl
+                        rows[#rows + 1] = {
+                            level = lvl,
+                            scoreDelta = levelBestDelta,
+                        }
+                        positiveDeltaSum = positiveDeltaSum + levelBestDelta
+                        positiveDeltaCount = positiveDeltaCount + 1
                     end
                 end
             end
@@ -443,15 +656,20 @@ local function scoreItemAgainstPriorities(item, priorities)
 
         if bestDelta > 0 then
             betterFor[#betterFor + 1] = priorityName
-            priorityScores[priorityName] = bestDelta
+            local averageDelta = 0
+            if positiveDeltaCount > 0 then
+                averageDelta = roundInt(positiveDeltaSum / positiveDeltaCount)
+            end
+            priorityScores[priorityName] = averageDelta
             priorityLevelRanges[priorityName] = formatLevelRanges(positiveLevels)
-            totalScore = totalScore + bestDelta
+            priorityDetails[priorityName] = rows
+            totalScore = totalScore + averageDelta
         end
     end
 
     restoreTemporaryItem(objId, previous)
 
-    return totalScore, betterFor, priorityScores, priorityLevelRanges
+    return totalScore, betterFor, priorityScores, priorityLevelRanges, priorityDetails
 end
 
 local function scoreCollectedItems()
@@ -473,7 +691,7 @@ local function scoreCollectedItems()
     end
 
     for idx, item in ipairs(collectedList) do
-        local score, betterFor, priorityScores, priorityLevelRanges = scoreItemAgainstPriorities(item, st.eligiblePriorities)
+        local score, betterFor, priorityScores, priorityLevelRanges, priorityDetails = scoreItemAgainstPriorities(item, st.eligiblePriorities)
         if score > 0 and #betterFor > 0 then
             scored[#scored + 1] = {
                 num = tostring(item.num),
@@ -482,7 +700,11 @@ local function scoreCollectedItems()
                 betterFor = betterFor,
                 priorityScores = priorityScores,
                 priorityLevelRanges = priorityLevelRanges,
+                priorityDetails = priorityDetails,
                 level = getItemLevelForScore(item),
+                timeLeft = item.time_left,
+                isWinningBid = item.is_winning_bid == true,
+                itemData = copyTable(item),
             }
         end
 
@@ -616,7 +838,9 @@ function inv.discover.onListRow(num, desc, lvl, typ, lastBid, bids, timeLeft)
     it.desc = trim(desc)
     it.list_level = tonumber(lvl) or 0
     it.list_type = trim((typ or ""):gsub("^%s*%*%s*", ""))
-    it.last_bid = tostring(lastBid or ""):gsub("%*$", "")
+    local rawLastBid = tostring(lastBid or "")
+    it.last_bid = rawLastBid:gsub("%*$", "")
+    it.is_winning_bid = rawLastBid:find("%*$") ~= nil
     it.bids = tonumber(bids) or 0
     it.time_left = trim(timeLeft)
     if cached then
@@ -1039,6 +1263,8 @@ Usage:
 Notes:
   - Setting a type replaces the previous discover type.
   - Scan output is quiet and only prints scored items with @Gscore > 0@W.
+  - Delta values are computed against max-stat caps for your setup.
+  - Because caps are considered, replacing a @G6str@W item with a @G7str@W item can still show @D0str@W delta.
   - Market numbers are clickable and run @Glbid <num>@W.
   - Results are cached in-memory only and are not saved across client restarts.
 ]])
