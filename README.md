@@ -21,7 +21,8 @@ Search output with better params and easier to use. Dinv search basically suppor
 
 DINV discover, used to find equipment upgrades, scored against defined priorities.
 
-<img width="900" height="693" alt="2026-04-12 19_55_30-Aardwolf - Mudlet 4 20 1" src="https://github.com/user-attachments/assets/81f1b5a7-ff88-489d-add8-37e4c8741218" />
+<img width="1482" height="613" alt="2026-04-24 00_05_23-Aardwolf - Mudlet 4 20 1" src="https://github.com/user-attachments/assets/2ff73e32-0454-4c01-ba5b-19c3a174ce86" />
+
 
 
 Auto testing on level-up if new equipment can be worn (against cache or live build; can be turned off)
