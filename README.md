@@ -21,7 +21,8 @@ Search output with better params and easier to use. Dinv search basically suppor
 
 DINV discover, used to find equipment upgrades, scored against defined priorities.
 
-<img width="1482" height="613" alt="2026-04-24 00_05_23-Aardwolf - Mudlet 4 20 1" src="https://github.com/user-attachments/assets/2ff73e32-0454-4c01-ba5b-19c3a174ce86" />
+<img width="1571" height="812" alt="2026-04-25 12_05_31-Aardwolf - Mudlet 4 20 1" src="https://github.com/user-attachments/assets/2164dbba-18f5-4d37-908f-3e31d27ec41b" />
+
 
 
 
