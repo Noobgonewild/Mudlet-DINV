@@ -1054,7 +1054,25 @@ function inv.items.buildSingleItem(objId, source)
     end
 
     dbot.debug("buildSingleItem: starting identify for objId=" .. tostring(objId) .. " source=" .. tostring(source), "inv.items")
-    inv.items.identifyNext()
+
+    local debounceSeconds = inv.items.identifyBatchDebounceSeconds or 0.3
+    inv.items.identifyBatchPending = true
+    tempTimer(debounceSeconds, function()
+        if not inv.items.identifyBatchPending then
+            return
+        end
+        inv.items.identifyBatchPending = nil
+        if not inv.items.buildInProgress or not inv.items.identifyInProgress then
+            return
+        end
+        local total = #(inv.items.identifyQueue or {})
+        inv.items.identifyTotal = total
+        if inv.items.progress then
+            inv.items.progress.total = total
+        end
+        dbot.debug("buildSingleItem: batch debounce fired, identify queue total=" .. tostring(total), "inv.items")
+        inv.items.identifyNext()
+    end)
     return DRL_RET_SUCCESS
 end
 
@@ -2386,11 +2404,29 @@ function inv.items.identifyNext()
     inv.items.identifyWaitForInvmon = nil
     inv.items.identifyWaitForFence = nil
 
-    inv.items.identifyIndex = (inv.items.identifyIndex or 0) + 1
+    local queue = inv.items.identifyQueue or {}
+    local nextIndex = (inv.items.identifyIndex or 0) + 1
 
-    -- Check if done
-    if inv.items.identifyIndex > #inv.items.identifyQueue then
+    -- Skip stale queue entries that disappeared before identification.
+    while nextIndex <= #queue do
+        local candidateId = queue[nextIndex]
+        if inv.items.getItem(candidateId) then
+            break
+        end
+        dbot.debug("identifyNext: skipping missing queued item objId=" .. tostring(candidateId), "inv.items")
+        table.remove(queue, nextIndex)
+        inv.items.identifyTotal = #queue
+        if inv.items.progress then
+            inv.items.progress.total = #queue
+        end
+    end
+
+    inv.items.identifyQueue = queue
+
+    if nextIndex > #queue then
+        inv.items.identifyIndex = nextIndex
         inv.items.identifyInProgress = false
+        inv.items.identifyPausedForCombat = nil
         inv.items.identifyCurrentId = nil
         inv.items.identifyCurrentContainer = nil
 
@@ -2402,11 +2438,26 @@ function inv.items.identifyNext()
         return
     end
 
-    local objId = inv.items.identifyQueue[inv.items.identifyIndex]
+    if dbot.gmcp and dbot.gmcp.stateIsInCombat and dbot.gmcp.stateIsInCombat() then
+        if not inv.items.identifyPausedForCombat then
+            inv.items.identifyPausedForCombat = true
+            dbot.debug("identifyNext: in combat, pausing identify until combat ends", "inv.items")
+        end
+        tempTimer(0.3, function()
+            if inv.items.buildInProgress and inv.items.identifyInProgress then
+                inv.items.identifyNext()
+            end
+        end)
+        return
+    end
+    inv.items.identifyPausedForCombat = nil
+    inv.items.identifyIndex = nextIndex
+
+    local objId = queue[inv.items.identifyIndex]
     local item = inv.items.getItem(objId)
 
     if not item then
-        -- Item gone, skip
+        -- Item disappeared after queue compaction; move to next.
         tempTimer(0.1, function() inv.items.identifyNext() end)
         return
     end
@@ -2428,6 +2479,7 @@ function inv.items.identifyNext()
     end
 
     inv.items.identifyCurrentId = objId
+    inv.items.identifyEnchantResetId = nil
     -- Prefer colorname, fall back to name, then Unknown
     local itemName = (item.stats and item.stats[invStatFieldColorName])
         or (item.stats and item.stats[invStatFieldName])
@@ -3476,11 +3528,26 @@ function inv.items.search(query, displayMode)
                 elseif key == "worn" then
                     match = inv.items.isWorn(objId)
                 elseif key == "minlevel" then
-                    match = level >= tonumber(value or 0)
+                    local minLevel = tonumber(value)
+                    if minLevel ~= nil then
+                        match = level >= minLevel
+                    else
+                        match = false
+                    end
                 elseif key == "maxlevel" then
-                    match = level <= tonumber(value or 999)
+                    local maxLevel = tonumber(value)
+                    if maxLevel ~= nil then
+                        match = level <= maxLevel
+                    else
+                        match = false
+                    end
                 elseif key == "level" then
-                    match = level == tonumber(value or 0)
+                    local exactLevel = tonumber(value)
+                    if exactLevel ~= nil then
+                        match = level == exactLevel
+                    else
+                        match = false
+                    end
                 elseif inv.items.isKnownQueryKey(key) then
                     local statValue = inv.items.getStatField(objId, key)
                     local lhs = tostring(statValue or ""):lower()

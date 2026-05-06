@@ -357,6 +357,22 @@ function inv.items.parseIdentifyLine(item, line)
     }
     local continuationState = inv.items.identifyContinuation
 
+    local function addEnchantType(kind)
+        if not kind or kind == "" then
+            return
+        end
+        local existing = tostring(item.stats[invStatFieldEnchants] or "")
+        local lowered = existing:lower()
+        if lowered:find(kind:lower(), 1, true) then
+            return
+        end
+        if existing == "" then
+            item.stats[invStatFieldEnchants] = kind
+        else
+            item.stats[invStatFieldEnchants] = existing .. "," .. kind
+        end
+    end
+
     -- Helper to convert strings with commas to numbers
     local function toNumber(value)
         if value == nil then
@@ -397,6 +413,11 @@ function inv.items.parseIdentifyLine(item, line)
     -- Id : 1930857578
     local id = cleanLine:match("Id%s+:%s+(%d+)")
     if id then
+        local normalizedId = tostring(id)
+        if inv.items.identifyEnchantResetId ~= normalizedId then
+            item.stats[invStatFieldEnchants] = nil
+            inv.items.identifyEnchantResetId = normalizedId
+        end
         item.stats[invStatFieldId] = tostring(id)
         continuationState.name = false
     end
@@ -776,6 +797,16 @@ function inv.items.parseIdentifyLine(item, line)
         continuationState.keywords = false
         continuationState.flags = false
         continuationState.affectMods = false
+    end
+
+    if lowerTrimmed:find("^|%s*illuminate%s*:") then
+        addEnchantType("illuminate")
+    end
+    if lowerTrimmed:find("^|%s*resonate%s*:") then
+        addEnchantType("resonate")
+    end
+    if lowerTrimmed:find("^|%s*solidify%s*:") then
+        addEnchantType("solidify")
     end
 
     -- Handle continuation lines: |            : more flags here        |

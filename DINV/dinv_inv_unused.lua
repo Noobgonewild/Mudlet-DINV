@@ -169,11 +169,33 @@ end
 ----------------------------------------------------------------------------------------------------
 -- Displays a report of all unused items
 ----------------------------------------------------------------------------------------------------
-function inv.unused.report()
+function inv.unused.report(query, displayMode)
+    displayMode = displayMode or "basic"
     local unusedIds, retval = inv.unused.find()
     
     if retval ~= DRL_RET_SUCCESS then
         return retval -- Error message was already printed in find()
+    end
+
+    local trimmedQuery = tostring(query or ""):gsub("^%s*(.-)%s*$", "%1")
+    if trimmedQuery ~= "" then
+        local matchedIds, searchRetval = inv.items.search(trimmedQuery)
+        if searchRetval ~= DRL_RET_SUCCESS then
+            return searchRetval
+        end
+
+        local matchedLookup = {}
+        for _, objId in ipairs(matchedIds or {}) do
+            matchedLookup[tostring(objId)] = true
+        end
+
+        local filtered = {}
+        for _, objId in ipairs(unusedIds) do
+            if matchedLookup[tostring(objId)] then
+                table.insert(filtered, objId)
+            end
+        end
+        unusedIds = filtered
     end
     
     -- Cache the result for the 'store' command
@@ -192,12 +214,14 @@ function inv.unused.report()
     }
     inv.items.sort(unusedIds, sortCriteria)
     
-    dbot.print("\n@WThe following items were not found in any of your 'dinv analyze' reports:@w")
+    if trimmedQuery ~= "" then
+        dbot.print("\n@WThe following filtered items were not found in any of your 'dinv analyze' reports:@w")
+    else
+        dbot.print("\n@WThe following items were not found in any of your 'dinv analyze' reports:@w")
+    end
     inv.items.displayLastType = "" -- Force a header print
     
-    for _, objId in ipairs(unusedIds) do
-        inv.items.displayItem(objId, "basic")
-    end
+    inv.items.displayResults(unusedIds, displayMode)
     
     dbot.print(string.format("\n@Y%d@W unused item(s) found.", #unusedIds))
     dbot.info("To store these items, use \"@Gdinv unused store <container>@W\".")
@@ -239,27 +263,48 @@ end
 -- CLI entry point for 'dinv unused' commands
 ----------------------------------------------------------------------------------------------------
 function inv.cli.unused.fn(name, line, wildcards)
-    local command = wildcards[1] or ""
-    local param = wildcards[2] or ""
+    local tokens = {}
+    for _, token in ipairs(wildcards or {}) do
+        table.insert(tokens, token)
+    end
+
+    local command = tokens[1] or ""
+    local param = tokens[2] or ""
     local endTag = inv.tags.new(line)
+    local retval = DRL_RET_SUCCESS
     
-    if command == "" then
-        -- This is the 'dinv unused' report command
-        inv.unused.report()
-    elseif command == "store" then
+    if command == "store" then
         if param == "" then
             dbot.warn("Missing container name for 'store' command.")
             inv.cli.unused.usage()
             return inv.tags.stop(invTagsUnused, endTag, DRL_RET_INVALID_PARAM)
         end
-        inv.unused.store(param)
+        retval = inv.unused.store(param)
     else
-        dbot.warn("Invalid 'unused' command.")
-        inv.cli.unused.usage()
-        return inv.tags.stop(invTagsUnused, endTag, DRL_RET_INVALID_PARAM)
+        -- `dinv unused` supports the same query filters as `dinv search`.
+        local displayMode = "basic"
+        if #tokens > 0 then
+            local first = tostring(tokens[1]):lower()
+            if first == "basic" or first == "objid" or first == "full" then
+                displayMode = first
+                table.remove(tokens, 1)
+            end
+        end
+
+        -- Also accept display mode at the end for convenience.
+        if #tokens > 0 then
+            local last = tostring(tokens[#tokens]):lower()
+            if last == "basic" or last == "objid" or last == "full" then
+                displayMode = last
+                table.remove(tokens, #tokens)
+            end
+        end
+
+        local query = table.concat(tokens, " ")
+        retval = inv.unused.report(query, displayMode)
     end
     
-    return inv.tags.stop(invTagsUnused, endTag, DRL_RET_SUCCESS)
+    return inv.tags.stop(invTagsUnused, endTag, retval)
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -268,6 +313,8 @@ end
 function inv.cli.unused.usage()
     dbot.print(string.format("@W    %-50s @w- %s", 
                pluginNameCmd .. " unused", "Report equipment not used in any analysis"))
+    dbot.print(string.format("@W    %-50s @w- %s",
+               pluginNameCmd .. " unused @G[basic|objid|full] <query>", "Report unused equipment matching search filters"))
     dbot.print(string.format("@W    %-50s @w- %s", 
                pluginNameCmd .. " unused store @G<container>", "Store all unused equipment"))
 end
@@ -284,6 +331,12 @@ The 'unused' command helps you identify and manage equipment that is not part of
 @Wdinv unused@w
   Analyzes your inventory and produces a colored table of all equipment (Armor, Weapons, Lights, and wearable Treasure) that is not used in any of your generated equipment sets. This is a great way to find items you can potentially sell, trade, or store away. The list of unused items is cached temporarily.
 
+@Wdinv unused <query>@w
+  Applies the same query syntax as '@Gdinv search@w' and only displays unused items matching that query.
+
+@Wdinv unused [basic|objid|full] <query>@w
+  Uses the requested output mode for the filtered unused list.
+
 @Wdinv unused store <container>@w
   Takes the cached list of items generated by the last 'dinv unused' command and moves all of them into the specified container. This is an excellent command for quickly cleaning up your main inventory.
 
@@ -294,7 +347,13 @@ Examples:
   2) After reviewing the list, move all those unused items into your 4th bag.
      "@Gdinv unused store 4.bag@w"
   
-  3) After reviewing the list, move all those unused items into your bag with the id 1919691768.
+  3) Show only unused armor up to level 71.
+     "@Gdinv unused type armor maxlevel 71@w"
+
+  4) Show only unused armor up to level 71 using full output.
+     "@Gdinv unused full type armor maxlevel 71@w"
+
+  5) After reviewing the list, move all those unused items into your bag with the id 1919691768.
      "@Gdinv unused store 1919691768@w"
 ]])
 end

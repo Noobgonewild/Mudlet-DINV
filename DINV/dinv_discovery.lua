@@ -765,13 +765,16 @@ function DINV.discovery.registerIdentifyTriggers()
 
     -- Match card content lines: | ... |
 	DINV.discovery.identifyTriggerIds.cardLine = tempRegexTrigger(
-		"^[^|]*\\|.+\\|",
+		"^\\s*\\|.*\\|\\s*$",
 		function()
 			local line = getCurrentLine() or ""
 			local isIdentifyBorder = tostring(line):match("^%s*|%s*%-+%s*|%s*$") ~= nil
 			local ok, err = pcall(function()
                 dbot.debug("@YcardLine trigger fired: " .. tostring(line):sub(1, 50) .. "@W", "discovery")
 				if not inv.items.identifyInProgress then
+					return
+				end
+				if not DINV.discovery.identifyCardOpen then
 					return
 				end
 				if line:match("|%s*Id%s*:") then
