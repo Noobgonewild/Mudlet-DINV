@@ -259,7 +259,8 @@ local function covetBuildWeightedDiff(targetId, wornId, priorityName, level)
     return table.concat(parts, ", "), weighted, table.concat(ignoredParts, ", ")
 end
 
-function inv.compare.covetAnalyze(priorityName, targetId, skipLevels)
+function inv.compare.covetAnalyze(priorityName, targetId, skipLevels, opts)
+    opts = opts or {}
     local analysisData = inv.analyze and inv.analyze.table and inv.analyze.table[priorityName] or nil
     if not analysisData or not analysisData.levels then
         dbot.warn("Covet requires analysis data. Run 'dinv analyze create " .. priorityName .. "' first.")
@@ -276,7 +277,8 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels)
     end
 
     local targetName = inv.items.getStatField(targetId, invStatFieldName) or ("Auction #" .. tostring(targetId))
-    local targetAuctionLabel = "Auction #" .. tostring(targetId)
+    local targetAuctionLabel = opts.targetLabel or ("Auction #" .. tostring(targetId))
+    local resultsTitle = opts.title or "@WCovet Results:@w"
     local targetLocs = inv.compare._expandWearLocations(targetId)
     do
         local locList = {}
@@ -420,18 +422,20 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels)
         end
     end
 
-    dbot.print("@WCovet Results:@w")
-    if cecho and cechoLink then
-        cecho("  <cyan>Target<white>: <reset>")
-        cechoLink(
-            "<yellow>" .. tostring(targetId) .. "<reset>",
-            "send([[lbid " .. tostring(targetId) .. "]])",
-            "Run: lbid " .. tostring(targetId),
-            true
-        )
-        cecho("<white> " .. targetAuctionLabel .. " <yellow>(level " .. tostring(itemLevel) .. ")<reset>\n")
-    else
-        dbot.print("  @CTarget@W: " .. tostring(targetId) .. " " .. targetAuctionLabel .. " @Y(level " .. tostring(itemLevel) .. ")@w")
+    dbot.print(resultsTitle)
+    if not opts.skipTargetHeader then
+        if cecho and cechoLink then
+            cecho("  <cyan>Target<white>: <reset>")
+            cechoLink(
+                "<yellow>" .. tostring(targetId) .. "<reset>",
+                "send([[lbid " .. tostring(targetId) .. "]])",
+                "Run: lbid " .. tostring(targetId),
+                true
+            )
+            cecho("<white> " .. targetAuctionLabel .. " <yellow>(level " .. tostring(itemLevel) .. ")<reset>\n")
+        else
+            dbot.print("  @CTarget@W: " .. tostring(targetId) .. " " .. targetAuctionLabel .. " @Y(level " .. tostring(itemLevel) .. ")@w")
+        end
     end
     dbot.print("  @CComparison source@W: analyzed equipment snapshots for priority '" .. tostring(priorityName) .. "' only")
     dbot.print("")
@@ -510,7 +514,7 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels)
     end
 
     dbot.print("")
-    dbot.print("@WPriority '" .. tostring(priorityName) .. "' advantages with auction #" .. tostring(targetId) .. ":@w")
+    dbot.print("@WPriority '" .. tostring(priorityName) .. "' advantages with " .. targetAuctionLabel .. ":@w")
 
     local widths = displayOptions.columnWidths
     local cellPad = widths.cellPad
@@ -657,42 +661,22 @@ function inv.compare.items(priorityName, itemName, skipLevels, endTag)
         return inv.tags.stop(invTagsCompare, endTag, DRL_RET_MISSING_ENTRY)
     end
 
-    if #itemIds > 2 then
+    if #itemIds > 1 then
         dbot.warn("Multiple items matched; refine your query.")
         inv.items.displayResults(itemIds, "basic")
         return inv.tags.stop(invTagsCompare, endTag, DRL_RET_BUSY)
     end
 
     local targetId = itemIds[1]
-    local compareId = itemIds[2]
-    local targetWear = inv.items.getStatField(targetId, invStatFieldWearable) or ""
-    local targetScore = inv.score.getItemScore(targetId, priorityName, nil)
+    local targetLabel = inv.items.getStatField(targetId, invStatFieldColorName)
+                     or inv.items.getStatField(targetId, invStatFieldName)
+                     or tostring(targetId)
 
-    local wornId = compareId
-    if not wornId then
-        for objId, _ in pairs(inv.items.table or {}) do
-            if inv.items.isWorn(objId) then
-                local wornLoc = inv.items.getStatField(objId, invStatFieldWorn)
-                if wornLoc and string.find(targetWear, wornLoc, 1, true) then
-                    wornId = objId
-                    break
-                end
-            end
-        end
-    end
-
-    dbot.print("@WCompare Results:@w")
-    dbot.print("  @CTarget@W: " .. (inv.items.getStatField(targetId, invStatFieldName) or "Unknown") ..
-               " @Y(score " .. targetScore .. ")@w")
-
-    if wornId then
-        local wornScore = inv.score.getItemScore(wornId, priorityName, nil)
-        dbot.print("  @CCompare@W: " .. (inv.items.getStatField(wornId, invStatFieldName) or "Unknown") ..
-                   " @Y(score " .. wornScore .. ")@w")
-        dbot.print("  @CDelta@W: " .. tostring(targetScore - wornScore))
-    else
-        dbot.print("  @YNo comparison item detected for this slot.@w")
-    end
+    inv.compare.covetAnalyze(priorityName, targetId, skipLevels, {
+        title           = "@WCompare Results:@w",
+        targetLabel     = targetLabel,
+        skipTargetHeader = true,
+    })
 
     return inv.tags.stop(invTagsCompare, endTag, DRL_RET_SUCCESS)
 end
