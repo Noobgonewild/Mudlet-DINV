@@ -11,6 +11,7 @@ inv.tags.stateName = "inv-tags.state"
 
 invTagsRefresh   = invTagsRefresh or "refresh"
 invTagsBuild     = invTagsBuild or "build"
+invTagsIdentify  = invTagsIdentify or "identify"
 invTagsSearch    = invTagsSearch or "search"
 invTagsGet       = invTagsGet or "get"
 invTagsPut       = invTagsPut or "put"
@@ -33,7 +34,7 @@ invTagsVersion   = invTagsVersion or "version"
 invTagsUnused    = invTagsUnused or "unused"
 
 inv.tags.modules = table.concat({
-    invTagsBuild, invTagsRefresh, invTagsSearch, invTagsGet, invTagsPut,
+    invTagsBuild, invTagsRefresh, invTagsIdentify, invTagsSearch, invTagsGet, invTagsPut,
     invTagsStore, invTagsKeyword, invTagsOrganize, invTagsSet, invTagsSnapshot,
     invTagsWeapon, invTagsPriority, invTagsAnalyze, invTagsUsage, invTagsCompare,
     invTagsCovet, invTagsBackup, invTagsReset, invTagsConsume, invTagsPortal,

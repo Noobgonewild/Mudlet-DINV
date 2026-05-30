@@ -377,6 +377,15 @@ inv.items.identifyCurrentContainer = nil
 inv.items.identifyWaitForInvmon = nil
 inv.items.identifyWaitForFence = nil
 inv.items.identifyResetId = nil
+inv.items.identifyCreatedMissing = inv.items.identifyCreatedMissing or {}
+inv.items.identifySawOutput = inv.items.identifySawOutput or {}
+inv.items.identifyHydratedFromInvdata = inv.items.identifyHydratedFromInvdata or {}
+inv.items.identifyHydrateInProgress = inv.items.identifyHydrateInProgress or false
+inv.items.identifyHydrateId = inv.items.identifyHydrateId or nil
+inv.items.identifyHydrateSource = inv.items.identifyHydrateSource or nil
+inv.items.identifyHydrateFound = inv.items.identifyHydrateFound or false
+inv.items.identifyHydratePreviousState = inv.items.identifyHydratePreviousState or nil
+inv.items.identifyHydrateTimerName = inv.items.identifyHydrateTimerName or nil
 inv.items.discoveryStage = 0
 inv.items.discoveryContainers = {}
 inv.items.containerIndex = 0
@@ -437,6 +446,17 @@ function inv.items.resetIdentifyStats(item)
     for _, field in ipairs(inv.items.identifyAdditiveFields) do
         item.stats[field] = 0
     end
+end
+
+function inv.items.resetIdentifyEnchantFields(item)
+    if not item or not item.stats then
+        return
+    end
+
+    item.stats[invStatFieldEnchants] = nil
+    item.stats[invStatFieldIlluminate] = nil
+    item.stats[invStatFieldResonate] = nil
+    item.stats[invStatFieldSolidify] = nil
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -1074,6 +1094,181 @@ function inv.items.buildSingleItem(objId, source)
         inv.items.identifyNext()
     end)
     return DRL_RET_SUCCESS
+end
+
+function inv.items.identifySingleItem(objId, source)
+    local normalizedObjId = tostring(objId or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if normalizedObjId == "" then
+        return DRL_RET_INVALID_PARAM
+    end
+
+    if inv.items.refreshInProgress or inv.items.identifyHydrateInProgress then
+        return DRL_RET_BUSY
+    end
+
+    inv.items.identifyCreatedMissing = inv.items.identifyCreatedMissing or {}
+    inv.items.identifySawOutput = inv.items.identifySawOutput or {}
+
+    if not inv.items.getItem(normalizedObjId) then
+        return inv.items.startIdentifyHydrateFromInvdata(normalizedObjId, source or "single-identify")
+    end
+
+    inv.items.identifyCreatedMissing[normalizedObjId] = nil
+    inv.items.identifySawOutput[normalizedObjId] = nil
+
+    local retval = inv.items.buildSingleItem(normalizedObjId, source or "single-identify")
+    if retval == DRL_RET_IN_COMBAT then
+        inv.items.enqueueDeferredIdentify(normalizedObjId, source or "single-identify")
+        return DRL_RET_SUCCESS
+    end
+
+    return retval
+end
+
+function inv.items.startIdentifyHydrateFromInvdata(objId, source)
+    local normalizedObjId = tostring(objId or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if normalizedObjId == "" then
+        return DRL_RET_INVALID_PARAM
+    end
+
+    if inv.items.buildInProgress or inv.items.identifyInProgress
+        or inv.items.refreshInProgress or inv.items.identifyHydrateInProgress then
+        return DRL_RET_BUSY
+    end
+
+    if dbot.gmcp and dbot.gmcp.statePreventsActions and dbot.gmcp.statePreventsActions() then
+        return DRL_RET_NOT_ACTIVE
+    end
+
+    if dbot.gmcp and dbot.gmcp.stateIsInCombat and dbot.gmcp.stateIsInCombat() then
+        return DRL_RET_IN_COMBAT
+    end
+
+    inv.items.identifyHydrateInProgress = true
+    inv.items.identifyHydrateId = normalizedObjId
+    inv.items.identifyHydrateSource = source or "single-identify"
+    inv.items.identifyHydrateFound = false
+    inv.items.identifyHydratePreviousState = inv.state
+    inv.items.identifyHydrateTimerName = "inv.items.identifyHydrate." .. normalizedObjId
+    inv.items.inEqdata = false
+    inv.items.inInvdata = false
+    inv.items.currentContainerId = nil
+    inv.items.currentInvdataSeen = nil
+    inv.items.expectedInvdataContainerId = nil
+    inv.items.awaitingInvdataContainerId = nil
+    inv.state = invStateDiscovery
+
+    if DINV and DINV.setBuildPhase then
+        DINV.setBuildPhase(2)
+    end
+
+    if DINV.discovery and DINV.discovery.register then
+        DINV.discovery.register()
+    end
+
+    dbot.debug("identify hydrate: scanning main invdata for objId=" .. normalizedObjId, "inv.items")
+    if inv.items.sendDiscoveryCommand then
+        inv.items.sendDiscoveryCommand("invdata")
+    else
+        sendSilent("invdata")
+    end
+
+    if tempTimer then
+        local expectedObjId = normalizedObjId
+        dbot.timers[inv.items.identifyHydrateTimerName] = tempTimer(5.0, function()
+            if inv.items.identifyHydrateInProgress
+                and tostring(inv.items.identifyHydrateId or "") == expectedObjId then
+                dbot.debug("identify hydrate: invdata timeout for objId=" .. expectedObjId, "inv.items")
+                if inv.items.identifyHydrateTimerName and dbot and dbot.timers then
+                    dbot.timers[inv.items.identifyHydrateTimerName] = nil
+                end
+                inv.items.identifyHydrateTimerName = nil
+                inv.items.finishIdentifyHydrateInvdata()
+            end
+        end)
+    end
+
+    return DRL_RET_SUCCESS
+end
+
+function inv.items.handleIdentifyHydrateInvdataLine(dataLine)
+    local targetId = tostring(inv.items.identifyHydrateId or "")
+    if targetId == "" then
+        return DRL_RET_INVALID_PARAM
+    end
+
+    local lineObjId = tostring(dataLine or ""):match("^(%d+),")
+    if tostring(lineObjId or "") ~= targetId then
+        return DRL_RET_SUCCESS
+    end
+
+    dbot.debug("identify hydrate: found target objId=" .. targetId, "inv.items")
+    local retval = inv.items._parseDataLine(dataLine, "invdata")
+    if retval == DRL_RET_SUCCESS then
+        inv.items.identifyHydrateFound = true
+    else
+        dbot.warn("dinv identify: failed to parse invdata for item " .. targetId ..
+                  " (" .. dbot.retval.getString(retval) .. ")")
+    end
+    return retval
+end
+
+function inv.items.finishIdentifyHydrateInvdata()
+    local objId = tostring(inv.items.identifyHydrateId or "")
+    local source = inv.items.identifyHydrateSource or "single-identify"
+    local found = inv.items.identifyHydrateFound == true
+    local previousState = inv.items.identifyHydratePreviousState
+    local timerName = inv.items.identifyHydrateTimerName
+
+    if timerName and dbot and dbot.deleteTimer then
+        dbot.deleteTimer(timerName)
+    end
+
+    inv.items.identifyHydrateInProgress = false
+    inv.items.identifyHydrateId = nil
+    inv.items.identifyHydrateSource = nil
+    inv.items.identifyHydrateFound = false
+    inv.items.identifyHydratePreviousState = nil
+    inv.items.identifyHydrateTimerName = nil
+    inv.items.inEqdata = false
+    inv.items.inInvdata = false
+    inv.items.currentContainerId = nil
+    inv.items.currentInvdataSeen = nil
+    inv.items.expectedInvdataContainerId = nil
+    inv.items.awaitingInvdataContainerId = nil
+    inv.state = previousState or invStateIdle
+
+    if DINV and DINV.setBuildPhase then
+        DINV.setBuildPhase(0)
+    end
+
+    if objId == "" then
+        return DRL_RET_INVALID_PARAM
+    end
+
+    if not found or not inv.items.getItem(objId) then
+        dbot.warn("dinv identify: item " .. objId .. " was not found in main inventory.")
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    inv.items.identifyCreatedMissing = inv.items.identifyCreatedMissing or {}
+    inv.items.identifySawOutput = inv.items.identifySawOutput or {}
+    inv.items.identifyHydratedFromInvdata = inv.items.identifyHydratedFromInvdata or {}
+    inv.items.identifyCreatedMissing[objId] = nil
+    inv.items.identifySawOutput[objId] = nil
+    inv.items.identifyHydratedFromInvdata[objId] = true
+
+    dbot.debug("identify hydrate: starting identify for objId=" .. objId, "inv.items")
+    local retval = inv.items.buildSingleItem(objId, source)
+    if retval == DRL_RET_IN_COMBAT then
+        inv.items.enqueueDeferredIdentify(objId, source)
+        return DRL_RET_SUCCESS
+    elseif retval ~= DRL_RET_SUCCESS then
+        dbot.warn("dinv identify: unable to identify item " .. objId ..
+                  " after invdata scan (" .. dbot.retval.getString(retval) .. ")")
+    end
+
+    return retval
 end
 
 function inv.items.enqueueDeferredIdentify(objId, source)
@@ -1893,6 +2088,7 @@ function inv.items.onIdentify(dataLine)
             local resetItem = inv.items.getItem(objId)
             if resetItem then
                 inv.items.resetIdentifyStats(resetItem)
+                inv.items.resetIdentifyEnchantFields(resetItem)
                 inv.items.setItem(objId, resetItem)
             end
             inv.items.identifyResetId = objId
@@ -2462,7 +2658,7 @@ function inv.items.identifyNext()
         return
     end
 
-    if inv.items.applyCachedStats(item) then
+    if not inv.items.forceIdentify and inv.items.applyCachedStats(item) then
         item.stats.identifyLevel = invIdLevelFull
         inv.items.setItem(objId, item)
         local cachedName = (item.stats and item.stats[invStatFieldColorName])
@@ -2541,6 +2737,7 @@ function inv.items.prepareIdentify(objId)
     end
     item.stats = item.stats or {}
     item.stats.identifyLevel = invIdLevelNone
+    inv.items.resetIdentifyEnchantFields(item)
 
     local resetFields = {
         invStatFieldStr,
@@ -2715,12 +2912,49 @@ function inv.items.handleIdentifyFence(fallbackObjId)
 
     -- Mark item as fully identified - we extracted all available stats
     local item = inv.items.getItem(objId)
-    if item and item.stats then
+    local createdMissing = inv.items.identifyCreatedMissing and inv.items.identifyCreatedMissing[objId]
+    local sawIdentifyOutput = inv.items.identifySawOutput and inv.items.identifySawOutput[objId]
+    local hydratedFromInvdata = inv.items.identifyHydratedFromInvdata
+        and inv.items.identifyHydratedFromInvdata[objId]
+    if createdMissing and not sawIdentifyOutput then
+        if inv.items.table then
+            inv.items.table[objId] = nil
+        end
+        if inv.items.identifyCreatedMissing then
+            inv.items.identifyCreatedMissing[objId] = nil
+        end
+        if inv.items.identifySawOutput then
+            inv.items.identifySawOutput[objId] = nil
+        end
+        item = nil
+        dbot.debug("handleIdentifyFence: no identify output for new objId=" .. tostring(objId) .. "; not persisting", "inv.items")
+    elseif hydratedFromInvdata and not sawIdentifyOutput then
+        if item and item.stats then
+            item.stats.identifyLevel = invIdLevelPartial
+            inv.items.setItem(objId, item)
+        end
+        if inv.items.identifyHydratedFromInvdata then
+            inv.items.identifyHydratedFromInvdata[objId] = nil
+        end
+        if inv.items.identifySawOutput then
+            inv.items.identifySawOutput[objId] = nil
+        end
+        dbot.debug("handleIdentifyFence: no identify output for hydrated objId=" .. tostring(objId) .. "; keeping invdata only", "inv.items")
+    elseif item and item.stats then
         item.stats.identifyLevel = invIdLevelFull
         inv.items.ensureKeywordsField(item)
         dbot.debug("handleIdentifyFence: Marked item as identified", "inv.items")
 
         inv.items.setItem(objId, item)
+        if inv.items.identifyCreatedMissing then
+            inv.items.identifyCreatedMissing[objId] = nil
+        end
+        if inv.items.identifySawOutput then
+            inv.items.identifySawOutput[objId] = nil
+        end
+        if inv.items.identifyHydratedFromInvdata then
+            inv.items.identifyHydratedFromInvdata[objId] = nil
+        end
 
         -- Cache the identified item
         if inv.items.cacheIdentifiedItem then
@@ -2800,6 +3034,14 @@ function inv.items.buildComplete()
         inv.items.identifyInProgress = false
         inv.items.forceIdentify = false
         inv.items.eqdataSeen = {}
+        for objId, _ in pairs(inv.items.identifyCreatedMissing or {}) do
+            if inv.items.table then
+                inv.items.table[tostring(objId)] = nil
+            end
+        end
+        inv.items.identifyCreatedMissing = {}
+        inv.items.identifySawOutput = {}
+        inv.items.identifyHydratedFromInvdata = {}
         inv.state = invStateIdle
         if DINV and DINV.setBuildPhase then
             DINV.setBuildPhase(0)
@@ -2807,6 +3049,9 @@ function inv.items.buildComplete()
         end
         if inv.items.save then
             inv.items.save()
+        end
+        if raiseEvent and singleId then
+            raiseEvent("DINV.identifyComplete", tostring(singleId))
         end
         dbot.debug("buildComplete: single-item identify complete for objId=" .. tostring(singleId), "inv.items")
         tempTimer(0.1, function()
@@ -2910,6 +3155,14 @@ function inv.items.buildAbort()
     inv.items.partialIdentifyMode = false
     inv.items.identifyPartialOnly = false
     inv.items.refreshIdentifyPartials = false
+    for objId, _ in pairs(inv.items.identifyCreatedMissing or {}) do
+        if inv.items.table then
+            inv.items.table[tostring(objId)] = nil
+        end
+    end
+    inv.items.identifyCreatedMissing = {}
+    inv.items.identifySawOutput = {}
+    inv.items.identifyHydratedFromInvdata = {}
     inv.state = invStateIdle
     if DINV and DINV.setBuildPhase then
         DINV.setBuildPhase(0)
@@ -3683,10 +3936,23 @@ function inv.items.displayItem(objId, displayMode, options)
     -- Use 11-character width for ID as string (handles large IDs safely)
     local formattedId = string.format("%11s", tostring(objId))
 
+    local function isItemWornForDisplay()
+        local worn = tostring(inv.items.getStatField(objId, invStatFieldWorn) or "")
+
+        if worn == "" or worn == "undefined" or worn == invItemWornNotWorn then
+            return false
+        end
+
+        return true
+    end
+
+    local idColorCode = isItemWornForDisplay() and "@G" or "@Y"
+    local idMudletColor = isItemWornForDisplay() and "<green>" or "<yellow>"
+
     local function printLine(msg)
         local raw = tostring(msg or "")
         if cechoLink then
-            local idPrefix = "@Y" .. formattedId .. "@W "
+            local idPrefix = idColorCode .. formattedId .. "@W "
             if raw:sub(1, #idPrefix) == idPrefix then
                 local location = tostring(inv.items.getStatField(objId, invStatFieldLocation) or "")
                 local remainder = raw:sub(#idPrefix + 1)
@@ -3694,13 +3960,13 @@ function inv.items.displayItem(objId, displayMode, options)
                 if location == "auction" and remainder:sub(1, #auctionLabelPrefix) == auctionLabelPrefix then
                     local linkCommand = string.format("send([[lbid %s]])", tostring(objId))
                     local tooltip = "Run: lbid " .. tostring(objId)
-                    cechoLink("<yellow>" .. formattedId .. "<reset>", linkCommand, tooltip, true)
+                    cechoLink(idMudletColor .. formattedId .. "<reset>", linkCommand, tooltip, true)
                 elseif location ~= "auction" then
                     local linkCommand = string.format("inv.items.runReportFromLink(%q)", tostring(objId))
                     local tooltip = "Run: dinv report " .. tostring(objId)
-                    cechoLink("<yellow>" .. formattedId .. "<reset>", linkCommand, tooltip, true)
+                    cechoLink(idMudletColor .. formattedId .. "<reset>", linkCommand, tooltip, true)
                 else
-                    cecho("<yellow>" .. formattedId .. "<reset>")
+                    cecho(idMudletColor .. formattedId .. "<reset>")
                 end
                 cecho(" " .. dbot.convertColors(remainder) .. "\n")
                 return
@@ -4057,7 +4323,7 @@ function inv.items.displayItem(objId, displayMode, options)
             end
 
             local cells = {
-                "@Y", formattedId, "@W ",
+                idColorCode, formattedId, "@W ",
                 padColored(wrappedNameLines[1] or "", effectiveNameWidth), sep,
                 padColored(levelText, levelWidth), sep,
             }
@@ -4104,7 +4370,7 @@ function inv.items.displayItem(objId, displayMode, options)
                 local idBlank = string.rep(" ", #formattedId)
                 for i = 2, #wrappedNameLines do
                     table.insert(continuationLines, table.concat({
-                        "@Y", idBlank, "@W ",
+                        idColorCode, idBlank, "@W ",
                         padColored(wrappedNameLines[i], effectiveNameWidth)
                     }, ""))
                 end

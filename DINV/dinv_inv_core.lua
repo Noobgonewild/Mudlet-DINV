@@ -129,6 +129,9 @@ invStatFieldAffects    = "affects"
 invStatFieldAffectMods = "affectMods"
 invStatFieldAbilMods   = "abilmods"
 invStatFieldEnchants   = "enchants"
+invStatFieldIlluminate = "illuminate"
+invStatFieldResonate   = "resonate"
+invStatFieldSolidify   = "solidify"
 
 -- Calculated/derived fields
 invStatFieldLocType    = "loctype"
@@ -265,6 +268,7 @@ invIdLevelFull    = "full"
 
 invTagsBuild     = "build"
 invTagsRefresh   = "refresh"
+invTagsIdentify  = "identify"
 invTagsSearch    = "search"
 invTagsSet       = "set"
 invTagsWeapon    = "weapon"

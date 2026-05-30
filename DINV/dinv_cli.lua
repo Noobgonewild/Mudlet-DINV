@@ -12,7 +12,7 @@ inv.cli = inv.cli or {}
 
 inv.cli.commands = {
     -- Inventory table access
-    "build", "refresh", "search", "query", "report",
+    "build", "refresh", "identify", "search", "query", "report",
     -- Item management
     "get", "put", "store", "keyword", "organize",
     -- Equipment sets
@@ -147,7 +147,7 @@ Usage:
     dinv help           - Show full command list
     dinv help <command> - Show detailed help for a specific command
     
-Available topics: build, refresh, search, query, set, priority, analyze,
+Available topics: build, refresh, identify, search, query, set, priority, analyze,
                   report, progress, compare, covet, snapshot, weapon, portal, consume,
                   backup, notify, debug, levelup, unused, and more.
 ]])
@@ -165,6 +165,7 @@ function inv.cli.fullUsage()
 
     if inv.cli.build and inv.cli.build.usage then inv.cli.build.usage() end
     if inv.cli.refresh and inv.cli.refresh.usage then inv.cli.refresh.usage() end
+    if inv.cli.identify and inv.cli.identify.usage then inv.cli.identify.usage() end
     if inv.cli.search and inv.cli.search.usage then inv.cli.search.usage() end
     if inv.cli.query and inv.cli.query.usage then inv.cli.query.usage() end
     if inv.cli.report and inv.cli.report.usage then inv.cli.report.usage() end
@@ -433,6 +434,41 @@ Subcommands:
 
 If you need to do a full rescan (e.g., after manual changes or if data seems
 out of sync), use 'dinv build confirm' instead.
+]])
+end
+
+----------------------------------------------------------------------------------------------------
+-- Identify Command - Re-identify one known item
+----------------------------------------------------------------------------------------------------
+
+inv.cli.identify = inv.cli.identify or {}
+
+function inv.cli.identify.fn(name, line, wildcards)
+    local endTag = inv.tags.new(line)
+    local objId = wildcards and wildcards[1] or nil
+
+    if not objId or tostring(objId) == "" then
+        dbot.warn("Usage: dinv identify <itemId>")
+        return inv.tags.stop(invTagsIdentify, endTag, DRL_RET_INVALID_PARAM)
+    end
+
+    local retval = inv.items.identifySingleItem(objId, "dinv identify")
+    return inv.tags.stop(invTagsIdentify, endTag, retval)
+end
+
+function inv.cli.identify.usage()
+    dbot.printRaw(string.format("@W    %-50s @w- %s",
+               pluginNameCmd .. " identify @G<itemId>", "Re-identify one tracked or main-inventory item"))
+end
+
+function inv.cli.identify.examples()
+    dbot.print([[@W
+Usage:
+    dinv identify <itemId>
+
+Re-identifies a single item using the same identify flow as build/refresh.
+If the item is not already tracked, DINV first checks main inventory data for
+that id and then identifies it.
 ]])
 end
 
@@ -1138,6 +1174,10 @@ function inv.cli.forget.fn(name, line, wildcards)
         inv.items.clearPendingForget()
     end
 
+    if #tokens == 1 and tostring(tokens[1] or ""):match("^%d+$") then
+        query = "id " .. tostring(tokens[1])
+    end
+
     local itemIds, retval = inv.items.search(query)
     if retval ~= DRL_RET_SUCCESS then
         return retval
@@ -1175,8 +1215,8 @@ end
 
 inv.cli.ignore = {}
 function inv.cli.ignore.fn(name, line, wildcards)
-    local action = wildcards and wildcards[1] or ""
-    local containerRef = wildcards and wildcards[2] or ""
+    local action = tostring(wildcards and wildcards[1] or ""):lower()
+    local containerRef = tostring(wildcards and wildcards[2] or "")
 
     local function resolveIgnoreTarget(ref)
         local normalizedRef = tostring(ref or "")
@@ -1190,6 +1230,23 @@ function inv.cli.ignore.fn(name, line, wildcards)
             return inv.items.findContainerId(normalizedRef)
         end
         return nil
+    end
+
+    local function resolveIgnoredTarget(ref)
+        local normalizedRef = tostring(ref or "")
+        if normalizedRef == "" then
+            return nil
+        end
+        if normalizedRef:lower() == tostring(invItemLocKeyring or "keyring") then
+            return tostring(invItemLocKeyring or "keyring")
+        end
+
+        local ignoreList = inv.config.get("ignoreContainers") or {}
+        if ignoreList[normalizedRef] ~= nil then
+            return normalizedRef
+        end
+
+        return resolveIgnoreTarget(normalizedRef)
     end
 
     local function formatIgnoredContainerLabel(objId)
@@ -1221,9 +1278,10 @@ function inv.cli.ignore.fn(name, line, wildcards)
         end
         return retval
     elseif action == "remove" then
-        local containerId = resolveIgnoreTarget(containerRef)
+        local containerId = resolveIgnoredTarget(containerRef)
         if containerId == nil then
             dbot.warn("Usage: dinv ignore remove [containerId|relativeName|keyring]")
+            dbot.warn("Tip: use any exact ID shown by 'dinv ignore list', even if the container is gone.")
             return DRL_RET_INVALID_PARAM
         end
         local retval = inv.config.removeIgnore(containerId)
@@ -2227,7 +2285,7 @@ tempered) and you want to re-identify it.
 
 Examples:
   1) Forget a specific item so it gets re-identified
-     "@Gdinv forget id 12345678@W"
+     "@Gdinv forget 12345678@W"
 
   2) Stage all matching items, then confirm removal
      "@Gdinv forget name old sword@W"
@@ -2253,7 +2311,10 @@ Examples:
   3) Stop ignoring a container
      "@Gdinv ignore remove 2.case@W"
 
-  4) List ignored locations
+  4) Stop ignoring a container that no longer exists in inventory
+     "@Gdinv ignore remove 3537310336@W"
+
+  5) List ignored locations
      "@Gdinv ignore list@W"
 ]])
 end

@@ -22,6 +22,59 @@ function inv.report.setChannel(channel)
     return DRL_RET_SUCCESS
 end
 
+local mudChannels = {
+    ["answer"] = true,
+    ["auction"] = true,
+    ["barter"] = true,
+    ["clantalk"] = true,
+    ["curse"] = true,
+    ["debate"] = true,
+    ["epics"] = true,
+    ["ftalk"] = true,
+    ["gametalk"] = true,
+    ["gclan"] = true,
+    ["global"] = true,
+    ["gossip"] = true,
+    ["gratz"] = true,
+    ["gtell"] = true,
+    ["immtalk"] = true,
+    ["lasertag"] = true,
+    ["mafiainfo"] = true,
+    ["market"] = true,
+    ["music"] = true,
+    ["pokerinfo"] = true,
+    ["question"] = true,
+    ["racetalk"] = true,
+    ["rauction"] = true,
+    ["rp"] = true,
+    ["sports"] = true,
+    ["spouse"] = true,
+    ["tech"] = true,
+    ["telepathy"] = true,
+    ["tiertalk"] = true,
+    ["wangrp"] = true,
+    -- legacy/common aliases kept intentionally
+    ["gt"] = true,
+    ["say"] = true,
+    ["tell"] = true,
+    ["clan"] = true,
+}
+
+local function sendToChannel(reportChannel, message)
+    local cmd = tostring(reportChannel or ""):gsub("^%s+", ""):gsub("%s+$", "") .. " " .. tostring(message or "")
+    local channelLower = tostring(reportChannel or ""):lower()
+    if mudChannels[channelLower] then
+        send(cmd)
+        return
+    end
+
+    if expandAlias then
+        expandAlias(cmd, false)
+    else
+        send(cmd)
+    end
+end
+
 local function reportLine(line, channel)
     local reportChannel = channel or inv.report.getChannel() or reportDefaultChannel
     local cleanedLine = tostring(line or ""):gsub("^@w", ""):gsub("%s+$", "")
@@ -33,7 +86,7 @@ local function reportLine(line, channel)
         end
     else
         if send then
-            send(reportChannel .. " " .. cleanedLine)
+            sendToChannel(reportChannel, cleanedLine)
         else
             dbot.warn("inv.report: send is unavailable; using echo output instead")
             if dbot and dbot.convertColors then
@@ -258,9 +311,13 @@ function inv.report.itemCR()
     end
 
     local summary = formatItemSummary(idArray[1])
-    send(channel .. " " .. summary)
+    sendToChannel(channel, summary)
     inv.report.itemPkg = nil
     return DRL_RET_SUCCESS
 end
 
+
+function inv.report.sendLine(line, channel)
+    return reportLine(line, channel)
+end
 dbot.debug("inv.report module loaded", "inv.report")

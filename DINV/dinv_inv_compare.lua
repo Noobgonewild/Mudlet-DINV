@@ -6,6 +6,38 @@
 inv.compare = {}
 inv.compare.covetPkg = inv.compare.covetPkg or nil
 
+local mudChannels = {
+    ["answer"] = true, ["auction"] = true, ["barter"] = true, ["clantalk"] = true, ["curse"] = true,
+    ["debate"] = true, ["epics"] = true, ["ftalk"] = true, ["gametalk"] = true, ["gclan"] = true,
+    ["global"] = true, ["gossip"] = true, ["gratz"] = true, ["gtell"] = true, ["immtalk"] = true,
+    ["lasertag"] = true, ["mafiainfo"] = true, ["market"] = true, ["music"] = true, ["pokerinfo"] = true,
+    ["question"] = true, ["racetalk"] = true, ["rauction"] = true, ["rp"] = true, ["sports"] = true,
+    ["spouse"] = true, ["tech"] = true, ["telepathy"] = true, ["tiertalk"] = true, ["wangrp"] = true,
+    ["gt"] = true, ["say"] = true, ["tell"] = true, ["clan"] = true,
+}
+
+function inv.compare.onDeltaClick(deltaLine)
+    local lineToReport = tostring(deltaLine or "")
+    lineToReport = lineToReport:gsub(" +", " "):gsub("%s+$", "")
+    if copy2decho then
+        copy2decho(lineToReport)
+    end
+    local channel = (inv and inv.report and inv.report.getChannel and inv.report.getChannel()) or "echo"
+    if channel == "echo" then
+        if dbot and dbot.print then dbot.print(lineToReport) end
+        return DRL_RET_SUCCESS
+    end
+    local cmd = tostring(channel) .. " " .. lineToReport
+    if mudChannels[tostring(channel):lower()] then
+        send(cmd, false)
+    elseif expandAlias then
+        expandAlias(cmd, false)
+    else
+        send(cmd, false)
+    end
+    return DRL_RET_SUCCESS
+end
+
 local function covetDebugDumpItem(item)
     if not item then
         return "(nil item)"
@@ -637,7 +669,21 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels, opts)
         dbot.print(renderBanner(rows[startIdx].level, rows[i].level, d.scoreDelta))
         displayAuctionTargetRow()
         inv.items.displayItem(headRow.againstId, "itemid", displayOptions)
-        dbot.print(renderDeltaLine(d))
+        local deltaLine = renderDeltaLine(d)
+        if cecho and cechoLink then
+            local clickableLine = tostring(deltaLine)
+            local reportCmd = string.format("inv.compare.onDeltaClick([[%s]])", clickableLine:gsub("%]%]", "] ]"))
+            local prefix, suffix = clickableLine:match("^(.-)@WDelta:@w(.*)$")
+            if prefix then
+                cecho((dbot and dbot.convertColors and dbot.convertColors(prefix) or prefix))
+                cechoLink("<white>Delta:<reset>", reportCmd, "Copy and report this delta line", true)
+                cecho((dbot and dbot.convertColors and dbot.convertColors(suffix) or suffix) .. "\n")
+            else
+                dbot.print(deltaLine)
+            end
+        else
+            dbot.print(deltaLine)
+        end
         i = i + 1
     end
 

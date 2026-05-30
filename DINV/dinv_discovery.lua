@@ -71,7 +71,11 @@ local function _resetInvCounters()
 end
 
 local function isDiscoveryActive()
-    return inv and inv.items and (inv.items.buildInProgress or inv.state == invStateDiscovery)
+    return inv and inv.items and (
+        inv.items.buildInProgress
+        or inv.items.identifyHydrateInProgress
+        or inv.state == invStateDiscovery
+    )
 end
 
 local function setSection(section, containerId)
@@ -96,6 +100,9 @@ local function setSection(section, containerId)
 end
 
 local function shouldSuppressDiscoveryOutput()
+    if inv and inv.items and inv.items.identifyHydrateInProgress then
+        return true
+    end
     if inv and inv.items and inv.items.buildInProgress then
         return true
     end
@@ -189,6 +196,11 @@ local function clearSection(section)
             DINV.discovery.debug.inv_calls_err
         ), "discovery")
 
+        if inv.items.identifyHydrateInProgress and inv.items.finishIdentifyHydrateInvdata then
+            inv.items.finishIdentifyHydrateInvdata()
+            return
+        end
+
         if inv.items.onInvdataComplete then
             local ok, err = pcall(inv.items.onInvdataComplete, containerId)
             if not ok then
@@ -214,6 +226,11 @@ local function handleDataLine(section, dataLine)
 
     if section == "invdata" then
         DINV.discovery.debug.inv_lines = DINV.discovery.debug.inv_lines + 1
+
+        if inv.items.identifyHydrateInProgress and inv.items.handleIdentifyHydrateInvdataLine then
+            inv.items.handleIdentifyHydrateInvdataLine(dataLine)
+            return
+        end
 
         if inv.items.onInvdata then
             local ok, err = pcall(inv.items.onInvdata, dataLine)
@@ -477,11 +494,13 @@ function DINV.discovery.register()
                     handleDataLine("invdata", dataLine)
 
                     -- Probe store correctness (first time only is noisy; keep it lightweight)
-                    local objId = tonumber(dataLine:match("^(%d+),"))
-                    if objId and inv.items.getItem then
-                        local it = inv.items.getItem(objId)
-                        if it == nil then
-                            dbot.debug(string.format("@R[DINV DBG] onInvdata did NOT store item id=%s@W", tostring(objId)), "discovery")
+                    if not inv.items.identifyHydrateInProgress then
+                        local objId = tonumber(dataLine:match("^(%d+),"))
+                        if objId and inv.items.getItem then
+                            local it = inv.items.getItem(objId)
+                            if it == nil then
+                                dbot.debug(string.format("@R[DINV DBG] onInvdata did NOT store item id=%s@W", tostring(objId)), "discovery")
+                            end
                         end
                     end
                 end
@@ -786,6 +805,10 @@ function DINV.discovery.registerIdentifyTriggers()
 				end
 				local item = inv.items.getItem(inv.items.identifyCurrentId)
 				if item and inv.items.parseIdentifyLine then
+                    if not isIdentifyBorder then
+                        inv.items.identifySawOutput = inv.items.identifySawOutput or {}
+                        inv.items.identifySawOutput[tostring(inv.items.identifyCurrentId)] = true
+                    end
 					inv.items.parseIdentifyLine(item, line)
 					inv.items.setItem(inv.items.identifyCurrentId, item)
 				end
@@ -856,6 +879,8 @@ function DINV.discovery.registerIdentifyTriggers()
             matches = matches or _G.matches
             local objId = matches and (matches[2] or matches[1]) or nil
             if objId and inv.items.identifyInProgress then
+                inv.items.identifySawOutput = inv.items.identifySawOutput or {}
+                inv.items.identifySawOutput[tostring(objId)] = true
                 if objId ~= inv.items.identifyCurrentId then
                     dbot.debug("@YID update: " .. tostring(inv.items.identifyCurrentId) .. " -> " .. objId .. "@W", "discovery")
                 end

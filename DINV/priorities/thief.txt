@@ -6,12 +6,12 @@ str          1.50
 int          0.00   
 wis          0.00   
 dex          2.00   
-con          0.00   
+con          0.50   
 luck         1.00   
-dam          2.00   
-hit          0.50   
-avedam       5.00   
-offhandDam   5.00   
+dam          2.50   
+hit          1.00   
+avedam       9.00   
+offhandDam   9.00   
 hp           0.00   
 mana         0.00   
 moves        0.00   

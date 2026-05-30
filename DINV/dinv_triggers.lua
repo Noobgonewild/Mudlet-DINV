@@ -209,6 +209,7 @@ function inv.items.onIdentifyLine(dataLine)
     item.stats = item.stats or {}
     if inv.items.identifyResetId ~= objId then
         inv.items.resetIdentifyStats(item)
+        inv.items.resetIdentifyEnchantFields(item)
         inv.items.setItem(objId, item)
         inv.items.identifyResetId = objId
     end
@@ -354,8 +355,16 @@ function inv.items.parseIdentifyLine(item, line)
         affectMods = false,
         keywords = false,
         name = false,
+        enchant = false,
+        inEnchants = false,
     }
     local continuationState = inv.items.identifyContinuation
+
+    local enchantValueFields = {
+        illuminate = invStatFieldIlluminate,
+        resonate = invStatFieldResonate,
+        solidify = invStatFieldSolidify,
+    }
 
     local function addEnchantType(kind)
         if not kind or kind == "" then
@@ -371,6 +380,54 @@ function inv.items.parseIdentifyLine(item, line)
         else
             item.stats[invStatFieldEnchants] = existing .. "," .. kind
         end
+    end
+
+    local function cleanEnchantValue(value)
+        value = dbot.stripColors(tostring(value or ""))
+        value = value:gsub("%s*|%s*$", "")
+        value = value:gsub("%s*%([^)]*%)%s*$", "")
+        value = value:gsub("^%s+", ""):gsub("%s+$", "")
+        value = value:gsub("%s+", " ")
+        return value
+    end
+
+    local function appendEnchantValue(kind, value)
+        kind = tostring(kind or ""):lower()
+        local field = enchantValueFields[kind]
+        if not field then
+            return
+        end
+
+        value = cleanEnchantValue(value)
+        if value == "" then
+            return
+        end
+
+        local existing = tostring(item.stats[field] or "")
+        for part in existing:gmatch("[^,]+") do
+            local trimmedPart = part:gsub("^%s+", ""):gsub("%s+$", "")
+            if trimmedPart == value then
+                return
+            end
+        end
+
+        if existing == "" then
+            item.stats[field] = value
+        else
+            item.stats[field] = existing .. ", " .. value
+        end
+    end
+
+    local function recordEnchantValue(kind, value)
+        kind = tostring(kind or ""):lower()
+        if not enchantValueFields[kind] then
+            return
+        end
+
+        addEnchantType(kind)
+        continuationState.inEnchants = true
+        continuationState.enchant = kind
+        appendEnchantValue(kind, value)
     end
 
     -- Helper to convert strings with commas to numbers
@@ -399,11 +456,17 @@ function inv.items.parseIdentifyLine(item, line)
         continuationState.keywords = false
         continuationState.flags = false
         continuationState.affectMods = false
+        continuationState.enchant = false
+        if not lowerTrimmed:find("enchants:")
+            and not lowerTrimmed:find("^|%s*illuminate%s*:")
+            and not lowerTrimmed:find("^|%s*resonate%s*:")
+            and not lowerTrimmed:find("^|%s*solidify%s*:") then
+            continuationState.inEnchants = false
+        end
     end
 
     ---------------------------------------------------------------------------
     -- RID-STYLE PARSING DISABLED
-    -- (RID command/module was commented out per user request)
     ---------------------------------------------------------------------------
 
     ---------------------------------------------------------------------------
@@ -414,25 +477,30 @@ function inv.items.parseIdentifyLine(item, line)
     local id = cleanLine:match("Id%s+:%s+(%d+)")
     if id then
         local normalizedId = tostring(id)
+        inv.items.identifySawOutput = inv.items.identifySawOutput or {}
+        inv.items.identifySawOutput[normalizedId] = true
         if inv.items.identifyEnchantResetId ~= normalizedId then
-            item.stats[invStatFieldEnchants] = nil
+            inv.items.resetIdentifyEnchantFields(item)
             inv.items.identifyEnchantResetId = normalizedId
         end
         item.stats[invStatFieldId] = tostring(id)
         continuationState.name = false
+        continuationState.enchant = false
+        continuationState.inEnchants = false
     end
 
-    -- Name : Axe of Aardwolf
     local name = cleanLine:match("Name%s+:%s+(.-)%s*|$")
     if name and name ~= "" then
-        -- Strip enchant text that may have been appended (e.g., "Wisdom +4 (removable...)")
-        name = name:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%)%s*", "")
-        name = name:gsub("%s+%(removable[^%)]*%)%s*", "")
         item.stats[invStatFieldName] = dbot.stripColors(name)
-        if not item.stats[invStatFieldColorName] or item.stats[invStatFieldColorName] == "" then
-            local colorName = tostring(originalLine):match("Name%s+:%s+(.-)%s*|$") or name
-            colorName = colorName:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%)%s*", "")
-            colorName = colorName:gsub("%s+%(removable[^%)]*%)%s*", "")
+        local colorName = tostring(originalLine):match("Name%s+:%s+(.-)%s*|$") or name
+        local existingColorName = item.stats[invStatFieldColorName]
+        local existingPlain = existingColorName and dbot.stripColors(existingColorName) or ""
+        local newPlain = dbot.stripColors(colorName)
+        local existingHasColorCodes = existingColorName and tostring(existingColorName):find("@", 1, true) ~= nil
+        local newHasColorCodes = tostring(colorName):find("@", 1, true) ~= nil
+        if existingHasColorCodes and not newHasColorCodes and existingPlain == newPlain then
+            item.stats[invStatFieldColorName] = existingColorName
+        else
             item.stats[invStatFieldColorName] = colorName
         end
         continuationState.keywords = false
@@ -797,16 +865,20 @@ function inv.items.parseIdentifyLine(item, line)
         continuationState.keywords = false
         continuationState.flags = false
         continuationState.affectMods = false
+        continuationState.inEnchants = true
+        if lowerTrimmed:find("enchants:") then
+            continuationState.enchant = false
+        end
     end
 
-    if lowerTrimmed:find("^|%s*illuminate%s*:") then
-        addEnchantType("illuminate")
-    end
-    if lowerTrimmed:find("^|%s*resonate%s*:") then
-        addEnchantType("resonate")
-    end
-    if lowerTrimmed:find("^|%s*solidify%s*:") then
-        addEnchantType("solidify")
+    local enchantKind, enchantValue = cleanLine:match("^%s*|%s*(%a+)%s*:%s*(.-)%s*|%s*$")
+    if enchantKind and enchantValue and enchantValueFields[enchantKind:lower()] then
+        recordEnchantValue(enchantKind, enchantValue)
+    else
+        local enchantContinuation = cleanLine:match("^%s*|%s*:%s*(.-)%s*|%s*$")
+        if enchantContinuation and continuationState.inEnchants and continuationState.enchant then
+            appendEnchantValue(continuationState.enchant, enchantContinuation)
+        end
     end
 
     -- Handle continuation lines: |            : more flags here        |
