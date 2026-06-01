@@ -41,7 +41,8 @@ inv.items.progress = inv.items.progress or {
     lastUpdate = 0,
 }
 inv.items.progress.reportMode = inv.items.progress.reportMode or "classic"
-if inv.items.progress.reportMode ~= "classic" and inv.items.progress.reportMode ~= "inline" then
+if inv.items.progress.reportMode ~= "classic" and inv.items.progress.reportMode ~= "inline"
+    and inv.items.progress.reportMode ~= "off" then
     inv.items.progress.reportMode = "classic"
 end
 inv.items.progress.inlineActive = inv.items.progress.inlineActive or false
@@ -67,7 +68,7 @@ end
 function inv.items.getReportMode()
     if inv.config and inv.config.getReportMode then
         local configured = inv.config.getReportMode()
-        if configured == "classic" or configured == "inline" then
+        if configured == "classic" or configured == "inline" or configured == "off" then
             inv.items.progress.reportMode = configured
             return configured
         end
@@ -77,7 +78,7 @@ end
 
 function inv.items.setReportMode(mode)
     local normalized = tostring(mode or ""):lower()
-    if normalized ~= "classic" and normalized ~= "inline" then
+    if normalized ~= "classic" and normalized ~= "inline" and normalized ~= "off" then
         return DRL_RET_INVALID_PARAM
     end
 
@@ -204,6 +205,12 @@ function inv.items.showProgress(stage, current, total, itemName)
     inv.items.progress.current = current
     inv.items.progress.total = total
 
+    local mode = inv.items.getReportMode()
+    if mode == "off" then
+        inv.items.clearInlineProgress()
+        return
+    end
+
     local pct = 0
     if total > 0 then
         pct = math.floor((current / total) * 100)
@@ -224,8 +231,6 @@ function inv.items.showProgress(stage, current, total, itemName)
     local filled = math.floor((pct / 100) * barWidth)
     local empty = barWidth - filled
     local bar = barColor .. string.rep("=", filled) .. "@w" .. string.rep("-", empty)
-
-    local mode = inv.items.getReportMode()
 
     -- Build message with Aardwolf color codes
     local msg = string.format("@w[%s@w] @W%d%% @w(%d/%d)", bar, pct, current, total)

@@ -616,12 +616,12 @@ function inv.cli.progress.fn(name, line, wildcards)
     local mode = tostring((wildcards and wildcards[1]) or ""):lower()
     if mode == "" or mode == "status" then
         local current = (inv.items and inv.items.getReportMode and inv.items.getReportMode()) or "classic"
-        dbot.info("Progress mode is '" .. tostring(current) .. "'. Usage: dinv progress <classic|inline>")
+        dbot.info("Progress mode is '" .. tostring(current) .. "'. Usage: dinv progress <classic|inline|off>")
         return DRL_RET_SUCCESS
     end
 
-    if mode ~= "classic" and mode ~= "inline" then
-        dbot.warn("Usage: dinv progress <classic|inline>")
+    if mode ~= "classic" and mode ~= "inline" and mode ~= "off" then
+        dbot.warn("Usage: dinv progress <classic|inline|off>")
         return DRL_RET_INVALID_PARAM
     end
 
@@ -639,14 +639,14 @@ end
 
 function inv.cli.progress.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s",
-               pluginNameCmd .. " progress @G<classic|inline>", "Set identify progress display mode"))
+               pluginNameCmd .. " progress @G<classic|inline|off>", "Set identify progress display mode"))
 end
 
 function inv.cli.progress.examples()
     local mode = (inv.items and inv.items.getReportMode and inv.items.getReportMode()) or "classic"
     dbot.print([[@W
 Usage:
-    dinv progress @G<classic|inline>@W - Set identify progress style
+    dinv progress @G<classic|inline|off>@W - Set identify progress style
     dinv progress status                       - Show current progress style
 
 Current mode: @G]] .. tostring(mode) .. [[@W
@@ -654,6 +654,7 @@ Current mode: @G]] .. tostring(mode) .. [[@W
 Modes:
     classic - Default line-by-line progress output
     inline  - Reuse a single progress line in the main console
+    off     - Hide identifying progress lines
 ]])
 end
 

@@ -200,7 +200,7 @@ end
 
 function inv.config.setReportMode(mode)
     local normalized = tostring(mode or ""):lower()
-    if normalized ~= "classic" and normalized ~= "inline" then
+    if normalized ~= "classic" and normalized ~= "inline" and normalized ~= "off" then
         return DRL_RET_INVALID_PARAM
     end
     return inv.config.set("reportMode", normalized)
