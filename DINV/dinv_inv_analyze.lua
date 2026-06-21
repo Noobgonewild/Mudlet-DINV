@@ -48,6 +48,44 @@ function inv.analyze.reset()
     return DRL_RET_SUCCESS
 end
 
+function inv.analyze.getStaleReason(priorityName)
+    local analysisData = inv.analyze.table and inv.analyze.table[priorityName]
+    if not analysisData then
+        return nil
+    end
+    if inv.context and inv.context.getStaleReason then
+        return inv.context.getStaleReason(analysisData.context)
+    end
+    return nil
+end
+
+function inv.analyze.isFresh(priorityName)
+    local analysisData = inv.analyze.table and inv.analyze.table[priorityName]
+    if not analysisData or not analysisData.levels then
+        return false, "no analysis data"
+    end
+    local reason = inv.analyze.getStaleReason(priorityName)
+    return reason == nil, reason
+end
+
+function inv.analyze.checkAvailable(priorityName, operationName)
+    local analysisData = inv.analyze.table and inv.analyze.table[priorityName]
+    if not analysisData or not analysisData.levels then
+        dbot.warn((operationName or "This operation") .. " requires analysis data for '" .. tostring(priorityName) .. "'.")
+        dbot.info("Run @Gdinv analyze create " .. tostring(priorityName) .. "@W first.")
+        return false, DRL_RET_MISSING_ENTRY
+    end
+
+    local reason = inv.analyze.getStaleReason(priorityName)
+    if reason then
+        dbot.warn("Analysis '" .. tostring(priorityName) .. "' is stale: " .. reason .. ".")
+        dbot.info("Run @Gdinv analyze create " .. tostring(priorityName) .. "@W to refresh it.")
+        return true, DRL_RET_SUCCESS, reason
+    end
+
+    return true, DRL_RET_SUCCESS
+end
+
 function inv.analyze._expandPositions(positions)
     if positions == nil or positions == "" then
         return nil
@@ -105,9 +143,14 @@ function inv.analyze.create(priorityName, positions, endTag, onComplete)
         delaySec = 0.5,
         endTag = endTag,
         callbacks = {},
+        context = inv.context and inv.context.capture and inv.context.capture() or nil,
     }
 
-    inv.analyze.table[priorityName] = { positions = allowedPositions, levels = {} }
+    inv.analyze.table[priorityName] = {
+        positions = allowedPositions,
+        levels = {},
+        context = inv.context and inv.context.copy and inv.context.copy(job.context) or job.context,
+    }
     dbot.info("Creating analysis for priority '" .. priorityName .. "'")
 
     if onComplete then
@@ -215,7 +258,9 @@ function inv.analyze.list(endTag)
     dbot.print("@WAnalysis Reports:@w")
     local count = 0
     for name, _ in pairs(inv.analyze.table) do
-        dbot.print("  @G" .. name .. "@w")
+        local staleReason = inv.analyze.getStaleReason(name)
+        local suffix = staleReason and (" @Y[STALE: " .. staleReason .. "]@w") or ""
+        dbot.print("  @G" .. name .. "@w" .. suffix)
         count = count + 1
     end
     if count == 0 then
@@ -232,13 +277,89 @@ function inv.analyze.display(priorityName, levelOrSkip, endTag)
         return inv.tags.stop(invTagsAnalyze, endTag, DRL_RET_MISSING_ENTRY)
     end
 
-    dbot.print("@WAnalysis Results: @G" .. priorityName .. "@w")
+    local staleReason = inv.analyze.getStaleReason(priorityName)
+    if staleReason then
+        dbot.warn("Analysis '" .. priorityName .. "' is stale: " .. staleReason .. ". Displaying saved results only.")
+        dbot.info("Run @Gdinv analyze create " .. priorityName .. "@W to refresh it.")
+    end
+
+    local staleHeading = staleReason and " @Y[STALE]@w" or ""
+    dbot.print("@WAnalysis Results: @G" .. priorityName .. "@w" .. staleHeading)
     local levels = {}
     local analysis = analysisData.levels or {}
     for level in pairs(analysis) do
         table.insert(levels, tonumber(level))
     end
     table.sort(levels)
+
+    local function cleanItemName(rawName)
+        local name = tostring(rawName or "")
+        return name:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%).*", "")
+    end
+
+    local function itemDisplayName(objId)
+        local rawName = inv.items.getStatField(objId, invStatFieldColorName)
+            or inv.items.getStatField(objId, invStatFieldName)
+            or ("obj " .. tostring(objId))
+        return cleanItemName(rawName)
+    end
+
+    local function padColored(value, width, align)
+        local raw = tostring(value or "")
+        local plain = dbot.stripColors(raw)
+        local pad = math.max(0, (tonumber(width) or 0) - #plain)
+        if align == "right" then
+            return string.rep(" ", pad) .. raw
+        end
+        return raw .. string.rep(" ", pad)
+    end
+
+    local function truncateColoredText(value, width)
+        local raw = tostring(value or "")
+        local limit = tonumber(width) or 0
+        if limit <= 0 or #dbot.stripColors(raw) <= limit then
+            return raw
+        end
+
+        local suffix = "..."
+        if limit <= #suffix then
+            return suffix:sub(1, limit)
+        end
+
+        local keep = limit - #suffix
+        local out = {}
+        local visible = 0
+        local idx = 1
+
+        while idx <= #raw and visible < keep do
+            local c = raw:sub(idx, idx)
+            if c == "@" then
+                local escapedAt = raw:sub(idx, idx + 1) == "@@"
+                local xcode = raw:match("^@x%d+", idx)
+                if escapedAt then
+                    table.insert(out, "@@")
+                    idx = idx + 2
+                    visible = visible + 1
+                elseif xcode then
+                    table.insert(out, xcode)
+                    idx = idx + #xcode
+                elseif idx < #raw then
+                    table.insert(out, raw:sub(idx, idx + 1))
+                    idx = idx + 2
+                else
+                    table.insert(out, c)
+                    idx = idx + 1
+                    visible = visible + 1
+                end
+            else
+                table.insert(out, c)
+                idx = idx + 1
+                visible = visible + 1
+            end
+        end
+
+        return table.concat(out, "") .. suffix .. "@w"
+    end
 
     local singleLevel = tonumber(levelOrSkip)
 
@@ -257,7 +378,7 @@ function inv.analyze.display(priorityName, levelOrSkip, endTag)
         table.sort(locs)
         for _, loc in ipairs(locs) do
             local objId = entry.equipment[loc]
-            local name = inv.items.getStatField(objId, invStatFieldName) or ("obj " .. tostring(objId))
+            local name = itemDisplayName(objId)
             dbot.print(string.format("    @C%-10s@W %s", loc .. ":", name))
         end
         return inv.tags.stop(invTagsAnalyze, endTag, DRL_RET_SUCCESS)
@@ -267,32 +388,65 @@ function inv.analyze.display(priorityName, levelOrSkip, endTag)
         return tonumber(inv.items.getStatField(objId, field)) or 0
     end
 
-    local function formatAnalyzeLine(level, marker, objId, loc)
-        local name = inv.items.getStatField(objId, invStatFieldName) or ("obj " .. tostring(objId))
+    local function formatValueCell(value, suffix, valueColorOverride)
+        local num = tonumber(value) or 0
+        if num == 0 then
+            return string.format("@D%d%s@w", num, suffix)
+        end
+        local valueColor = valueColorOverride or (num < 0 and "@R" or "@G")
+        return string.format("%s%d@D%s@w", valueColor, num, suffix)
+    end
+
+    local analyzeStats = {
+        { field = invStatFieldHitroll, suffix = "hr",  width = 5 },
+        { field = invStatFieldDamroll, suffix = "dr",  width = 5 },
+        { field = invStatFieldInt,     suffix = "int", width = 5 },
+        { field = invStatFieldWis,     suffix = "wis", width = 5 },
+        { field = invStatFieldLuck,    suffix = "luc", width = 5 },
+        { field = invStatFieldStr,     suffix = "str", width = 5 },
+        { field = invStatFieldDex,     suffix = "dex", width = 5 },
+        { field = invStatFieldCon,     suffix = "con", width = 5 },
+        { field = invStatFieldAllPhys, suffix = "res", width = 5 },
+        { field = invStatFieldHp,      suffix = "hp",  width = 6 },
+        { field = invStatFieldMana,    suffix = "mn",  width = 6 },
+        { field = invStatFieldMoves,   suffix = "mv",  width = 6 },
+    }
+
+    local function formatAnalyzeLine(level, marker, objId, loc, widths)
         local markerColor = (marker == ">>") and "@G" or "@R"
-        return string.format(
-            "%3d %s%s@w %-24s %-10s %4d %4d %3d %3d %3d %3d %3d %3d %3d %5d %5d %5d",
-            tonumber(level) or 0,
-            markerColor,
-            marker,
-            name,
-            loc,
-            statValue(objId, invStatFieldHitroll),
-            statValue(objId, invStatFieldDamroll),
-            statValue(objId, invStatFieldInt),
-            statValue(objId, invStatFieldWis),
-            statValue(objId, invStatFieldLuck),
-            statValue(objId, invStatFieldStr),
-            statValue(objId, invStatFieldDex),
-            statValue(objId, invStatFieldCon),
-            statValue(objId, invStatFieldAllPhys),
-            statValue(objId, invStatFieldHp),
-            statValue(objId, invStatFieldMana),
-            statValue(objId, invStatFieldMoves)
-        )
+        local valueColorOverride = (marker == "<<") and "@R" or nil
+        local sep = " "
+        local cells = {
+            string.format("@W%3d@w ", tonumber(level) or 0),
+            markerColor, marker, "@w ",
+            padColored(truncateColoredText(itemDisplayName(objId), widths.name), widths.name), sep,
+            padColored("@C" .. tostring(loc or "") .. "@w", widths.loc), sep,
+        }
+
+        for _, stat in ipairs(analyzeStats) do
+            table.insert(cells, padColored(
+                formatValueCell(statValue(objId, stat.field), stat.suffix, valueColorOverride),
+                stat.width))
+            table.insert(cells, sep)
+        end
+
+        return table.concat(cells, "")
     end
 
     local prevEquipment = nil
+    local groups = {}
+    local widths = { name = 24, loc = 8 }
+
+    local function noteItemWidth(objId)
+        if not objId then
+            return
+        end
+        local plain = dbot.stripColors(itemDisplayName(objId))
+        if #plain > widths.name then
+            widths.name = #plain
+        end
+    end
+
     for _, level in ipairs(levels) do
         local entry = analysis[tostring(level)]
         local equipment = entry and entry.equipment or {}
@@ -315,19 +469,33 @@ function inv.analyze.display(priorityName, levelOrSkip, endTag)
 
         if #changed > 0 then
             table.sort(changed, function(a, b) return a.loc < b.loc end)
-            dbot.print(string.format("\n@W-------------------------------------------- Level %3d --------------------------------------------@w", level))
-            dbot.print("@WLvl Name of Armor            Type       HR   DR Int Wis Lck Str Dex Con Res HitP Mana Move@w")
             for _, change in ipairs(changed) do
-                if change.fromObjId then
-                    dbot.print(formatAnalyzeLine(change.fromObjId and level or 0, "<<", change.fromObjId, change.loc))
+                local locLen = #tostring(change.loc or "")
+                if locLen > widths.loc then
+                    widths.loc = locLen
                 end
-                if change.toObjId then
-                    dbot.print(formatAnalyzeLine(level, ">>", change.toObjId, change.loc))
-                end
+                noteItemWidth(change.fromObjId)
+                noteItemWidth(change.toObjId)
             end
+            table.insert(groups, { level = level, changes = changed })
         end
 
         prevEquipment = equipment
+    end
+
+    widths.name = math.min(widths.name, 35)
+    widths.loc = math.min(widths.loc, 12)
+
+    for _, group in ipairs(groups) do
+        dbot.print(string.format("\n@W-------------------------------------------- Level %3d --------------------------------------------@w", group.level))
+        for _, change in ipairs(group.changes) do
+            if change.fromObjId then
+                dbot.print(formatAnalyzeLine(group.level, "<<", change.fromObjId, change.loc, widths))
+            end
+            if change.toObjId then
+                dbot.print(formatAnalyzeLine(group.level, ">>", change.toObjId, change.loc, widths))
+            end
+        end
     end
 
     return inv.tags.stop(invTagsAnalyze, endTag, DRL_RET_SUCCESS)
@@ -380,6 +548,15 @@ function inv.analyze.onLevelGained(newLevel)
     local priorityName = inv.priority.getDefault()
     if not priorityName then
         return DRL_RET_SUCCESS
+    end
+
+    local staleReason = inv.analyze.getStaleReason(priorityName)
+    if staleReason then
+        local warningKey = tostring(priorityName) .. "|" .. tostring(staleReason)
+        if inv.analyze._lastLevelupStaleWarning ~= warningKey then
+            dbot.warn("Analysis '" .. priorityName .. "' is stale: " .. staleReason .. ". Level-up check is continuing with cached results.")
+            inv.analyze._lastLevelupStaleWarning = warningKey
+        end
     end
 
     local upgradeSlots = inv.analyze.getUpgradeSlotsForLevel(priorityName, level)
@@ -531,6 +708,14 @@ function inv.analyze.onLevelStatus(currentBaseLevel, forceConfirm)
     elseif mode == "cache" then
         local analysisData = inv.analyze.table and inv.analyze.table[priorityName]
         local levels = analysisData and analysisData.levels or nil
+        local staleReason = inv.analyze.getStaleReason(priorityName)
+        if staleReason then
+            local warningKey = tostring(priorityName) .. "|" .. tostring(staleReason)
+            if inv.analyze._lastLevelupStaleWarning ~= warningKey then
+                dbot.warn("Analysis '" .. priorityName .. "' is stale: " .. staleReason .. ". Level-up check is continuing with cached results.")
+                inv.analyze._lastLevelupStaleWarning = warningKey
+            end
+        end
         if not levels or not levels[tostring(newBase)] or not levels[tostring(newBase - 1)] then
             effectiveMode = "off"
             disabledReason = "no analysis"

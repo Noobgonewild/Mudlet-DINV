@@ -100,8 +100,8 @@ local function hasDualWieldAvailable(wearableLevel)
     local level = tonumber(wearableLevel) or getCurrentWearableLevel()
     local dualWieldAvailable = false
 
-    if dbot.ability and dbot.ability.isAvailable then
-        dualWieldAvailable = dbot.ability.isAvailable("dual wield", level)
+    if dbot.ability and dbot.ability.hasDualWieldAccess then
+        dualWieldAvailable = dbot.ability.hasDualWieldAccess(level)
     end
 
     if not dualWieldAvailable then

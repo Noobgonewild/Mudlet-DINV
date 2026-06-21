@@ -38,6 +38,16 @@ function inv.usage.display(priorityName, query, endTag)
         table.insert(priorities, priorityName)
     end
 
+    for _, prio in ipairs(priorities) do
+        local analysisData = inv.analyze.table and inv.analyze.table[prio]
+        if analysisData and analysisData.levels then
+            local fresh, freshRetval = inv.analyze.checkAvailable(prio, "Usage")
+            if not fresh then
+                return inv.tags.stop(invTagsUsage, endTag, freshRetval)
+            end
+        end
+    end
+
     local function displayUsage()
         inv.items.sort(itemIds, {
             { field = invStatFieldType, isAscending = true },

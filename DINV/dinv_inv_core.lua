@@ -320,6 +320,7 @@ inv.keyword  = inv.keyword or {}
 inv.unused   = inv.unused or {}
 inv.discover = inv.discover or {}
 inv.cli      = inv.cli or {}
+inv.context  = inv.context or {}
 
 -- Pre-declare init sub-tables for each module
 inv.config.init   = inv.config.init or {}
@@ -351,6 +352,116 @@ inv.items.table   = inv.items.table or {}
 inv.priority.table = inv.priority.table or {}
 inv.cache.table   = inv.cache.table or {}
 inv.snapshot.table = inv.snapshot.table or {}
+
+----------------------------------------------------------------------------------------------------
+-- Character-dependent cache context
+----------------------------------------------------------------------------------------------------
+
+-- Increment this when a class/tier-dependent analysis rule changes.  It keeps
+-- saved analyses from silently surviving a semantic change in DINV itself.
+inv.context.rulesVersion = 1
+
+local function contextCopyArray(values)
+    local out = {}
+    for _, value in ipairs(values or {}) do
+        table.insert(out, tostring(value))
+    end
+    return out
+end
+
+local function contextClassSet(values)
+    local out = {}
+    for _, value in ipairs(values or {}) do
+        out[tostring(value):lower()] = tostring(value)
+    end
+    return out
+end
+
+local function contextSortedNames(classSet)
+    local out = {}
+    for _, displayName in pairs(classSet or {}) do
+        table.insert(out, displayName)
+    end
+    table.sort(out, function(a, b) return a:lower() < b:lower() end)
+    return out
+end
+
+function inv.context.capture()
+    local classes = {}
+    if dbot and dbot.gmcp and dbot.gmcp.getClasses then
+        classes = dbot.gmcp.getClasses()
+    end
+
+    return {
+        classes = contextCopyArray(classes),
+        tier = tonumber(dbot and dbot.gmcp and dbot.gmcp.getTier and dbot.gmcp.getTier()) or 0,
+        rulesVersion = inv.context.rulesVersion,
+    }
+end
+
+function inv.context.copy(value)
+    if type(value) ~= "table" then
+        return nil
+    end
+    return {
+        classes = contextCopyArray(value.classes),
+        tier = tonumber(value.tier) or 0,
+        rulesVersion = tonumber(value.rulesVersion) or 0,
+    }
+end
+
+function inv.context.getStaleReason(storedContext)
+    if type(storedContext) ~= "table" then
+        return "saved before character-context tracking was added"
+    end
+
+    local current = inv.context.capture()
+    local storedRules = tonumber(storedContext.rulesVersion) or 0
+    if storedRules ~= tonumber(current.rulesVersion) then
+        return string.format("analysis rules changed from version %d to %d", storedRules, current.rulesVersion)
+    end
+
+    local storedTier = tonumber(storedContext.tier) or 0
+    if storedTier ~= tonumber(current.tier) then
+        return string.format("tier changed from T%d to T%d", storedTier, current.tier)
+    end
+
+    local storedClasses = contextClassSet(storedContext.classes)
+    local currentClasses = contextClassSet(current.classes)
+    local added = {}
+    local removed = {}
+
+    for normalized, displayName in pairs(currentClasses) do
+        if not storedClasses[normalized] then
+            added[normalized] = displayName
+        end
+    end
+    for normalized, displayName in pairs(storedClasses) do
+        if not currentClasses[normalized] then
+            removed[normalized] = displayName
+        end
+    end
+
+    local addedNames = contextSortedNames(added)
+    local removedNames = contextSortedNames(removed)
+    local changes = {}
+    if #addedNames > 0 then
+        table.insert(changes, "added " .. table.concat(addedNames, ", "))
+    end
+    if #removedNames > 0 then
+        table.insert(changes, "removed " .. table.concat(removedNames, ", "))
+    end
+    if #changes > 0 then
+        return "classes changed: " .. table.concat(changes, "; ")
+    end
+
+    return nil
+end
+
+function inv.context.isStale(storedContext)
+    local reason = inv.context.getStaleReason(storedContext)
+    return reason ~= nil, reason
+end
 
 ----------------------------------------------------------------------------------------------------
 -- Wear Location Table  (numeric id -> slot name, matches Aardwolf invmon/eqdata protocol)

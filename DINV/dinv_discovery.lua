@@ -4,8 +4,11 @@ DINV.discovery.identifyTriggerIds = DINV.discovery.identifyTriggerIds or {}
 DINV.discovery.identifyBuffer = DINV.discovery.identifyBuffer or {}
 DINV.discovery.currentSection = nil
 DINV.discovery.currentContainerId = nil
+DINV.discovery.keepFlagChanged = false
 DINV.discovery.identifyCardOpen = DINV.discovery.identifyCardOpen or false
 DINV.discovery.rawSuppressUntil = DINV.discovery.rawSuppressUntil or 0
+DINV.discovery.perfSectionStart = DINV.discovery.perfSectionStart or nil
+DINV.discovery.perfParseMs = DINV.discovery.perfParseMs or 0
 DINV.discovery.debug = DINV.discovery.debug or {
     eq_lines = 0,
     inv_lines = 0,
@@ -68,23 +71,51 @@ local function _resetInvCounters()
     DINV.discovery.debug.inv_lines = 0
     DINV.discovery.debug.inv_calls_ok = 0
     DINV.discovery.debug.inv_calls_err = 0
+    DINV.discovery.perfParseMs = 0
 end
 
 local function isDiscoveryActive()
     return inv and inv.items and (
         inv.items.buildInProgress
+        -- refreshInProgress is the authoritative owner flag for refresh scans.
+        -- Do not rely only on inv.state here: asynchronous item handling can
+        -- temporarily change that broader state while validation still owns
+        -- the protocol response.
+        or inv.items.refreshInProgress
         or inv.items.identifyHydrateInProgress
         or inv.state == invStateDiscovery
     )
 end
 
 local function setSection(section, containerId)
-    if not isDiscoveryActive() then
-        return
+    local isMainInventoryKeepSync = section == "invdata"
+        and containerId == nil
+        and inv
+        and inv.items
+        and inv.items.keepSync
+        and inv.items.keepSync.active == true
+
+    -- Protocol tags can also be produced by commands entered manually. Only
+    -- admit them while DINV owns an active discovery workflow, except for the
+    -- deliberately narrow main-inventory scan used to synchronize keep flags.
+    if not isDiscoveryActive() and not isMainInventoryKeepSync then
+        dbot.debug(
+            "Ignoring unsolicited " .. tostring(section) .. " section while discovery is idle",
+            "discovery"
+        )
+        return false
+    end
+
+    if inv and inv.items and inv.items.startRefreshScan
+        and not inv.items.startRefreshScan(section, containerId) then
+        return false
     end
 
     DINV.discovery.currentSection = section
     DINV.discovery.currentContainerId = containerId
+    DINV.discovery.keepFlagChanged = false
+    DINV.discovery.perfSectionStart = dbot.perfNow and dbot.perfNow() or nil
+    DINV.discovery.perfParseMs = 0
 
     if section == "eqdata" then
         inv.items.inEqdata = true
@@ -97,13 +128,29 @@ local function setSection(section, containerId)
         _resetInvCounters()
         dbot.debug("@YNow in invdata section, container: " .. tostring(containerId) .. "@W", "discovery")
     end
+    return true
 end
 
 local function shouldSuppressDiscoveryOutput()
+    -- Once a protocol section has been admitted, DINV owns every line in it.
+    -- Keep this independent of the broader workflow state so a late state
+    -- transition cannot expose raw CSV rows while the section is open.
+    if DINV.discovery.currentSection ~= nil then
+        return true
+    end
+    if inv and inv.items and (inv.items.inEqdata or inv.items.inInvdata) then
+        return true
+    end
+    if inv and inv.items and inv.items.keepSync and inv.items.keepSync.active then
+        return true
+    end
     if inv and inv.items and inv.items.identifyHydrateInProgress then
         return true
     end
     if inv and inv.items and inv.items.buildInProgress then
+        return true
+    end
+    if inv and inv.items and inv.items.refreshInProgress then
         return true
     end
     if inv and inv.state == invStateDiscovery then
@@ -160,28 +207,69 @@ function DINV.discovery.queuePromptSuppress()
     )
 end
 
-local function clearSection(section)
-    dbot.debug("@YClearing section: " .. tostring(section) .. "@W", "discovery")
+local function finishKeepFlagCapture(section, containerId, wasActive)
+    local changed = DINV.discovery.keepFlagChanged == true
+    local completedSync = false
 
-    if not isDiscoveryActive() then
-        inv.items.inEqdata = false
-        inv.items.inInvdata = false
-        DINV.discovery.currentSection = nil
-        DINV.discovery.currentContainerId = nil
-        return
+    if section == "invdata"
+        and containerId == nil
+        and inv.items.completeKeepFlagSync
+        and inv.items.keepSync
+        and inv.items.keepSync.active then
+        completedSync = inv.items.completeKeepFlagSync(changed)
     end
 
+    if changed and not completedSync and not wasActive and inv.items.save then
+        inv.items.save()
+    end
+
+    if not wasActive then
+        inv.items.currentInvdataSeen = nil
+        inv.items.awaitingInvdataContainerId = nil
+    end
+    DINV.discovery.keepFlagChanged = false
+    if inv.items.maybeStartKeepFlagSync then
+        inv.items.maybeStartKeepFlagSync()
+    end
+end
+
+local function clearSection(section)
+    dbot.debug("@YClearing section: " .. tostring(section) .. "@W", "discovery")
+    local wasActive = isDiscoveryActive()
+    local perfSectionStart = DINV.discovery.perfSectionStart
+    local perfParseMs = DINV.discovery.perfParseMs or 0
+
     if section == "eqdata" then
+        if DINV.discovery.currentSection ~= "eqdata" then
+            if inv.items.refreshInProgress and inv.items.invalidateRefresh then
+                inv.items.invalidateRefresh("received eqdata end without an active eqdata response")
+            end
+            return
+        end
         inv.items.inEqdata = false
         DINV.discovery.currentSection = nil
         DINV.discovery.currentContainerId = nil
-        if inv.items.onEqdataComplete then
+        local validCompletion = not inv.items.completeRefreshScan
+            or inv.items.completeRefreshScan("eqdata", nil)
+        dbot.perf(
+            string.format("scan eqdata parse %.1fms", perfParseMs),
+            perfSectionStart
+        )
+        DINV.discovery.perfSectionStart = nil
+        if validCompletion and inv.items.onEqdataComplete then
             inv.items.onEqdataComplete()
         end
+        finishKeepFlagCapture(section, nil, wasActive)
         return
     end
 
     if section == "invdata" then
+        if DINV.discovery.currentSection ~= "invdata" then
+            if inv.items.refreshInProgress and inv.items.invalidateRefresh then
+                inv.items.invalidateRefresh("received invdata end without an active invdata response")
+            end
+            return
+        end
         inv.items.inInvdata = false
         local containerId = DINV.discovery.currentContainerId
         DINV.discovery.currentSection = nil
@@ -197,11 +285,38 @@ local function clearSection(section)
         ), "discovery")
 
         if inv.items.identifyHydrateInProgress and inv.items.finishIdentifyHydrateInvdata then
+            dbot.perf(
+                string.format(
+                    "scan invdata container=%s lines=%d ok=%d err=%d parse %.1fms",
+                    tostring(containerId),
+                    DINV.discovery.debug.inv_lines,
+                    DINV.discovery.debug.inv_calls_ok,
+                    DINV.discovery.debug.inv_calls_err,
+                    perfParseMs
+                ),
+                perfSectionStart
+            )
+            DINV.discovery.perfSectionStart = nil
+            finishKeepFlagCapture(section, containerId, wasActive)
             inv.items.finishIdentifyHydrateInvdata()
             return
         end
 
-        if inv.items.onInvdataComplete then
+        local validCompletion = not inv.items.completeRefreshScan
+            or inv.items.completeRefreshScan("invdata", containerId)
+        dbot.perf(
+            string.format(
+                "scan invdata container=%s lines=%d ok=%d err=%d parse %.1fms",
+                tostring(containerId),
+                DINV.discovery.debug.inv_lines,
+                DINV.discovery.debug.inv_calls_ok,
+                DINV.discovery.debug.inv_calls_err,
+                perfParseMs
+            ),
+            perfSectionStart
+        )
+        DINV.discovery.perfSectionStart = nil
+        if validCompletion and inv.items.onInvdataComplete then
             local ok, err = pcall(inv.items.onInvdataComplete, containerId)
             if not ok then
                 dbot.debug("@R[DINV DBG] onInvdataComplete ERROR: " .. tostring(err) .. "@W", "discovery")
@@ -209,6 +324,7 @@ local function clearSection(section)
         else
             dbot.debug("@R[DINV DBG] inv.items.onInvdataComplete is NIL@W", "discovery")
         end
+        finishKeepFlagCapture(section, containerId, wasActive)
     end
 end
 
@@ -219,7 +335,25 @@ local function handleDataLine(section, dataLine)
 
     if section == "eqdata" then
         if inv.items.onEqdata then
-            inv.items.onEqdata(dataLine)
+            local parseStart = dbot.perfNow and dbot.perfNow() or nil
+            local ok, retval, keepFlagChanged = pcall(inv.items.onEqdata, dataLine)
+            if parseStart and dbot.perfNow then
+                local elapsedMs = (dbot.perfNow() - parseStart) * 1000
+                DINV.discovery.perfParseMs = (DINV.discovery.perfParseMs or 0) + elapsedMs
+                if elapsedMs >= 100 and dbot.perf then
+                    dbot.perf("slow eqdata row id=" .. tostring(dataLine:match("^(%d+),") or "?"), parseStart)
+                end
+            end
+            if ok and retval == DRL_RET_SUCCESS then
+                if keepFlagChanged then
+                    DINV.discovery.keepFlagChanged = true
+                end
+            else
+                if inv.items.refreshInProgress and inv.items.invalidateRefresh then
+                    inv.items.invalidateRefresh("failed to parse eqdata item line")
+                end
+                dbot.debug("@R[DINV DBG] onEqdata ERROR: " .. tostring(retval) .. "@W", "discovery")
+            end
         end
         return
     end
@@ -227,18 +361,46 @@ local function handleDataLine(section, dataLine)
     if section == "invdata" then
         DINV.discovery.debug.inv_lines = DINV.discovery.debug.inv_lines + 1
 
+        if inv.items.keepSync and inv.items.keepSync.active
+            and inv.items.updateKeepFlagFromDataLine then
+            local retval, keepFlagChanged = inv.items.updateKeepFlagFromDataLine(dataLine)
+            if retval == DRL_RET_SUCCESS then
+                DINV.discovery.debug.inv_calls_ok = DINV.discovery.debug.inv_calls_ok + 1
+                if keepFlagChanged then
+                    DINV.discovery.keepFlagChanged = true
+                end
+            else
+                DINV.discovery.debug.inv_calls_err = DINV.discovery.debug.inv_calls_err + 1
+            end
+            return
+        end
+
         if inv.items.identifyHydrateInProgress and inv.items.handleIdentifyHydrateInvdataLine then
             inv.items.handleIdentifyHydrateInvdataLine(dataLine)
             return
         end
 
         if inv.items.onInvdata then
-            local ok, err = pcall(inv.items.onInvdata, dataLine)
-            if ok then
+            local parseStart = dbot.perfNow and dbot.perfNow() or nil
+            local ok, retval, keepFlagChanged = pcall(inv.items.onInvdata, dataLine)
+            if parseStart and dbot.perfNow then
+                local elapsedMs = (dbot.perfNow() - parseStart) * 1000
+                DINV.discovery.perfParseMs = (DINV.discovery.perfParseMs or 0) + elapsedMs
+                if elapsedMs >= 100 and dbot.perf then
+                    dbot.perf("slow invdata row id=" .. tostring(dataLine:match("^(%d+),") or "?"), parseStart)
+                end
+            end
+            if ok and retval == DRL_RET_SUCCESS then
                 DINV.discovery.debug.inv_calls_ok = DINV.discovery.debug.inv_calls_ok + 1
+                if keepFlagChanged then
+                    DINV.discovery.keepFlagChanged = true
+                end
             else
                 DINV.discovery.debug.inv_calls_err = DINV.discovery.debug.inv_calls_err + 1
-                dbot.debug("@R[DINV DBG] onInvdata ERROR: " .. tostring(err) .. "@W", "discovery")
+                if inv.items.refreshInProgress and inv.items.invalidateRefresh then
+                    inv.items.invalidateRefresh("failed to parse invdata item line")
+                end
+                dbot.debug("@R[DINV DBG] onInvdata ERROR: " .. tostring(retval) .. "@W", "discovery")
                 dbot.debug("@R[DINV DBG] onInvdata line was: " .. tostring(dataLine) .. "@W", "discovery")
             end
         else
@@ -294,6 +456,15 @@ function DINV.discovery.register()
             end
 
             local objId = matches and matches[2] or nil
+            if objId and inv and inv.items and inv.items.refreshInProgress
+                and inv.items.completeMissingRefreshContainer then
+                if inv.items.completeMissingRefreshContainer(objId)
+                    and inv.items.onInvdataComplete then
+                    inv.items.onInvdataComplete(objId)
+                end
+                return
+            end
+
             if objId and inv and inv.items and inv.items.handleMissingItem then
                 inv.items.handleMissingItem(objId)
             end
@@ -315,10 +486,10 @@ function DINV.discovery.register()
             end
             dbot.debug("@YTrigger fired: eqdataStart@W", "discovery")
             dbot.debug("@Y=== EQDATA START ===@W", "discovery")
-            if not isDiscoveryActive() then
+            if not setSection("eqdata", nil) then
+                if shouldSuppressDiscoveryOutput() then deleteLine() end
                 return
             end
-            setSection("eqdata", nil)
             if shouldSuppressDiscoveryOutput() then deleteLine() end
         end
     )
@@ -333,9 +504,6 @@ function DINV.discovery.register()
             end
             dbot.debug("@YTrigger fired: eqdataEnd@W", "discovery")
             dbot.debug("@Y=== EQDATA END ===@W", "discovery")
-            if not isDiscoveryActive() then
-                return
-            end
             if shouldSuppressDiscoveryOutput() then deleteLine() end
             clearSection("eqdata")
         end
@@ -345,25 +513,36 @@ function DINV.discovery.register()
     -- INV TAGS: robust matching (NO ^/$)
     --------------------------------------------------------------------------------------------
 
-    -- Empty container on ONE line: {invdata 123}{/invdata} (robust)
+    -- Empty main inventory/container on ONE line: {invdata}{/invdata}
+    -- or {invdata 123}{/invdata}.
     DINV.discovery.ids.invdataEmptyContainer = tempRegexTrigger(
-        "\\{invdata\\s*(\\d+)\\}.*\\{/invdata\\}",
+        "\\{invdata\\s*(\\d*)\\}.*\\{/invdata\\}",
         function(matches)
             if not DINV.shouldProcessData() then
                 deleteLine()
                 return
             end
-            if not isDiscoveryActive() then
-                return
-            end
             local line = _getLine()
             local containerId = matches[2]
+            if containerId == "" then
+                containerId = nil
+            end
+            if not containerId and inv and inv.items
+                and inv.items.expectedInvdataContainerId
+                and inv.items.awaitingInvdataContainerId
+                and tostring(inv.items.expectedInvdataContainerId)
+                    == tostring(inv.items.awaitingInvdataContainerId) then
+                containerId = tostring(inv.items.awaitingInvdataContainerId)
+            end
             dbot.debug("@YTrigger fired: invdataEmptyContainer@W", "discovery")
             dbot.debug("@Yline=" .. line .. "@W", "discovery")
             dbot.debug("@Yhex=" .. _hexDump(line) .. "@W", "discovery")
             dbot.debug("@Y=== INVDATA EMPTY CONTAINER: " .. tostring(containerId) .. " ===@W", "discovery")
 
-            setSection("invdata", containerId)
+            if not setSection("invdata", containerId) then
+                if shouldSuppressDiscoveryOutput() then deleteLine() end
+                return
+            end
             if shouldSuppressDiscoveryOutput() then deleteLine() end
             clearSection("invdata")
         end
@@ -377,12 +556,6 @@ function DINV.discovery.register()
 	  function()
 		if not DINV.shouldProcessData() then
 		  deleteLine()
-		  return
-		end
-		if not isDiscoveryActive() then
-		  if shouldSuppressRawDiscoveryNoise() and deleteLine then
-		    deleteLine()
-		  end
 		  return
 		end
 		local line = _getLine()
@@ -415,7 +588,10 @@ function DINV.discovery.register()
 
 		if containerId and containerId ~= "0" then
 		  dbot.debug("@Y=== INVDATA CONTAINER START: " .. tostring(containerId) .. " ===@W", "discovery")
-		  setSection("invdata", containerId)
+		  if not setSection("invdata", containerId) then
+		    if shouldSuppressDiscoveryOutput() then deleteLine() end
+		    return
+		  end
 		else
 		  dbot.debug("@Y=== INVDATA START (MAIN) ===@W", "discovery")
 		  dbot.debug(string.format(
@@ -424,7 +600,10 @@ function DINV.discovery.register()
 			tostring(invStateDiscovery),
 			tostring(inv and inv.items and inv.items.buildInProgress)
 		  ), "discovery")
-		  setSection("invdata", nil)
+		  if not setSection("invdata", nil) then
+		    if shouldSuppressDiscoveryOutput() then deleteLine() end
+		    return
+		  end
 		end
 
         if shouldSuppressDiscoveryOutput() then deleteLine() end
@@ -439,12 +618,6 @@ function DINV.discovery.register()
         function()
             if not DINV.shouldProcessData() then
                 deleteLine()
-                return
-            end
-            if not isDiscoveryActive() then
-                if shouldSuppressRawDiscoveryNoise() and deleteLine then
-                    deleteLine()
-                end
                 return
             end
             local line = _getLine()
@@ -469,9 +642,18 @@ function DINV.discovery.register()
     --------------------------------------------------------------------------------------------
 
     DINV.discovery.ids.dataLine = tempRegexTrigger(
-        "^(\\d{5,}.*)$",
+        "^(\\d{5,},.*)$",
         function(matches)
-            dbot.debug("@YTrigger fired: dataLine@W", "discovery")
+            matches = matches or _G.matches
+            local dataLine = nil
+            if matches then
+                dataLine = matches[2] or matches[1]
+            end
+            if (not dataLine or dataLine == "") and getCurrentLine then
+                dataLine = getCurrentLine()
+            end
+            dataLine = tostring(dataLine or ""):gsub("^%s+", ""):gsub("%s+$", "")
+
             if not (inv.items.inEqdata or inv.items.inInvdata) then
                 if shouldSuppressRawDiscoveryNoise() and deleteLine then
                     deleteLine()
@@ -479,14 +661,20 @@ function DINV.discovery.register()
                 return
             end
             if inv.items.inEqdata or inv.items.inInvdata then
-                local dataLine = nil
-                if matches then
-                    dataLine = matches[2] or matches[1]
+                if shouldSuppressDiscoveryOutput() then deleteLine() end
+
+                dbot.debug("@YTrigger fired: dataLine@W", "discovery")
+
+                if dataLine == "" then
+                    return
                 end
-                if (not dataLine or dataLine == "") and getCurrentLine then
-                    dataLine = getCurrentLine()
+                if not dataLine:match("^%d+,") then
+                    dbot.debug(
+                        "@YIgnoring non-protocol dataLine: " .. dataLine:sub(1, 60) .. "@W",
+                        "discovery"
+                    )
+                    return
                 end
-                dataLine = tostring(dataLine or ""):gsub("^%s+", ""):gsub("%s+$", "")
 
                 if inv.items.inEqdata then
                     handleDataLine("eqdata", dataLine)
@@ -504,8 +692,6 @@ function DINV.discovery.register()
                         end
                     end
                 end
-
-                if shouldSuppressDiscoveryOutput() then deleteLine() end
             end
         end
     )
@@ -560,21 +746,32 @@ function DINV.discovery.register()
         )
     end
 
-    -- {invitem} for real-time updates
-    DINV.discovery.ids.invitem = tempRegexTrigger(
-        "^\\{invitem\\}(.+)$",
-        function(matches)
-            dbot.debug("@YTrigger fired: invitem@W", "discovery")
-            matches = matches or _G.matches
-            if inv.items.onInvitem then
-                local payload = matches and (matches[2] or matches[1]) or nil
-                if payload then
-                    inv.items.onInvitem(payload)
+    -- {invitem} for real-time updates. The package XML normally owns this
+    -- stream; register a temporary fallback only when that trigger is absent.
+    local hasPackageInvitemTrigger = false
+    if exists then
+        local ok, triggerId = pcall(exists, "invitem", "trigger")
+        hasPackageInvitemTrigger = ok and triggerId and triggerId ~= 0
+    end
+
+    if hasPackageInvitemTrigger then
+        dbot.debug("@YSkipping temp invitem trigger: package trigger 'invitem' exists@W", "discovery")
+    else
+        DINV.discovery.ids.invitem = tempRegexTrigger(
+            "^\\{invitem\\}(.+)$",
+            function(matches)
+                dbot.debug("@YTrigger fired: invitem@W", "discovery")
+                matches = matches or _G.matches
+                if inv.items.onInvitem then
+                    local payload = matches and (matches[2] or matches[1]) or nil
+                    if payload then
+                        inv.items.onInvitem(payload)
+                    end
                 end
+                deleteLine()
             end
-            deleteLine()
-        end
-    )
+        )
+    end
 
     dbot.debug("@YDiscovery triggers registered successfully@W", "discovery")
     return DRL_RET_SUCCESS

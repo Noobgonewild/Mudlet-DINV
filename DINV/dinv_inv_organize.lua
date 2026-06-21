@@ -47,6 +47,365 @@ function inv.organize.getColorName(objId)
     return "Unknown (" .. strId .. ")"
 end
 
+local function trimOrganizeString(value)
+    return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function splitOrganizeQuery(query)
+    local rules = {}
+    for clause in tostring(query or ""):gmatch("[^|]+") do
+        local trimmed = trimOrganizeString(clause)
+        if trimmed ~= "" then
+            table.insert(rules, trimmed)
+        end
+    end
+    return rules
+end
+
+local function joinOrganizeRules(rules)
+    local parts = {}
+    if type(rules) == "table" then
+        for _, rule in ipairs(rules) do
+            local trimmed = trimOrganizeString(rule)
+            if trimmed ~= "" then
+                table.insert(parts, trimmed)
+            end
+        end
+    end
+    return table.concat(parts, " || ")
+end
+
+function inv.organize.getRuleQuery(entry)
+    if type(entry) == "table" then
+        return trimOrganizeString(entry.query or joinOrganizeRules(entry.rules))
+    end
+    return trimOrganizeString(entry)
+end
+
+function inv.organize.getTypesFromQuery(query)
+    local types = {}
+    for _, clause in ipairs(splitOrganizeQuery(query)) do
+        local typeValue = string.lower(clause):match("type%s+(%S+)")
+        if typeValue and typeValue ~= "" then
+            table.insert(types, typeValue)
+        end
+    end
+    return types
+end
+
+function inv.organize.isActiveContainerId(objId)
+    local strId = tostring(objId or "")
+    if strId == "" or not inv.items.table or not inv.items.table[strId] then
+        return false
+    end
+
+    local itemType = tostring(inv.items.getStatField(strId, invStatFieldType) or "")
+    local typeNum = tonumber(inv.items.getStatField(strId, invStatFieldTypeNum)) or 0
+    return itemType == "Container" or typeNum == 11
+end
+
+function inv.organize.migrateItemRulesToConfig()
+    if not inv.config or not inv.config.getOrganizeRule or not inv.config.setOrganizeRule then
+        return false
+    end
+
+    local migrated = false
+    for objId, _ in pairs(inv.items.table or {}) do
+        local itemQuery = trimOrganizeString(inv.items.getStatField(objId, invQueryKeyOrganize) or "")
+        if itemQuery ~= "" and inv.organize.isActiveContainerId(objId)
+            and inv.config.getOrganizeRule(objId) == nil then
+            local retval = inv.config.setOrganizeRule(objId, itemQuery, inv.organize.getColorName(objId))
+            if retval == DRL_RET_SUCCESS then
+                migrated = true
+            else
+                dbot.warn("Failed to migrate organize rule for container " .. tostring(objId) ..
+                          " into config: " .. dbot.retval.getString(retval))
+            end
+        end
+    end
+
+    return migrated
+end
+
+function inv.organize.syncRulesFromConfig(options)
+    options = options or {}
+
+    if not inv.config or not inv.config.getOrganizeRules then
+        return {}, 0
+    end
+
+    inv.organize.migrateItemRulesToConfig()
+
+    local activeRules = {}
+    local missingCount = 0
+    local itemChanged = false
+    local rules = inv.config.getOrganizeRules()
+
+    for containerId, entry in pairs(rules) do
+        local objId = tostring((type(entry) == "table" and (entry.id or entry.containerId)) or containerId)
+        local organizeQuery = inv.organize.getRuleQuery(entry)
+
+        if organizeQuery ~= "" then
+            if inv.organize.isActiveContainerId(objId) then
+                local itemQuery = trimOrganizeString(inv.items.getStatField(objId, invQueryKeyOrganize) or "")
+                if itemQuery ~= organizeQuery then
+                    inv.items.setStatField(objId, invQueryKeyOrganize, organizeQuery)
+                    itemChanged = true
+                end
+
+                local types = inv.organize.getTypesFromQuery(organizeQuery)
+                table.insert(activeRules, {
+                    containerId = tostring(objId),
+                    containerName = inv.organize.getColorName(objId),
+                    types = types,
+                    query = organizeQuery,
+                    clauses = inv.items.parseQuery(organizeQuery)
+                })
+            else
+                missingCount = missingCount + 1
+                if options.warnMissing then
+                    local label = type(entry) == "table" and entry.label or nil
+                    local labelText = label and label ~= "" and (" (" .. tostring(label) .. ")") or ""
+                    dbot.warn("Saved organize rule for container id " .. tostring(objId) ..
+                              labelText .. " is not present in the current item table; skipping it.")
+                end
+            end
+        end
+    end
+
+    if itemChanged and options.saveItems ~= false and inv.items.save then
+        inv.items.save()
+    end
+
+    return activeRules, missingCount
+end
+
+function inv.organize.identifyContainerIfNeeded(objId)
+    if not inv.items or not inv.items.identifySingleItem then
+        return DRL_RET_SUCCESS
+    end
+
+    local identifyLevel = inv.items.getStatField(objId, "identifyLevel")
+    if identifyLevel == invIdLevelFull then
+        return DRL_RET_SUCCESS
+    end
+
+    local retval = inv.items.identifySingleItem(objId, "dinv organize add")
+    if retval == DRL_RET_BUSY then
+        dbot.warn("Container " .. tostring(objId) .. " was saved for organize, but identify is busy.")
+    elseif retval ~= DRL_RET_SUCCESS then
+        dbot.warn("Container " .. tostring(objId) .. " was saved for organize, but identify returned " ..
+                  dbot.retval.getString(retval) .. ".")
+    end
+
+    return retval
+end
+
+inv.organize.resolvePkg = inv.organize.resolvePkg or nil
+
+function inv.organize.resolveContainerRefWithId(containerRef, actionName, endTag, callback)
+    local ref = trimOrganizeString(containerRef)
+    if ref == "" then
+        return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_INVALID_PARAM)
+    end
+
+    if inv.organize.resolvePkg ~= nil then
+        dbot.warn("Already resolving an organize container reference; try again in a moment.")
+        return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_BUSY)
+    end
+
+    inv.organize.resolvePkg = {
+        ref = ref,
+        actionName = actionName or "organize",
+        endTag = endTag,
+        callback = callback,
+        triggerIds = {},
+        resolvedId = nil,
+    }
+
+    local function cleanup()
+        local pkg = inv.organize.resolvePkg
+        if not pkg then
+            return
+        end
+        for _, triggerId in pairs(pkg.triggerIds or {}) do
+            if triggerId then
+                killTrigger(triggerId)
+            end
+        end
+        if pkg.timeoutTimerName and dbot and dbot.deleteTimer then
+            dbot.deleteTimer(pkg.timeoutTimerName)
+        end
+        if pkg.settleTimerName and dbot and dbot.deleteTimer then
+            dbot.deleteTimer(pkg.settleTimerName)
+        end
+        inv.organize.resolvePkg = nil
+    end
+
+    local function finish()
+        local pkg = inv.organize.resolvePkg
+        if not pkg then
+            return
+        end
+        local objId = pkg.resolvedId
+        local cb = pkg.callback
+        cleanup()
+
+        if not inv.organize.isActiveContainerId(objId) then
+            dbot.warn("Resolved '" .. ref .. "' to id " .. tostring(objId) ..
+                      ", but that id is not a current DINV container. Run 'dinv refresh force' and try again.")
+            return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_MISSING_ENTRY)
+        end
+
+        return cb(tostring(objId))
+    end
+
+    local function scheduleFinish(objId)
+        local pkg = inv.organize.resolvePkg
+        if not pkg then
+            return
+        end
+
+        pkg.resolvedId = tostring(objId)
+
+        if not tempTimer then
+            return finish()
+        end
+
+        if pkg.settleTimerName and dbot and dbot.deleteTimer then
+            dbot.deleteTimer(pkg.settleTimerName)
+        end
+
+        local settleTimerName = "inv.organize.resolve.settle." .. tostring(os.time())
+        pkg.settleTimerName = settleTimerName
+        dbot.timers[settleTimerName] = tempTimer(0.25, function()
+            if inv.organize.resolvePkg and inv.organize.resolvePkg.resolvedId then
+                finish()
+            end
+        end)
+    end
+
+    inv.organize.resolvePkg.triggerIds.idCardLine = tempRegexTrigger(
+        "^\\s*[|+].*$",
+        function()
+            local pkg = inv.organize.resolvePkg
+            if not pkg then
+                return
+            end
+
+            local line = getCurrentLine and getCurrentLine() or ""
+            local clean = dbot.stripColors and dbot.stripColors(line) or line
+            local objId = clean:match("Id%s*:%s*(%d+)")
+            if objId then
+                pkg.resolvedId = tostring(objId)
+            end
+
+            if deleteLine then
+                deleteLine()
+            end
+
+            if pkg.resolvedId then
+                scheduleFinish(pkg.resolvedId)
+            end
+        end
+    )
+
+    if tempTimer then
+        local timerName = "inv.organize.resolve." .. tostring(os.time())
+        inv.organize.resolvePkg.timeoutTimerName = timerName
+        dbot.timers[timerName] = tempTimer(5.0, function()
+            local pkg = inv.organize.resolvePkg
+            if not pkg then
+                return
+            end
+            cleanup()
+            dbot.warn("Could not resolve organize container reference '" .. ref .. "' with identify output.")
+            return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_MISSING_ENTRY)
+        end)
+    end
+
+    send("id " .. ref, false)
+    return DRL_RET_SUCCESS
+end
+
+function inv.organize.addResolved(objId, queryString, endTag, options)
+    options = options or {}
+    objId = tostring(objId or "")
+
+    -- Validate at the persistence boundary as well as in reference-resolution
+    -- callers. This prevents a resolved normal item from ever receiving an
+    -- organize rule if a caller bypasses findContainer.
+    if not inv.organize.isActiveContainerId(objId) then
+        local itemType = inv.items and inv.items.getStatField
+            and inv.items.getStatField(objId, invStatFieldType) or ""
+        dbot.warn("Object " .. objId .. " is not a current DINV container" ..
+                  (itemType ~= "" and (" (type: " .. tostring(itemType) .. ")") or ""))
+        return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_MISSING_ENTRY)
+    end
+
+    local colorName = inv.organize.getColorName(objId)
+
+    if not inv.config or not inv.config.addOrganizeRule then
+        dbot.warn("inv.organize.add: Config storage is unavailable")
+        return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_UNINITIALIZED)
+    end
+
+    local configRet = inv.config.addOrganizeRule(objId, queryString, colorName)
+    if configRet ~= DRL_RET_SUCCESS then
+        dbot.warn("inv.organize.add: Failed to persist organize rule: " ..
+                  dbot.retval.getString(configRet))
+        return inv.tags.stop(invTagsOrganize, endTag, configRet)
+    end
+
+    local organizeField = inv.config.getOrganizeQuery(objId)
+    inv.items.setStatField(objId, invQueryKeyOrganize, organizeField)
+    inv.items.save()
+    if not options.skipIdentify then
+        inv.organize.identifyContainerIfNeeded(objId)
+    end
+
+    dbot.info("Added organization query \"@C" .. queryString ..
+              "@W\" to container \"" .. colorName .. "@W\" (" .. objId .. ")")
+
+    return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_SUCCESS)
+end
+
+function inv.organize.clearResolved(objId, endTag)
+    local colorName = inv.organize.getColorName(objId)
+    local clearedQuery = ""
+
+    if inv.config and inv.config.getOrganizeQuery then
+        clearedQuery = trimOrganizeString(inv.config.getOrganizeQuery(objId))
+    end
+    if clearedQuery == "" and inv.items and inv.items.getStatField then
+        clearedQuery = trimOrganizeString(inv.items.getStatField(objId, invQueryKeyOrganize) or "")
+    end
+
+    if inv.config and inv.config.clearOrganizeRules then
+        local configRet = inv.config.clearOrganizeRules(objId)
+        if configRet ~= DRL_RET_SUCCESS then
+            dbot.warn("inv.organize.clear: Failed to persist organize clear: " ..
+                      dbot.retval.getString(configRet))
+            return inv.tags.stop(invTagsOrganize, endTag, configRet)
+        end
+    end
+
+    if inv.items.table and inv.items.table[tostring(objId)] then
+        inv.items.setStatField(objId, invQueryKeyOrganize, "")
+        inv.items.save()
+    end
+
+    if clearedQuery ~= "" then
+        dbot.info("Cleared organizational queries from container \"" .. colorName ..
+                  "@W\" (" .. objId .. "): @C" .. clearedQuery .. "@w")
+    else
+        dbot.info("No organizational queries were saved for container \"" .. colorName ..
+                  "@W\" (" .. objId .. ")")
+    end
+
+    return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_SUCCESS)
+end
+
 ----------------------------------------------------------------------------------------------------
 -- Add an organize query to a container
 ----------------------------------------------------------------------------------------------------
@@ -62,36 +421,19 @@ function inv.organize.add(containerRef, queryString, endTag)
         return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_INVALID_PARAM)
     end
 
+    if tonumber(containerRef) == nil then
+        return inv.organize.resolveContainerRefWithId(containerRef, "organize add", endTag, function(objId)
+            return inv.organize.addResolved(objId, queryString, endTag, { skipIdentify = true })
+        end)
+    end
+
     -- Find the container
     local objId = inv.organize.findContainer(containerRef)
     if objId == nil then
         return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_MISSING_ENTRY)
     end
 
-    -- Append the query to any previous organization queries for that container
-    local organizeField = inv.items.getStatField(objId, invQueryKeyOrganize) or ""
-    if organizeField ~= "" then
-        organizeField = organizeField .. " || "
-    end
-    organizeField = organizeField .. queryString
-
-    -- Set the organize field on the item
-    inv.items.setStatField(objId, invQueryKeyOrganize, organizeField)
-    inv.items.save()
-
-    -- Add to custom cache for persistence
-    if inv.cache and inv.cache.addCustom then
-        inv.cache.addCustom(objId, "organize", organizeField)
-        if inv.cache.saveCustom then
-            inv.cache.saveCustom()
-        end
-    end
-
-    local colorName = inv.organize.getColorName(objId)
-    dbot.info("Added organization query \"@C" .. queryString ..
-              "@W\" to container \"" .. colorName .. "@W\" (" .. objId .. ")")
-
-    return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_SUCCESS)
+    return inv.organize.addResolved(objId, queryString, endTag)
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -104,29 +446,25 @@ function inv.organize.clear(containerRef, endTag)
         return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_INVALID_PARAM)
     end
 
-    -- Find the container
-    local objId = inv.organize.findContainer(containerRef)
-    if objId == nil then
-        return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_MISSING_ENTRY)
+    if tonumber(containerRef) == nil then
+        return inv.organize.resolveContainerRefWithId(containerRef, "organize clear", endTag, function(objId)
+            return inv.organize.clearResolved(objId, endTag)
+        end)
     end
 
-    local colorName = inv.organize.getColorName(objId)
-
-    -- Clear the organize field
-    inv.items.setStatField(objId, invQueryKeyOrganize, "")
-    inv.items.save()
-
-    -- Update custom cache
-    if inv.cache and inv.cache.addCustom then
-        inv.cache.addCustom(objId, "organize", "")
-        if inv.cache.saveCustom then
-            inv.cache.saveCustom()
+    local objId = nil
+    local numericId = tonumber(containerRef)
+    if numericId and inv.config and inv.config.getOrganizeRule
+        and inv.config.getOrganizeRule(tostring(numericId)) then
+        objId = tostring(numericId)
+    else
+        objId = inv.organize.findContainer(containerRef)
+        if objId == nil then
+            return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_MISSING_ENTRY)
         end
     end
 
-    dbot.info("Cleared all organization queries from container \"" .. colorName .. "@W\" (" .. objId .. ")")
-
-    return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_SUCCESS)
+    return inv.organize.clearResolved(objId, endTag)
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -134,6 +472,12 @@ end
 ----------------------------------------------------------------------------------------------------
 
 function inv.organize.display(containerRef, endTag)
+    if containerRef and containerRef ~= "" and tonumber(containerRef) == nil then
+        return inv.organize.resolveContainerRefWithId(containerRef, "organize display", endTag, function(objId)
+            return inv.organize.display(objId, endTag)
+        end)
+    end
+
     local foundAny = false
 
     dbot.print("@WContainers that have associated organizational queries:@w")
@@ -143,16 +487,30 @@ function inv.organize.display(containerRef, endTag)
         return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_UNINITIALIZED)
     end
 
+    inv.organize.syncRulesFromConfig({ warnMissing = false })
+
+    local rules = inv.config and inv.config.getOrganizeRules and inv.config.getOrganizeRules() or {}
+
     if containerRef and containerRef ~= "" then
-        local objId = inv.organize.findContainer(containerRef)
-        if objId == nil then
-            return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_MISSING_ENTRY)
+        local objId = nil
+        local numericId = tonumber(containerRef)
+        if numericId and rules[tostring(numericId)] then
+            objId = tostring(numericId)
+        else
+            objId = inv.organize.findContainer(containerRef)
+            if objId == nil then
+                return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_MISSING_ENTRY)
+            end
         end
 
-        local organizeQuery = inv.items.getStatField(objId, invQueryKeyOrganize) or ""
-        local colorName = inv.organize.getColorName(objId)
+        local entry = rules[tostring(objId)]
+        local organizeQuery = inv.organize.getRuleQuery(entry)
         if organizeQuery ~= "" then
-            dbot.print("@W  " .. colorName .. "@W (" .. objId .. "): @C" .. organizeQuery .. "@w")
+            local active = inv.organize.isActiveContainerId(objId)
+            local colorName = active and inv.organize.getColorName(objId)
+                or (entry and entry.label) or ("Unknown (" .. tostring(objId) .. ")")
+            local suffix = active and "" or " @Y(missing from item state; saved, not active)@w"
+            dbot.print("@W  " .. colorName .. "@W (" .. objId .. "): @C" .. organizeQuery .. suffix .. "@w")
             return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_SUCCESS)
         end
 
@@ -160,11 +518,15 @@ function inv.organize.display(containerRef, endTag)
         return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_SUCCESS)
     end
 
-    for objId, item in pairs(inv.items.table) do
-        local organizeQuery = inv.items.getStatField(objId, invQueryKeyOrganize) or ""
+    for containerId, entry in pairs(rules) do
+        local objId = tostring((type(entry) == "table" and (entry.id or entry.containerId)) or containerId)
+        local organizeQuery = inv.organize.getRuleQuery(entry)
         if organizeQuery ~= "" then
-            local colorName = inv.organize.getColorName(objId)
-            dbot.print("@W  " .. colorName .. "@W (" .. objId .. "): @C" .. organizeQuery .. "@w")
+            local active = inv.organize.isActiveContainerId(objId)
+            local colorName = active and inv.organize.getColorName(objId)
+                or (entry and entry.label) or ("Unknown (" .. tostring(objId) .. ")")
+            local suffix = active and "" or " @Y(missing from item state; saved, not active)@w"
+            dbot.print("@W  " .. colorName .. "@W (" .. objId .. "): @C" .. organizeQuery .. suffix .. "@w")
             foundAny = true
         end
     end
@@ -226,31 +588,8 @@ function inv.organize.run(queryString, endTag)
         return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_BUSY)
     end
 
-    -- Get all organize rules from containers
-    local organizeRules = {}
-    for objId, item in pairs(inv.items.table) do
-        local organizeQuery = inv.items.getStatField(objId, invQueryKeyOrganize) or ""
-        if organizeQuery ~= "" then
-            -- Parse the query to extract type conditions
-            -- Format: "type armor" or "type armor || type weapon"
-            local types = {}
-            for clause in organizeQuery:gmatch("[^|]+") do
-                clause = clause:match("^%s*(.-)%s*$")  -- trim
-                local typeValue = clause:match("type%s+(%S+)")
-                if typeValue then
-                    table.insert(types, string.lower(typeValue))
-                end
-            end
-            if #types > 0 then
-                table.insert(organizeRules, {
-                    containerId = tostring(objId),
-                    containerName = inv.organize.getColorName(objId),
-                    types = types,
-                    query = organizeQuery
-                })
-            end
-        end
-    end
+    -- Config is the source of truth; item state must still contain the saved ID.
+    local organizeRules = inv.organize.syncRulesFromConfig({ warnMissing = true })
 
     -- Debug: Show parsed rules
     for _, rule in ipairs(organizeRules) do
@@ -273,7 +612,8 @@ function inv.organize.run(queryString, endTag)
         phase = "invdata",
         numOrganized = 0,
         numFallbackStored = 0,
-        numKeptInventory = 0
+        numKeptInventory = 0,
+        keepFlagChanged = false
     }
 
     -- Register triggers
@@ -378,16 +718,15 @@ function inv.organize.unregisterTriggers()
     end
     inv.organize.triggerIds = {}
 
-    -- Re-enable discovery triggers
+    -- Re-enable every discovery trigger disabled by registerTriggers().
+    -- Restoring only the invdata triggers leaves real-time handlers such as
+    -- invitem disabled after the first organize run, causing protocol tags to
+    -- leak into the output and preventing those updates from being processed.
     if DINV.discovery and DINV.discovery.ids then
-        if DINV.discovery.ids.invdataStartAny then
-            enableTrigger(DINV.discovery.ids.invdataStartAny)
-        end
-        if DINV.discovery.ids.invdataEnd then
-            enableTrigger(DINV.discovery.ids.invdataEnd)
-        end
-        if DINV.discovery.ids.dataLine then
-            enableTrigger(DINV.discovery.ids.dataLine)
+        for name, id in pairs(DINV.discovery.ids) do
+            if id and type(id) == "number" and name ~= "invmon" then
+                enableTrigger(id)
+            end
         end
     end
 end
@@ -487,9 +826,15 @@ function inv.organize.parseInvdataLine(line)
     dbot.debug(string.format("Organize: Found item %s, type=%d (%s), name=%s",
         objId, typeNum, typeName, (itemName or ""):sub(1, 30)), "organize")
 
+    local _, keepFlagChanged = inv.items._parseDataLine(line, "organize")
+    if keepFlagChanged then
+        pkg.keepFlagChanged = true
+    end
+
     -- Store the item info
     table.insert(pkg.inventoryItems, {
         objId = objId,
+        flags = flags or "",
         typeNum = typeNum,
         typeName = string.lower(typeName),
         itemName = itemName or "Unknown",
@@ -527,19 +872,11 @@ function inv.organize.processInventory()
             local didMatchRule = false
             -- Check against each rule
             for _, rule in ipairs(pkg.rules) do
-                local matches = false
-                for _, ruleType in ipairs(rule.types) do
-                    dbot.debug(string.format("Organize: Comparing item.typeName='%s' vs ruleType='%s'",
-                        item.typeName, ruleType), "organize")
-                    if item.typeName == ruleType then
-                        matches = true
-                        break
-                    end
-                end
+                local matches = inv.items.matchesParsedQuery(item.objId, rule.clauses)
 
                 if matches then
-                    dbot.debug(string.format("Organize: Item %s (%s) matches rule for container %s",
-                        item.objId, item.typeName, rule.containerId), "organize")
+                    dbot.debug(string.format("Organize: Item %s matches query '%s' for container %s",
+                        item.objId, rule.query, rule.containerId), "organize")
 
                     if isIgnoredDestination(rule.containerId) then
                         dbot.debug(string.format("Organize: Skipping rule destination for item %s because container %s is ignored",
@@ -660,16 +997,21 @@ function inv.organize.finish()
             "@G" .. tostring(pkg.numFallbackStored or 0) .. "@W by lastStored/container fallback. Kept " ..
             "@G" .. tostring(pkg.numKeptInventory or 0) .. "@W in inventory.")
 
-        -- Save inventory table to persist location updates from invmon
-        if inv.items.save then
-            inv.items.save()
-        end
     else
         dbot.info("No items were moved. Kept " .. tostring(pkg.numKeptInventory or 0) .. " in inventory.")
     end
 
+    -- Persist location changes from invmon and any authoritative keep flags
+    -- captured by this organize run, but write only once at completion.
+    if (movedTotal > 0 or pkg.keepFlagChanged) and inv.items.save then
+        inv.items.save()
+    end
+
     local endTag = pkg.endTag
     inv.organize.runPkg = nil
+    if inv.items and inv.items.maybeStartKeepFlagSync then
+        inv.items.maybeStartKeepFlagSync()
+    end
     return inv.tags.stop(invTagsOrganize, endTag, DRL_RET_SUCCESS)
 end
 
@@ -690,7 +1032,8 @@ function inv.organize.findContainer(containerRef)
         local item = inv.items.table and inv.items.table[strId]
         if item then
             local itemType = inv.items.getStatField(strId, invStatFieldType) or ""
-            if itemType == "Container" then
+            local typeNum = tonumber(inv.items.getStatField(strId, invStatFieldTypeNum)) or 0
+            if itemType == "Container" or typeNum == 11 then
                 return strId
             else
                 dbot.warn("Object " .. containerRef .. " is not a container (type: " .. itemType .. ")")

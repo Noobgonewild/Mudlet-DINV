@@ -171,6 +171,32 @@ function DINV.aliases.register()
             return true
         end
     )
+
+    -- Keep/unkeep do not emit the kept state through invmon. Forward the
+    -- command immediately, then refresh only main inventory flags.
+    DINV.aliases.ids.keepSync = tempAlias(
+        "^keep\\s+(.+)$",
+        function()
+            local target = matches and matches[2] or ""
+            send("keep " .. target, false)
+            if inv and inv.items and inv.items.requestKeepFlagSync then
+                inv.items.requestKeepFlagSync()
+            end
+            return true
+        end
+    )
+
+    DINV.aliases.ids.unkeepSync = tempAlias(
+        "^unkeep\\s+(.+)$",
+        function()
+            local target = matches and matches[2] or ""
+            send("unkeep " .. target, false)
+            if inv and inv.items and inv.items.requestKeepFlagSync then
+                inv.items.requestKeepFlagSync()
+            end
+            return true
+        end
+    )
     
     dbot.debug("DINV aliases registered", "aliases")
     return DRL_RET_SUCCESS

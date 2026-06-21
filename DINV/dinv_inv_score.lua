@@ -81,6 +81,29 @@ function inv.score.getFlyingSkipReason(level)
     return nil
 end
 
+local function invScoreShouldSkipDualWieldEffect(level)
+    if dbot and dbot.ability and dbot.ability.getDualWieldAccess then
+        local available, access = dbot.ability.getDualWieldAccess(level)
+        if available then
+            return true, string.format(
+                "class:%s wearableLevel:%d threshold:%d",
+                tostring(access.className or "Unknown"),
+                tonumber(access.wearableLevel) or 0,
+                tonumber(access.threshold) or 0
+            )
+        end
+    end
+    return false, ""
+end
+
+function inv.score.getDualWieldSkipReason(level)
+    local shouldSkip, reason = invScoreShouldSkipDualWieldEffect(level)
+    if shouldSkip then
+        return reason
+    end
+    return nil
+end
+
 ----------------------------------------------------------------------------------------------------
 -- Score an individual item based on priority
 ----------------------------------------------------------------------------------------------------
@@ -288,6 +311,15 @@ function inv.score.extended(itemStats, priorityName, handicap, level, isOffhand)
                     if skipFlying then
                         dbot.debug(
                             string.format("  Effect 'flying' skipped (%s)", tostring(skipReason)),
+                            "inv.score"
+                        )
+                        shouldApplyEffect = false
+                    end
+                elseif normalizedEffectName:gsub("%s+", "") == "dualwield" then
+                    local skipDualWield, skipReason = invScoreShouldSkipDualWieldEffect(level)
+                    if skipDualWield then
+                        dbot.debug(
+                            string.format("  Effect 'dualwield' skipped (%s)", tostring(skipReason)),
                             "inv.score"
                         )
                         shouldApplyEffect = false

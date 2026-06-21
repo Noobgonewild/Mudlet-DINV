@@ -10,7 +10,7 @@
 ----------------------------------------------------------------------------------------------------
 
 DINV = DINV or {}
-DINV.version = "2.0056"
+DINV.version = "2.0057"
 DINV.name = "Durel's Inventory Manager"
 
 -- Determine the path to the DINV directory
@@ -70,6 +70,9 @@ DINV.modules = {
     "dinv_inv_unused",
     "dinv_inv_discover",
     -- "dinv_rid", -- RID command/module disabled per user request (kept commented, not removed)
+
+    -- Public addon integration API (load after feature modules, before CLI help)
+    "dinv_api",
     
     -- User Interface (load last)
     "dinv_cli",
@@ -260,6 +263,10 @@ function DINV.onGMCPCharBase()
         end
     end
 
+    if DINV.api and DINV.api._onReady and inv and inv.init and inv.init.initializedActive then
+        pcall(DINV.api._onReady)
+    end
+
     if inv and inv.analyze and inv.analyze.captureLoginLevel and dbot and dbot.gmcp and dbot.gmcp.getLevel then
         local baseLevel = tonumber(dbot.gmcp.getLevel())
         if baseLevel and baseLevel > 0 then
@@ -285,6 +292,10 @@ function DINV.onGMCPCharStatus()
                 if inv.init and inv.init.atActive then
                     inv.init.atActive()
                 end
+            end
+
+            if DINV.api and DINV.api._onReady and inv and inv.init and inv.init.initializedActive then
+                pcall(DINV.api._onReady)
             end
 
             if inv and inv.regen and inv.regen.onWake then
@@ -338,6 +349,9 @@ function DINV.forceInit()
             local retval = inv.init.atActive()
             if retval == DRL_RET_SUCCESS then
                 cecho("<green>DINV: Active initialization complete!\n")
+                if DINV.api and DINV.api._onReady then
+                    pcall(DINV.api._onReady)
+                end
             elseif retval == DRL_RET_BUSY then
                 cecho("<yellow>DINV: Initialization already in progress.\n")
             else

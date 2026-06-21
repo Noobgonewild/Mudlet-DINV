@@ -16,7 +16,7 @@
 ----------------------------------------------------------------------------------------------------
 
 DINV = DINV or {}
-DINV.version = { major = 2, minor = 56 }
+DINV.version = { major = 2, minor = 57 }
 
 -- Get the Mudlet profile directory for module loading
 local profilePath = getMudletHomeDir()
@@ -87,6 +87,7 @@ function DINV.initialize()
         "dinv_inv_discover",-- Discover command helpers
         "dinv_inv_report",  -- Report output
         "dinv_rid",         -- Rid test reporting
+        "dinv_api",         -- Public addon integration API
         "dinv_cli",         -- CLI routing
         "dinv_triggers",    -- Mudlet triggers
         "dinv_aliases",     -- Mudlet aliases
@@ -157,6 +158,9 @@ function DINV.onGMCPCharBase()
         dbot.gmcp.isInitialized = true
         if inv and inv.init and inv.init.atActive and not inv.init.initializedActive then
             inv.init.atActive()
+        end
+        if DINV.api and DINV.api._onReady and inv and inv.init and inv.init.initializedActive then
+            pcall(DINV.api._onReady)
         end
     end
 end
@@ -251,15 +255,20 @@ end</script>
       </Trigger>
       <Trigger isActive="yes" isFolder="no">
         <name>invitem</name>
-        <script>if inv and inv.items and inv.items.trigger and inv.items.trigger.invitem then
-    inv.items.trigger.invitem(matches[2], matches[3])
+        <script>local payload = matches and matches[2] or nil
+if payload and inv and inv.items and inv.items.onInvitem then
+    inv.items.onInvitem(payload)
+end
+-- The payload has been captured and processed; only remove the display line now.
+if deleteLine then
+    deleteLine()
 end</script>
         <triggerType>1</triggerType>
         <conditonLineDelta>0</conditonLineDelta>
         <mStayOpen>0</mStayOpen>
         <mCommand></mCommand>
         <regexCodeList>
-          <string>^\{invitem\}(.*?),(.*?)$</string>
+          <string>^\{invitem\}(.*)$</string>
         </regexCodeList>
         <regexCodePropertyList>
           <integer>1</integer>

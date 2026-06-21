@@ -155,6 +155,16 @@ function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, ba
         end
     end
 
+    if inv.score and inv.score.getDualWieldSkipReason then
+        local dualWieldSkipReason = inv.score.getDualWieldSkipReason(targetLevel)
+        if dualWieldSkipReason then
+            dbot.debug(
+                string.format("Dual wield priority override active for level %d (%s)", tonumber(targetLevel) or 0, dualWieldSkipReason),
+                "inv.set"
+            )
+        end
+    end
+
     local baseLevel
     if baseLevelOverride ~= nil then
         baseLevel = tonumber(baseLevelOverride) or 1
@@ -244,6 +254,7 @@ function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, ba
         score = totalScore,
         level = targetLevel,
         created = os.time(),
+        context = inv.context and inv.context.capture and inv.context.capture() or nil,
     }
 
     inv.set.save()
@@ -423,8 +434,8 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
 
     local dualWieldAvailable = false
 
-    if dbot.ability and dbot.ability.isAvailable then
-        dualWieldAvailable = dbot.ability.isAvailable("dual wield", targetLevel)
+    if dbot.ability and dbot.ability.hasDualWieldAccess then
+        dualWieldAvailable = dbot.ability.hasDualWieldAccess(targetLevel)
         debug("Phase 3: Natural dual wield: " .. tostring(dualWieldAvailable))
     end
 
@@ -710,6 +721,20 @@ function inv.set.hasDualWield(equipment)
     return false
 end
 
+function inv.set.getStaleReason(priorityName, level)
+    local targetLevel = tostring(tonumber(level) or level or "")
+    local setData = inv.set.table
+        and inv.set.table[priorityName]
+        and inv.set.table[priorityName][targetLevel]
+    if not setData then
+        return nil
+    end
+    if inv.context and inv.context.getStaleReason then
+        return inv.context.getStaleReason(setData.context)
+    end
+    return nil
+end
+
 
 function inv.set.display(priorityName, level, endTag, forceRebuild)
     if priorityName == nil or priorityName == "" then
@@ -732,6 +757,11 @@ function inv.set.display(priorityName, level, endTag, forceRebuild)
 
     if forceRebuild == nil then
         forceRebuild = true
+    end
+
+    local staleReason = inv.set.getStaleReason(priorityName, targetLevel)
+    if staleReason then
+        dbot.warn("Cached set for '" .. priorityName .. "' is stale: " .. staleReason .. ". Continuing with the requested operation.")
     end
 
     if forceRebuild then
@@ -1079,6 +1109,11 @@ function inv.set.wear(priorityName, level, endTag)
 
     local targetLevel = tostring(tonumber(level) or (dbot.gmcp.getWearableLevel and dbot.gmcp.getWearableLevel()) or (dbot.gmcp.getLevel and dbot.gmcp.getLevel()) or 1)
 
+    local staleReason = inv.set.getStaleReason(priorityName, targetLevel)
+    if staleReason then
+        dbot.warn("Cached set for '" .. priorityName .. "' is stale: " .. staleReason .. ". Wearing the cached set.")
+    end
+
     if inv.set.table[priorityName] == nil or inv.set.table[priorityName][targetLevel] == nil then
         dbot.info("Creating set before wearing...")
         local retval = inv.set.create(priorityName, tonumber(targetLevel))
@@ -1347,6 +1382,10 @@ function inv.set.test(priorityName, mode, endTag)
     if normalizedMode == "cache" then
         local analysisData = inv.analyze and inv.analyze.table and inv.analyze.table[priorityName]
         local levels = analysisData and analysisData.levels or nil
+        local staleReason = inv.analyze and inv.analyze.getStaleReason and inv.analyze.getStaleReason(priorityName) or nil
+        if staleReason then
+            dbot.warn("Analysis '" .. priorityName .. "' is stale: " .. staleReason .. ". Continuing with cached results.")
+        end
         if debugEnabled then
             if analysisData then
                 dbot.printRaw(string.format(
@@ -1361,7 +1400,7 @@ function inv.set.test(priorityName, mode, endTag)
                     tostring(priorityName)))
             end
         end
-        if levels and levels[tostring(testLevel)] and levels[tostring(testLevel)].equipment then
+        if effectiveMode == "cache" and levels and levels[tostring(testLevel)] and levels[tostring(testLevel)].equipment then
             local targetEquipment = levels[tostring(testLevel)].equipment or {}
             local wornByLoc = inv.analyze.getCurrentWornByLoc()
             local changes = 0
@@ -1375,7 +1414,7 @@ function inv.set.test(priorityName, mode, endTag)
                 end
             end
             count = changes
-        else
+        elseif effectiveMode == "cache" then
             if debugEnabled then
                 dbot.printRaw(string.format(
                     "@D[DINV DEBUG] set test cache: missing level @Y%d@D snapshot/equipment.@w",

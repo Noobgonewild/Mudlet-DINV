@@ -290,6 +290,7 @@ The build process:
   3. Scans inside each container
   4. Identifies each item (taking from containers if needed)
 
+Kept state is read from the K flag in eqdata/invdata and stored with each item.
 After the initial build, changes are tracked automatically via invmon/invitem.
 Use "dinv refresh" to check tracking status.
 ]])
@@ -319,6 +320,19 @@ function inv.cli.refresh.fn(name, line, wildcards)
         local eagerSec = inv.config.get("refreshEagerSec") or 0
         inv.items.refreshOn(periodMin, eagerSec)
         cecho("\n<green>[DINV] Refresh enabled. Period: " .. periodMin .. " minute(s).\n")
+        return inv.tags.stop(invTagsRefresh, endTag, DRL_RET_SUCCESS)
+    elseif action == "trace" or action == "perf" then
+        DINV.perf = DINV.perf or {}
+        local flag = args[2] and tostring(args[2]):lower() or "status"
+        if flag == "on" or flag == "enable" or flag == "enabled" or flag == "true" or flag == "1" then
+            DINV.perf.enabled = true
+        elseif flag == "off" or flag == "disable" or flag == "disabled" or flag == "false" or flag == "0" then
+            DINV.perf.enabled = false
+        elseif flag ~= "status" and flag ~= "check" then
+            cecho("\n<yellow>[DINV] Invalid refresh trace setting. Usage: dinv refresh trace [on|off|status]\n")
+            return inv.tags.stop(invTagsRefresh, endTag, DRL_RET_INVALID_PARAM)
+        end
+        cecho("\n<green>[DINV] Refresh trace is " .. (DINV.perf.enabled and "ON" or "OFF") .. ".\n")
         return inv.tags.stop(invTagsRefresh, endTag, DRL_RET_SUCCESS)
     elseif action == "force" then
         local retval = inv.items.refresh(0, invItemsRefreshLocDirty, nil, { identifyPartials = true })
@@ -397,6 +411,7 @@ function inv.cli.refresh.fn(name, line, wildcards)
     cecho("<white>    - In containers:   <green>" .. containerCount .. "\n")
     cecho("\n")
     cecho("<white>  Changes are tracked automatically via invmon/invitem.\n")
+    cecho("<white>  Refresh reconciles worn, inventory, and container IDs.\n")
     cecho("<white>  Refresh timer:       <green>" .. (inv.config.isRefreshEnabled() and "on" or "off") .. "<white> (" .. tostring(inv.config.getRefreshPeriod()) .. " min)\n")
     if inv.config.isRefreshEnabled() then
         local minutesLeft = inv.items.refreshGetMinutesLeft and inv.items.refreshGetMinutesLeft() or nil
@@ -404,7 +419,7 @@ function inv.cli.refresh.fn(name, line, wildcards)
             cecho("<white>  Next refresh in:     <green>" .. minutesLeft .. "<white> min\n")
         end
     end
-    cecho("<white>  To do a full rescan: <green>dinv build confirm\n")
+    cecho("<white>  To rebuild from scratch: <green>dinv build confirm\n")
     cecho("\n")
 
     return inv.tags.stop(invTagsRefresh, endTag, DRL_RET_SUCCESS)
@@ -412,28 +427,35 @@ end
 
 function inv.cli.refresh.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s",
-               pluginNameCmd .. " refresh @G[on | force | off | period <min> | check]", "Inventory tracking status and refresh controls"))
+               pluginNameCmd .. " refresh @G[on | force | off | period <min> | check | trace <on|off>]", "Inventory tracking status and refresh controls"))
 end
 
 function inv.cli.refresh.examples()
     dbot.print([[@W
 Usage:
-    dinv refresh [on | force | off | period <min> | check]
+    dinv refresh [on | force | off | period <min> | check | trace <on|off>]
 
 Shows the current inventory tracking status. Changes to your inventory are
 tracked automatically via invmon/invitem events.
 
+Refresh scans worn equipment, main inventory, and each known container. Items
+not seen in that scan are removed from persistence, and newly seen partial
+items are queued for identify. Kept state is refreshed from each observed
+eqdata/invdata K flag.
+
 Subcommands:
   on            Enable automatic refreshes using the configured period.
-  force         Run an immediate refresh (dirty locations only), then fully identify
-                any items still marked partial.
+  force         Run the same refresh immediately instead of waiting for the timer.
   off           Disable automatic refreshes.
   period <min>  Set the automatic refresh period (minutes). If refreshes are on,
                 the timer is rescheduled to the new period.
   check         Show time remaining until the next automatic refresh.
+  trace <on|off>
+                Print temporary [DINV PERF] timing lines during refresh without
+                enabling debug output. This setting is not persisted.
 
-If you need to do a full rescan (e.g., after manual changes or if data seems
-out of sync), use 'dinv build confirm' instead.
+If you need to rebuild from scratch (e.g., after major corruption), use
+'dinv build confirm' instead.
 ]])
 end
 
@@ -481,7 +503,7 @@ inv.cli.search = {}
 
 function inv.cli.search.fn(name, line, wildcards)
     local tokens = wildcards or {}
-    local displayMode = "basic"
+    local displayMode = "objid"
     local explicitMode = false
     if #tokens > 0 then
         local mode = tostring(tokens[1]):lower()
@@ -510,7 +532,7 @@ end
 
 function inv.cli.search.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s", 
-               pluginNameCmd .. " search @G[basic|objid|full] <query>", "Search inventory"))
+               pluginNameCmd .. " search @G[basic|objid|full] <query>", "Search inventory (default: objid)"))
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -525,6 +547,145 @@ end
 function inv.cli.query.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s",
                pluginNameCmd .. " query", "Query syntax and searchable tags"))
+end
+
+----------------------------------------------------------------------------------------------------
+-- Public API Help Topic
+-- Intentionally omitted from the main command list: this is developer documentation, not a command.
+----------------------------------------------------------------------------------------------------
+
+inv.cli.api = {}
+
+function inv.cli.api.usage()
+    dbot.printRaw(string.format("@W    %-50s @w- %s",
+               pluginNameCmd .. " help api", "Public Lua API for other Mudlet scripts"))
+end
+
+function inv.cli.api.examples()
+    dbot.print([[@W
+@Y================================================================================@W
+@Y                               DINV Public API@W
+@Y================================================================================@W
+
+@COverview@W
+  Other Mudlet scripts can call @GDINV.api@W directly. API calls return Lua values
+  silently: they do not print search results or errors in the main window.
+
+  API version: @G2@W
+  API namespace: @GDINV.api@W
+  Mode: @Gread-only@W
+
+@CCore Methods@W
+  @GDINV.api.getVersion()@W
+  @GDINV.api.getCapabilities()@W
+  @GDINV.api.getStatus(options)@W
+  @GDINV.api.getRevision()@W
+  @GDINV.api.isReady()@W
+  @GDINV.api.setDebug(true|false)@W
+  @GDINV.api.getDebug()@W
+
+@CGetting Started@W
+  @Glocal status = DINV.api.getStatus()@W
+  @Gif status.ok and status.ready then
+      local result = DINV.api.search("type weapon")
+    end@W
+
+@CResult Format@W
+  Most endpoints return a result table containing:
+
+    @Gok@W          true on success, false on failure
+    @Gcode@W        stable result code such as OK, NOT_FOUND, or BUSY
+    @Gmessage@W     human-readable error text, or nil on success
+    @GapiVersion@W  public API version
+    @Grevision@W    current inventory revision
+
+  Search-like endpoints also return @Gcount@W and @Gitems@W. Returned item tables
+  are copies. Changing them cannot modify DINV inventory data.
+
+@CQuery Methods@W
+  @GDINV.api.search(query, options)@W
+  @GDINV.api.getItem(objId, options)@W
+  @GDINV.api.findOne(query, options)@W
+  @GDINV.api.count(query, options)@W
+  @GDINV.api.exists(query, options)@W
+  @GDINV.api.distinct(field, query, options)@W
+  @GDINV.api.groupBy(field, query, options)@W
+
+  Search options include:
+    @Gdetail@W          "summary", "full", or "raw"
+    @Gfields@W          array of fields to return
+    @GsortBy@W          array such as {"name", "-level"}
+    @Glimit / offset@W  pagination controls
+    @Gsource@W          "auto", "live", or "persistence"
+    @GincludeIgnored@W  include items in ignored containers
+    @Gtrace@W           include silent diagnostics in result.diagnostics
+
+@CInventory Structure@W
+  @GDINV.api.getEquipment(options)@W
+  @GDINV.api.getEquipped(wearLocation, options)@W
+  @GDINV.api.getContainer(reference, options)@W
+  @GDINV.api.getContainerContents(reference, options)@W
+  @GDINV.api.getLocationContents(location, options)@W
+  @GDINV.api.getKeyring(options)@W
+  @GDINV.api.getItemLocation(objId, options)@W
+  @GDINV.api.resolveContainer(reference, options)@W
+
+@CSpecialized Queries@W
+  @GDINV.api.getWeapons(options)@W
+  @GDINV.api.getWeaponDamageTypes(options)@W
+  @GDINV.api.getPortals(options)@W
+  @GDINV.api.getConsumables(options)@W
+  @GDINV.api.getKeys(options)@W
+  @GDINV.api.getWearableItems(wearLocation, options)@W
+  @GDINV.api.getNewItems(sinceRevision, options)@W
+  @GDINV.api.findDuplicates(options)@W
+
+@CPriorities and Scoring@W
+  @GDINV.api.getPriority(name, options)@W
+  @GDINV.api.listPriorities(options)@W
+  @GDINV.api.scoreItem(objId, priorityName, options)@W
+  @GDINV.api.compareItems(firstId, secondId, priorityName, options)@W
+  @GDINV.api.getBestItems(wearLocation, priorityName, options)@W
+
+@CRead-Only Boundary@W
+  @GDINV.api@W never sends commands to Aardwolf and never pushes Mudlet events.
+  @GDINV.actions@W exists only as a compatibility namespace; its methods return
+  @YUNSUPPORTED@W in read-only mode.
+
+  Subscriptions are disabled. Use polling/query methods instead:
+  @GDINV.api.getChangesSince(revision)@W
+
+@CExamples@W
+  @Glocal cards = DINV.api.search(
+      "name fantasy series collector's card",
+      { fields = {"id", "name", "location"} }
+    )@W
+
+  @Glocal keys = DINV.api.findDuplicates({
+      query = "type key location keyring",
+      groupBy = "normalizedName",
+      fields = {"id", "name", "timer", "normalizedName"}
+    })@W
+
+  @Glocal changes = DINV.api.getChangesSince(lastRevision)@W
+
+@CDiagnostics@W
+  Expected failures are returned to the caller and are not printed.
+
+  Use @G{ trace = true }@W on one call to receive timing and diagnostic data.
+  Use @GDINV.api.setDebug(true)@W to enable the existing @Cinv.api@W debug category.
+  Global debug logging never changes API results.
+
+@CCommon Result Codes@W
+  @GOK@W, @YINVALID_ARGUMENT@W, @YNOT_READY@W, @YNOT_FOUND@W,
+  @YMULTIPLE_MATCHES@W, @YUNSUPPORTED@W, and @RINTERNAL_ERROR@W.
+
+@CData Guarantees@W
+  Item IDs are strings. Returned tables are copies. @GDINV.api@W methods do not
+  send commands to Aardwolf, invoke callbacks, or raise Mudlet API events.
+@Y================================================================================@W
+]])
+    return DRL_RET_SUCCESS
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -1336,6 +1497,30 @@ function inv.cli.cache.usage()
                pluginNameCmd .. " cache @G[clear [type]]", "Cache management"))
 end
 
+function inv.cli.cache.examples()
+    inv.cli.cache.usage()
+    dbot.print([[@W
+
+Display:
+    dinv cache
+
+Clear:
+    dinv cache clear
+    dinv cache clear all
+    dinv cache clear recent
+    dinv cache clear frequent
+    dinv cache clear custom
+
+Types:
+    @Call@W       Clears all cache buckets: recent, frequent, and custom.
+    @Crecent@W    Object-id cache for items identified recently. This helps the same
+              tracked object keep full stats during normal inventory updates.
+    @Cfrequent@W  Shared name cache for repeat deterministic items: potions, pills,
+              food, wands, staves, scrolls, and raw materials such as ores.
+    @Ccustom@W    Reserved/user-managed cache bucket for explicit cache entries.
+]])
+end
+
 ----------------------------------------------------------------------------------------------------
 -- Tags Command
 ----------------------------------------------------------------------------------------------------
@@ -1619,57 +1804,56 @@ its name.  Also, queries will accept "key" instead of "keywords", "loc" instead 
 and "rloc" instead of "rlocation".  Yeah, I'm lazy sometimes...
 
 Performing a search will display relevant information about the items whose characteristics match
-the query.  There are three modes of searches: "basic", "objid", and "full".  A basic search displays
-just basic information about the items -- surprise!  An objid search shows everything in the basic
-search in addition to the item's unique ID.  A full search shows lots of info for each item and is
-very verbose.
+the query.  There are three search modes: "basic", "objid", and "full".  Searches use "objid" by
+default.  A basic search omits object IDs, hit points, mana, moves, and the illuminated/resonated/
+solidified flags.  An objid search shows the standard output with object IDs, hit points, mana,
+moves, and the illuminated/resonated/solidified flags.  A full search adds stored key/value data
+for every item.
 
 Examples:
   1) Show basic info for all weapons between the levels of 1 to 40
-     "@Gdinv search type weapon minlevel 1 maxlevel 40@W"
+     "@Gdinv search basic type weapon minlevel 1 maxlevel 40@W"
 
-@WLvl Name of Weapon           Type     Ave Wgt   HR   DR Dam Type Specials Int Wis Lck Str Dex Con
-  8 a Flamethrower           exotic     4   0   10   18 Fire     none       2   0   3   0   0   0
- 11 Dagger of Aardwolf       dagger    27   1    5    5 Cold     sharp      0   0   0   0   0   0
- 20 Searing Blaze            whip      30   3    2    2 Fire     flaming    1   4   7   1   0   0
- 26 Melpomene's Betrayal     dagger    36   1    2    2 Pierce   sharp      0   0   0   0   2   0
- 40 Dagger of Aardwolf       dagger   100   0   20   20 Fire     sharp      1   0   0   0   0   0
- 40 Dagger of Aardwolf       dagger   100  10    5    5 Mental   sharp      0   0   0   0   0   0
+@C--- Weapon ---@w
+@Wa Flamethrower          lv8   exotic  4dam    0str  2int  0wis  0dex  0con  3luc  10hr  18dr
+Dagger of Aardwolf      lv11  dagger  27dam    0str  0int  0wis  0dex  0con  0luc   5hr   5dr
+Searing Blaze           lv20  whip    30dam    1str  1int  4wis  0dex  0con  7luc   2hr   2dr
+Melpomene's Betrayal    lv26  dagger  36dam    0str  0int  0wis  2dex  0con  0luc   2hr   2dr
+Dagger of Aardwolf      lv40  dagger 100dam    0str  1int  0wis  0dex  0con  0luc  20hr  20dr
+Dagger of Aardwolf      lv40  dagger 100dam    0str  0int  0wis  0dex  0con  0luc   5hr   5dr
+@Y6@W item(s) found.
 
   2) Show unique IDs and info for all level 91 ear and neck items
      "@Gdinv search objid wearable ear level 91 || wearable neck level 91@W"
 
-@W--- Armor ---
- 3537310336 :::Sterling Cuff:::                     lv91  ear      0str  4int  0wis  0dex  0con  3luc  0hr   14dr  0hp   30mn  -60mv IRS
+@C--- Armor ---@w
+@W 3537310336 :::Sterling Cuff:::    lv91  ear      0str  4int  0wis  0dex  0con  3luc   0hr  14dr   0hp  30mn -60mv IRS
+@Y1@W item(s) found.
 
   3) Show full info from persistence for anything with an anti-evil flag
      "@Gdinv search full flag anti-evil@W"
 
-@WLvl Name of Weapon           Type     Ave Wgt   HR   DR Dam Type Specials Int Wis Lck Str Dex Con
- 20 Searing Bl  (1743467081) whip      30   3    2    2 Fire     flaming    1   4   7   1   0   0
-    colorName:"Searing Blaze" objectID:1743467081
-    keywords:"searing blaze vengeance"
-    flags:"unique, glow, hum, magic, anti-evil, held, resonated, illuminated, V3"
-    score:309 worth:2690 material:steel foundAt:"Unknown"
-    allphys:0 allmagic:0 slash:0 pierce:0 bash:0 acid:0 poison:0
-    disease:0 cold:0 energy:0 holy:0 electric:0 negative:0 shadow:0
-    air:0 earth:0 fire:0 water:0 light:0 mental:0 sonic:0 magic:0
-    weight:3 ownedBy:""
-    clan:"From Crusaders of the Nameless One" affectMods:""
+@C--- Weapon ---@w
+@W 1743467081 Searing Blaze           lv20  whip    30dam    1str  1int  4wis  0dex  0con  7luc   2hr   2dr   0hp   0mn   0mv IRS
+    @CcolorName@w:"Searing Blaze" @Cflags@w:"unique, glow, hum, magic, anti-evil, held, resonated, illuminated, V3" @Cid@w:"1743467081" @Ckeywords@w:"searing blaze vengeance"
+    @Clevel@w:"20" @Cmaterial@w:"steel" @Cscore@w:"309" @Cweight@w:"3"
+@Y1@W item(s) found.
 
   4) Show info on any containers that are wearable on your back
-     "@Gdinv search type container wearable back@W"
+     "@Gdinv search basic type container wearable back@W"
 
-@WLvl Name of Container        Type       HR   DR Int Wis Lck Str Dex Con Wght  Cap Hold Hvy #In Wgt%
-201 Pandora's [Box]          Contain    20   26   5   0   3   0   0   5    8 1500   16  50  33   50
+@C--- Container ---@w
+@WPandora's [Box]          lv201   0str  5int  0wis  0dex  5con  3luc  20hr  26dr
+@Y1@W item(s) found.
 
   5) Show info on any portals leading to the Empire of Talsa
-     "@Gdinv search type portal leadsto talsa@W"
+     "@Gdinv search basic type portal leadsto talsa@W"
 
-@WLvl Name of Portal           Type     Leads to            HR  DR Int Wis Lck Str Dex Con
- 60 Irresistible Calling     portal   The Empire of Tals   0   0   0   0   0   0   0   0
-100 Evil Intentions          portal   The Empire of Tals   0   0   0   0   0   0   0   0
-150 Cosmic Calling           portal   The Empire of Tals   0   0   0   0   0   0   0   0
+@C--- Portal ---@w
+@WIrresistible Calling     lv60    0str  0int  0wis  0dex  0con  0luc   0hr   0dr
+Evil Intentions          lv100   0str  0int  0wis  0dex  0con  0luc   0hr   0dr
+Cosmic Calling           lv150   0str  0int  0wis  0dex  0con  0luc   0hr   0dr
+@Y3@W item(s) found.
 
   6) Look at sorted lists of your poker cards and aardwords tiles
      "@Gdinv search key poker || key aardwords@W"
@@ -1916,6 +2100,9 @@ Examples:
 
   5) Run the organize process to sort items
      "@Gdinv organize@W"
+
+  6) Organize using kept and non-kept item rules
+     "@Gdinv organize add 1.bag type weapon flag kept || type potion ~flag kept@W"
 ]])
 end
 
@@ -1943,6 +2130,8 @@ Examples:
   "@Gdinv search keywords hot searing@W"
   "@Gdinv search weight 5@W"
   "@Gdinv search flags resonated anti-evil@W"
+  "@Gdinv search type weapon flag kept@W"
+  "@Gdinv search type potion ~flag kept@W"
   "@Gdinv search type weapon minlevel 100 ~specials vorpal@W"
 ]])
 end
@@ -2334,19 +2523,6 @@ Examples:
 
   2) Disable auto-regen ring swapping
      "@Gdinv regen off@W"
-]])
-end
-
-function inv.cli.refresh.examples()
-    dbot.print("@W\nUsage:\n")
-    inv.cli.refresh.usage()
-    dbot.print(
-[[@W
-Refresh shows the current inventory tracking status.
-
-Examples:
-  1) Show tracking status
-     "@Gdinv refresh@W"
 ]])
 end
 

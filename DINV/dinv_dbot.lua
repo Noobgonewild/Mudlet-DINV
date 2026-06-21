@@ -325,6 +325,36 @@ function dbot.debug(msg, moduleName)
     cecho("\n<dim_grey>" .. prefix .. " " .. tostring(msg) .. "\n")
 end
 
+DINV.perf = DINV.perf or {
+    enabled = false,
+}
+
+function dbot.perfEnabled()
+    return DINV and DINV.perf and DINV.perf.enabled == true
+end
+
+function dbot.perfNow()
+    if os and os.clock then
+        return os.clock()
+    end
+    return 0
+end
+
+function dbot.perf(label, startTime)
+    local now = dbot.perfNow()
+    if not dbot.perfEnabled() then
+        return now
+    end
+
+    local elapsed = ""
+    if startTime ~= nil then
+        elapsed = string.format(" %.1fms", (now - startTime) * 1000)
+    end
+
+    cecho("\n[DINV PERF] " .. tostring(label or "") .. elapsed .. "\n")
+    return now
+end
+
 -- Print with color code conversion (@G -> green, etc.)
 function dbot.print(msg)
     local text = tostring(msg or "")
@@ -465,15 +495,31 @@ function dbot.fileExists(fileName)
     return false
 end
 
+dbot.ensuredDirectories = dbot.ensuredDirectories or {}
+
 function dbot.ensureDirectory(path)
     -- Use lfs (LuaFileSystem) which is available in Mudlet
     if lfs then
+        local perfStart = dbot.perfNow()
         if path == nil or path == "" then
             return
         end
 
         local normalized = tostring(path):gsub("\\", "/")
+        normalized = normalized:gsub("/+$", "")
+        if normalized == "" then
+            return
+        end
+        local cacheKey = normalized
+
+        if dbot.ensuredDirectories[cacheKey] then
+            dbot.perf("ensureDirectory cached " .. cacheKey, perfStart)
+            return
+        end
+
         if lfs.attributes(normalized, "mode") == "directory" then
+            dbot.ensuredDirectories[cacheKey] = true
+            dbot.perf("ensureDirectory exists " .. cacheKey, perfStart)
             return
         end
 
@@ -502,6 +548,11 @@ function dbot.ensureDirectory(path)
                 lfs.mkdir(current)
             end
         end
+
+        if lfs.attributes(cacheKey, "mode") == "directory" then
+            dbot.ensuredDirectories[cacheKey] = true
+        end
+        dbot.perf("ensureDirectory created " .. cacheKey, perfStart)
     end
 end
 
@@ -653,9 +704,60 @@ end
 
 function dbot.gmcp.getClass()
     if gmcp and gmcp.char and gmcp.char.base then
-        return gmcp.char.base.class or "Unknown"
+        return gmcp.char.base.class or "Unknown", gmcp.char.base.subclass or ""
     end
-    return "Unknown"
+    return "Unknown", ""
+end
+
+-- Aardwolf exposes all classes owned by the character as a compact string in
+-- char.base.classes.  The digits are server-defined class identifiers; keep
+-- that representation internal and return human-readable names everywhere
+-- else in DINV.
+dbot.gmcp.classCodeNames = {
+    ["0"] = "Mage",
+    ["1"] = "Cleric",
+    ["2"] = "Thief",
+    ["3"] = "Warrior",
+    ["4"] = "Ranger",
+    ["5"] = "Paladin",
+    ["6"] = "Psionicist",
+}
+
+function dbot.gmcp.getClasses()
+    local classes = {}
+    local seen = {}
+    local encoded = ""
+
+    if gmcp and gmcp.char and gmcp.char.base then
+        encoded = tostring(gmcp.char.base.classes or "")
+    end
+
+    for code in encoded:gmatch("%d") do
+        local className = dbot.gmcp.classCodeNames[code]
+        local normalized = className and className:lower() or nil
+        if className and not seen[normalized] then
+            table.insert(classes, className)
+            seen[normalized] = true
+        end
+    end
+
+    -- Older or incomplete GMCP snapshots may omit the class-set field.  The
+    -- current class is still authoritative enough for a conservative fallback.
+    local currentClass = select(1, dbot.gmcp.getClass())
+    currentClass = tostring(currentClass or ""):match("^%s*(.-)%s*$") or ""
+    local normalizedCurrent = currentClass:lower()
+    for _, canonicalName in pairs(dbot.gmcp.classCodeNames) do
+        if canonicalName:lower() == normalizedCurrent then
+            currentClass = canonicalName
+            normalizedCurrent = canonicalName:lower()
+            break
+        end
+    end
+    if currentClass ~= "" and normalizedCurrent ~= "unknown" and not seen[normalizedCurrent] then
+        table.insert(classes, currentClass)
+    end
+
+    return classes
 end
 
 function dbot.gmcp.getRace()
@@ -836,6 +938,7 @@ end
 
 function dbot.storage.saveTable(fileName, tableName, theTable, doForceSave)
     local retval = DRL_RET_SUCCESS
+    local perfStart = dbot.perfNow()
     
     if not dbot.init.initializedActive and not doForceSave then
         dbot.note("Skipping save for '" .. (tableName or "Unknown") .. "' table: plugin is not initialized")
@@ -860,13 +963,18 @@ function dbot.storage.saveTable(fileName, tableName, theTable, doForceSave)
     local shortName = fileName:match("([^/\\]+)$") or fileName
     local targetDir = fileName:match("^(.*)[/\\][^/\\]+$")
     if targetDir and targetDir ~= "" then
+        local ensureStart = dbot.perfNow()
         dbot.ensureDirectory(targetDir)
+        dbot.perf("saveTable ensureDir " .. shortName, ensureStart)
     end
     dbot.debug("dbot.storage.saveTable: Saving '" .. shortName .. "'", "dbot.storage")
     
     -- Serialize the table
+    local serializeStart = dbot.perfNow()
     local serialized = dbot.storage.serialize(theTable)
+    dbot.perf("saveTable serialize " .. shortName, serializeStart)
     
+    local writeStart = dbot.perfNow()
     local f, errString = io.open(fileName, "w+")
     if f == nil then
         dbot.warn("dbot.storage.saveTable: Failed to save file: " .. (errString or "unknown error"))
@@ -878,6 +986,8 @@ function dbot.storage.saveTable(fileName, tableName, theTable, doForceSave)
     f:write(tableName .. " = " .. serialized .. "\n")
     f:flush()
     f:close()
+    dbot.perf("saveTable write " .. shortName, writeStart)
+    dbot.perf("saveTable total " .. shortName, perfStart)
     
     return retval
 end
@@ -1357,6 +1467,9 @@ dbot.execute.queue.isDequeueRunning = false
 dbot.execute.queue.fenceCounter = 1
 dbot.execute.queue.fenceTimeoutSeconds = 30
 dbot.execute.queue.fenceIsDetected = false
+dbot.execute.queue.fenceSession = tostring(os.time())
+    .. tostring(math.floor((os.clock() or 0) * 1000000))
+    .. tostring({}):gsub("[^%w]", "")
 dbot.execute.fast = {}
 dbot.execute.safe = {}
 
@@ -1396,7 +1509,7 @@ function dbot.execute.queue.pop()
     return table.remove(dbot.execute.queue.commands, 1)
 end
 
-function dbot.execute.queue.fence(onDetected, timeoutSeconds)
+function dbot.execute.queue.fence(onDetected, timeoutSeconds, onTimeout)
     -- Process all queued commands
     while #dbot.execute.queue.commands > 0 do
         local cmd = dbot.execute.queue.pop()
@@ -1409,12 +1522,24 @@ function dbot.execute.queue.fence(onDetected, timeoutSeconds)
     end
 
     local fenceNumber = dbot.execute.queue.fenceCounter or 1
-    local uniqueString = "{ DINV fence " .. fenceNumber .. " }"
+    local fenceSession = tostring(dbot.execute.queue.fenceSession or "session")
+    local uniqueString = "{ DINV fence " .. fenceSession .. " " .. fenceNumber .. " }"
+    local fencePattern = "^\\{ DINV fence " .. fenceSession .. " " .. fenceNumber .. " \\}$"
     dbot.execute.queue.fenceCounter = fenceNumber + 1
     dbot.execute.queue.fenceIsDetected = false
+    local fenceDetected = false
+    local fenceTriggerId
 
     local function handleFence()
+        if fenceDetected then
+            return
+        end
+        fenceDetected = true
         dbot.execute.queue.fenceIsDetected = true
+        if fenceTriggerId and killTrigger then
+            killTrigger(fenceTriggerId)
+            fenceTriggerId = nil
+        end
         if deleteLine then
             deleteLine()
         end
@@ -1426,7 +1551,7 @@ function dbot.execute.queue.fence(onDetected, timeoutSeconds)
         end
     end
 
-    tempRegexTrigger("^" .. uniqueString .. "$", handleFence)
+    fenceTriggerId = tempRegexTrigger(fencePattern, handleFence)
     if sendSilent then
         sendSilent("echo " .. uniqueString)
     else
@@ -1436,8 +1561,15 @@ function dbot.execute.queue.fence(onDetected, timeoutSeconds)
     if tempTimer then
         local timeout = timeoutSeconds or dbot.execute.queue.fenceTimeoutSeconds
         tempTimer(timeout, function()
-            if not dbot.execute.queue.fenceIsDetected then
+            if not fenceDetected then
                 dbot.warn("dbot.execute.queue.fence: fence message timed out")
+                if fenceTriggerId and killTrigger then
+                    killTrigger(fenceTriggerId)
+                    fenceTriggerId = nil
+                end
+                if onTimeout then
+                    onTimeout()
+                end
             end
         end)
     end
@@ -1616,23 +1748,51 @@ function dbot.callback.wait(resultData, timeout)
 end
 
 ----------------------------------------------------------------------------------------------------
--- Ability Module (simple GMCP-backed availability checks)
+-- Ability Module
 ----------------------------------------------------------------------------------------------------
 
 dbot.ability = {}
 
-function dbot.ability.isAvailable(abilityName)
-    if not abilityName or abilityName == "" then
-        return false
+dbot.ability.dualWieldClassLevels = {
+    thief = 29,
+    warrior = 32,
+    ranger = 25,
+    paladin = 35,
+}
+
+-- Returns whether the character has natural class/level access to dual wield
+-- at an equipment-wearable level.  DINV analysis already adds tier*10 to each
+-- projected base level, so comparing that level with the untiered thresholds
+-- exactly models Aardwolf's tier reductions (for example T3 Warrior: level 2).
+-- Non-listed classes are intentionally ignored, including their level-201
+-- superhero availability.
+function dbot.ability.getDualWieldAccess(wearableLevel)
+    local level = tonumber(wearableLevel)
+    if level == nil and dbot.gmcp and dbot.gmcp.getWearableLevel then
+        level = tonumber(dbot.gmcp.getWearableLevel())
     end
-    if gmcp and gmcp.char and gmcp.char.skills then
-        for _, skill in pairs(gmcp.char.skills) do
-            if type(skill) == "table" and skill.name and string.lower(skill.name) == string.lower(abilityName) then
-                return true
-            end
+    level = level or 1
+
+    for _, className in ipairs(dbot.gmcp.getClasses()) do
+        local normalized = tostring(className or ""):lower()
+        local threshold = dbot.ability.dualWieldClassLevels[normalized]
+        if threshold and level >= threshold then
+            return true, {
+                className = className,
+                threshold = threshold,
+                wearableLevel = level,
+            }
         end
     end
-    return false
+
+    return false, {
+        wearableLevel = level,
+    }
+end
+
+function dbot.ability.hasDualWieldAccess(wearableLevel)
+    local available = dbot.ability.getDualWieldAccess(wearableLevel)
+    return available == true
 end
 
 ----------------------------------------------------------------------------------------------------

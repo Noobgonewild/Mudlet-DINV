@@ -90,6 +90,17 @@ function inv.unused.find()
     local usedItemIds = {}
     local hasAnalysisData = false
 
+    if inv.analyze and inv.analyze.table then
+        for priorityName, analysisEntry in pairs(inv.analyze.table) do
+            if analysisEntry and analysisEntry.levels and next(analysisEntry.levels) then
+                local fresh = inv.analyze.checkAvailable(priorityName, "Unused-item analysis")
+                if not fresh then
+                    return nil, DRL_RET_MISSING_ENTRY
+                end
+            end
+        end
+    end
+
     local function markUsedItem(itemInfo)
         local itemId = nil
 
@@ -142,7 +153,15 @@ function inv.unused.find()
 
     -- Fallback to set data when analysis reports are not available.
     if not hasAnalysisData and inv.set and inv.set.table then
-        for _, levels in pairs(inv.set.table) do
+        for priorityName, levels in pairs(inv.set.table) do
+            local warnedReason = nil
+            for level, setData in pairs(levels or {}) do
+                local staleReason = inv.set.getStaleReason and inv.set.getStaleReason(priorityName, level) or nil
+                if setData and staleReason and staleReason ~= warnedReason then
+                    dbot.warn("Cached sets for '" .. tostring(priorityName) .. "' are stale: " .. staleReason .. ". Unused-item analysis is continuing with them.")
+                    warnedReason = staleReason
+                end
+            end
             if collectUsedFromSetLevels(levels) then
                 hasAnalysisData = true
             end

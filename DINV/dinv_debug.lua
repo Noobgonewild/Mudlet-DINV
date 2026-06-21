@@ -18,6 +18,7 @@ DINV.debug.descriptions = DINV.debug.descriptions or {
     dbot = "Core utility/logging framework.",
     discovery = "Equipment/inventory parsing triggers.",
     ["inv.analyze"] = "Analyze item stats and recommendations.",
+    ["inv.api"] = "Public API requests, events, and callback diagnostics.",
     ["inv.cache"] = "Inventory cache initialization.",
     ["inv.cli"] = "Command routing and help.",
     ["inv.compare"] = "Compare items and sets.",

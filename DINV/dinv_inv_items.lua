@@ -10,6 +10,11 @@ inv.items.init = inv.items.init or {}
 inv.items.table = inv.items.table or {}
 inv.items.timer = inv.items.timer or { name = "drlInvItemsRefreshTimer" }
 inv.items.stateName = inv.items.stateName or "inv-items.state"
+inv.items.keepSync = inv.items.keepSync or {
+    active = false,
+    scheduled = false,
+    pending = false,
+}
 
 ----------------------------------------------------------------------------------------------------
 -- Timer Configuration
@@ -18,6 +23,8 @@ inv.items.stateName = inv.items.stateName or "inv-items.state"
 inv.items.timer = inv.items.timer or {}
 inv.items.timer.name = inv.items.timer.name or "drlInvItemsRefreshTimer"
 inv.items.timer.invmonSaveName = inv.items.timer.invmonSaveName or "drlInvItemsInvmonSaveTimer"
+inv.items.timer.keepSyncStartName = inv.items.timer.keepSyncStartName or "drlInvItemsKeepSyncStartTimer"
+inv.items.timer.keepSyncTimeoutName = inv.items.timer.keepSyncTimeoutName or "drlInvItemsKeepSyncTimeoutTimer"
 inv.items.timer.refreshMin = 5
 inv.items.timer.refreshEagerSec = 0
 inv.items.timer.refreshNextTs = nil
@@ -500,6 +507,8 @@ function inv.items.fini(doSaveState)
     
     -- Clean up timer
     dbot.deleteTimer(inv.items.timer.name)
+    dbot.deleteTimer(inv.items.timer.keepSyncStartName)
+    dbot.deleteTimer(inv.items.timer.keepSyncTimeoutName)
     
     return retval
 end
@@ -677,6 +686,171 @@ function inv.items.scheduleSaveFromInvmon()
     return DRL_RET_SUCCESS
 end
 
+function inv.items.isKeepFlagSyncBusy()
+    return inv.items.buildInProgress
+        or inv.items.refreshInProgress
+        or inv.items.identifyInProgress
+        or inv.items.identifyHydrateInProgress
+        or inv.items.inEqdata
+        or inv.items.inInvdata
+        or (inv.organize and inv.organize.runPkg ~= nil)
+end
+
+inv.items.keepFlagSyncTimeoutSeconds = inv.items.keepFlagSyncTimeoutSeconds or 5
+
+function inv.items.rememberKeepFlagForSync(objId, item)
+    local sync = inv.items.keepSync
+    local key = tostring(objId or "")
+    if not sync or not sync.active or key == "" or not item then
+        return
+    end
+
+    sync.originalKeepFlags = sync.originalKeepFlags or {}
+    if sync.originalKeepFlags[key] ~= nil then
+        return
+    end
+
+    item.stats = item.stats or {}
+    local value = item.stats[invStatFieldKeepflag]
+    sync.originalKeepFlags[key] = {
+        hadValue = value ~= nil,
+        value = value,
+    }
+end
+
+function inv.items.rollbackKeepFlagSync()
+    local sync = inv.items.keepSync
+    if not sync then
+        return
+    end
+
+    for objId, original in pairs(sync.originalKeepFlags or {}) do
+        local item = inv.items.getItem(objId)
+        if item then
+            item.stats = item.stats or {}
+            if original.hadValue then
+                item.stats[invStatFieldKeepflag] = original.value
+            else
+                item.stats[invStatFieldKeepflag] = nil
+            end
+            inv.items.setItem(objId, item, { silentApi = true })
+        end
+    end
+
+    sync.originalKeepFlags = nil
+end
+
+function inv.items.armKeepFlagSyncTimeout()
+    local sync = inv.items.keepSync
+    if not sync or not sync.active or not tempTimer then
+        return
+    end
+
+    dbot.deleteTimer(inv.items.timer.keepSyncTimeoutName)
+    local timeoutSeconds = tonumber(inv.items.keepFlagSyncTimeoutSeconds) or 5
+    dbot.timers[inv.items.timer.keepSyncTimeoutName] = tempTimer(timeoutSeconds, function()
+        if not sync.active then
+            return
+        end
+
+        inv.items.rollbackKeepFlagSync()
+        sync.active = false
+        sync.changed = false
+        inv.items.inInvdata = false
+        inv.items.currentContainerId = nil
+        if DINV and DINV.discovery then
+            DINV.discovery.currentSection = nil
+            DINV.discovery.currentContainerId = nil
+            DINV.discovery.keepFlagChanged = false
+        end
+        dbot.debug(
+            "Keep flag invdata synchronization timed out after " ..
+                tostring(timeoutSeconds) .. " seconds of inactivity; partial changes were rolled back",
+            "inv.items"
+        )
+        if sync.pending then
+            inv.items.maybeStartKeepFlagSync()
+        end
+    end)
+end
+
+function inv.items.maybeStartKeepFlagSync()
+    local sync = inv.items.keepSync
+    if not sync or not sync.pending or sync.active or sync.scheduled then
+        return
+    end
+    if inv.items.isKeepFlagSyncBusy() then
+        return
+    end
+
+    sync.pending = false
+    sync.scheduled = true
+    dbot.deleteTimer(inv.items.timer.keepSyncStartName)
+
+    local function startSync()
+        sync.scheduled = false
+        if inv.items.isKeepFlagSyncBusy() then
+            sync.pending = true
+            return
+        end
+
+        -- Commands issued during the short settle window are covered by this
+        -- scan. Commands arriving after the scan starts set pending again.
+        sync.pending = false
+        sync.active = true
+        sync.changed = false
+        sync.originalKeepFlags = {}
+        inv.items.expectedInvdataContainerId = nil
+        inv.items.awaitingInvdataContainerId = nil
+
+        if inv.items.sendDiscoveryCommand then
+            inv.items.sendDiscoveryCommand("invdata")
+        else
+            sendSilent("invdata")
+        end
+
+        inv.items.armKeepFlagSyncTimeout()
+    end
+
+    if tempTimer then
+        dbot.timers[inv.items.timer.keepSyncStartName] = tempTimer(0.2, startSync)
+    else
+        startSync()
+    end
+end
+
+function inv.items.requestKeepFlagSync()
+    inv.items.keepSync = inv.items.keepSync or {
+        active = false,
+        scheduled = false,
+        pending = false,
+    }
+    inv.items.keepSync.pending = true
+    inv.items.maybeStartKeepFlagSync()
+end
+
+function inv.items.completeKeepFlagSync(changed)
+    local sync = inv.items.keepSync
+    if not sync or not sync.active then
+        return false
+    end
+
+    dbot.deleteTimer(inv.items.timer.keepSyncTimeoutName)
+    sync.active = false
+    sync.changed = changed == true
+    sync.originalKeepFlags = nil
+
+    if sync.changed and inv.items.save then
+        inv.items.save()
+    end
+
+    sync.changed = false
+    if sync.pending then
+        inv.items.maybeStartKeepFlagSync()
+    end
+    return true
+end
+
 function inv.items.cancelPendingRemoval(objId)
     local key = tostring(objId or "")
     if key == "" then
@@ -747,6 +921,203 @@ end
 ----------------------------------------------------------------------------------------------------
 -- Refresh Management
 ----------------------------------------------------------------------------------------------------
+
+local function copyRefreshValue(value, seen)
+    if type(value) ~= "table" then
+        return value
+    end
+
+    seen = seen or {}
+    if seen[value] then
+        return seen[value]
+    end
+
+    local copy = {}
+    seen[value] = copy
+    for key, child in pairs(value) do
+        copy[copyRefreshValue(key, seen)] = copyRefreshValue(child, seen)
+    end
+    return copy
+end
+
+local function refreshScopeKey(kind, containerId)
+    if kind == "eqdata" then
+        return "worn"
+    end
+    local normalizedContainerId = inv.items.normalizeContainerId
+        and inv.items.normalizeContainerId(containerId)
+        or nil
+    if normalizedContainerId then
+        return "container:" .. normalizedContainerId
+    end
+    return "inventory"
+end
+
+function inv.items.invalidateRefresh(reason)
+    local validation = inv.items.refreshValidation
+    if not inv.items.refreshInProgress or not validation then
+        return
+    end
+    validation.valid = false
+    validation.errors = validation.errors or {}
+    table.insert(validation.errors, tostring(reason or "unknown refresh validation error"))
+    dbot.debug("Refresh validation failed: " .. tostring(reason), "inv.items")
+end
+
+function inv.items.expectRefreshScan(kind, containerId)
+    local validation = inv.items.refreshValidation
+    if not inv.items.refreshInProgress or not validation then
+        return true
+    end
+
+    if validation.expected then
+        inv.items.invalidateRefresh("started a new scan before the previous scan completed")
+        return false
+    end
+
+    validation.scanSerial = (tonumber(validation.scanSerial) or 0) + 1
+    validation.expected = {
+        kind = tostring(kind),
+        containerId = inv.items.normalizeContainerId(containerId),
+        key = refreshScopeKey(kind, containerId),
+        serial = validation.scanSerial,
+        started = false,
+    }
+    validation.requested = validation.requested or {}
+    validation.requested[validation.expected.key] =
+        (validation.requested[validation.expected.key] or 0) + 1
+
+    if tempTimer then
+        local serial = validation.scanSerial
+        local validationOwner = validation
+        tempTimer(30, function()
+            local current = inv.items.refreshValidation
+            if inv.items.refreshInProgress
+                and current == validationOwner
+                and current.expected
+                and current.expected.serial == serial then
+                inv.items.invalidateRefresh("timed out waiting for " ..
+                    tostring(current.expected.key))
+                inv.items.abortInvalidRefresh()
+            end
+        end)
+    end
+
+    return true
+end
+
+function inv.items.startRefreshScan(kind, containerId)
+    local validation = inv.items.refreshValidation
+    if not inv.items.refreshInProgress or not validation then
+        return true
+    end
+
+    local expected = validation.expected
+    local actualKey = refreshScopeKey(kind, containerId)
+    if not expected then
+        inv.items.invalidateRefresh("received unexpected " .. actualKey .. " response")
+        return false
+    end
+    if expected.key ~= actualKey or expected.kind ~= tostring(kind) then
+        inv.items.invalidateRefresh("expected " .. tostring(expected.key) ..
+            " but received " .. actualKey)
+        return false
+    end
+    if expected.started then
+        inv.items.invalidateRefresh("received duplicate start for " .. actualKey)
+        return false
+    end
+
+    expected.started = true
+    return true
+end
+
+function inv.items.completeRefreshScan(kind, containerId)
+    local validation = inv.items.refreshValidation
+    if not inv.items.refreshInProgress or not validation then
+        return true
+    end
+
+    local expected = validation.expected
+    local actualKey = refreshScopeKey(kind, containerId)
+    if not expected then
+        inv.items.invalidateRefresh("received unexpected completion for " .. actualKey)
+        return false
+    end
+    if expected.key ~= actualKey or expected.kind ~= tostring(kind) then
+        inv.items.invalidateRefresh("completed " .. actualKey ..
+            " while waiting for " .. tostring(expected.key))
+        return false
+    end
+    if not expected.started then
+        inv.items.invalidateRefresh("completed " .. actualKey .. " before its start marker")
+        return false
+    end
+
+    validation.completed = validation.completed or {}
+    validation.completed[actualKey] = (validation.completed[actualKey] or 0) + 1
+    validation.expected = nil
+    return true
+end
+
+function inv.items.completeMissingRefreshContainer(objId)
+    local validation = inv.items.refreshValidation
+    local normalizedId = inv.items.normalizeContainerId(objId)
+    if not inv.items.refreshInProgress or not validation or not normalizedId then
+        return false
+    end
+
+    local expected = validation.expected
+    local actualKey = refreshScopeKey("invdata", normalizedId)
+    if not expected or expected.key ~= actualKey then
+        inv.items.invalidateRefresh("item-not-found response for unexpected container " ..
+            tostring(objId))
+        return false
+    end
+
+    expected.started = true
+    return inv.items.completeRefreshScan("invdata", normalizedId)
+end
+
+function inv.items.abortInvalidRefresh()
+    local validation = inv.items.refreshValidation
+    if not inv.items.refreshInProgress or not validation then
+        return
+    end
+
+    if validation.originalTable then
+        inv.items.table = validation.originalTable
+    end
+
+    local reason = table.concat(validation.errors or {}, "; ")
+    inv.items.refreshValidation = nil
+    inv.items.refreshSeen = nil
+    inv.items.refreshRecheckQueue = nil
+    inv.items.refreshRecheckIndex = nil
+    inv.items.refreshInProgress = false
+    inv.items.refreshIdentifyPartials = false
+    inv.items.discoveryStage = 0
+    inv.items.inEqdata = false
+    inv.items.inInvdata = false
+    inv.items.currentContainerId = nil
+    inv.items.expectedInvdataContainerId = nil
+    inv.items.awaitingInvdataContainerId = nil
+    inv.items.currentInvdataSeen = nil
+    inv.state = invStateIdle
+
+    if DINV and DINV.discovery then
+        DINV.discovery.currentSection = nil
+        DINV.discovery.currentContainerId = nil
+    end
+    if DINV and DINV.setBuildPhase then
+        DINV.setBuildPhase(0)
+    end
+
+    dbot.warn("Refresh was not internally consistent; no items were removed or saved." ..
+        (reason ~= "" and " Reason: " .. reason or ""))
+    inv.items.maybeStartKeepFlagSync()
+    inv.items.scheduleDeferredIdentifyProcessing("refreshAbort")
+end
 
 function inv.items.refreshOn(periodMin, eagerSec)
     inv.items.timer.refreshMin = periodMin or 5
@@ -820,9 +1191,14 @@ function inv.items.refreshGetMinutesLeft()
 end
 
 function inv.items.refresh(delay, refreshLoc, endTag, callback)
+    local perfStart = dbot.perfNow and dbot.perfNow() or nil
+    dbot.perf("refresh requested loc=" .. tostring(refreshLoc or "nil"))
+
     -- Try to auto-initialize if not already done
     if not inv.init.initializedActive then
+        local initStart = dbot.perfNow and dbot.perfNow() or nil
         inv.items.ensureInitialized()
+        dbot.perf("refresh ensureInitialized", initStart)
     end
     
     -- Check if we can run
@@ -854,22 +1230,39 @@ function inv.items.refresh(delay, refreshLoc, endTag, callback)
         dbot.debug("inv.items.refresh: full-location refresh requested; preserving existing identify data", "inv.items")
     end
 
-    if refreshLoc == invItemsRefreshLocAll then
-        inv.items.refreshIdentifyPartials = true
-    elseif type(callback) == "table" and callback.identifyPartials then
-        inv.items.refreshIdentifyPartials = true
-    else
-        inv.items.refreshIdentifyPartials = false
-    end
+    inv.items.refreshPerfStart = perfStart
+    inv.items.refreshIdentifyPartials = refreshLoc == invItemsRefreshLocAll
+        or (type(callback) == "table" and callback.identifyPartials == true)
     inv.state = invStateDiscovery
     inv.items.refreshInProgress = true
     inv.items.refreshSeen = {}
+
+    local copyStart = dbot.perfNow and dbot.perfNow() or nil
+    local originalTable = copyRefreshValue(inv.items.table or {})
+    dbot.perf("refresh copy original table", copyStart)
+
+    inv.items.refreshValidation = {
+        valid = true,
+        errors = {},
+        expected = nil,
+        requested = {},
+        completed = {},
+        phase = "initial",
+        discoveryStarted = false,
+        initialComplete = false,
+        recheckComplete = false,
+        originalTable = originalTable,
+    }
+    inv.items.refreshRecheckQueue = nil
+    inv.items.refreshRecheckIndex = nil
     inv.items.eqdataSeen = {}
     inv.items.expectedInvdataContainerId = nil
 
     -- Ensure discovery triggers are registered for refresh scans
     if DINV.discovery and DINV.discovery.register then
+        local registerStart = dbot.perfNow and dbot.perfNow() or nil
         DINV.discovery.register()
+        dbot.perf("refresh register discovery triggers", registerStart)
     end
 
     -- Toggle prompt handling at refresh boundaries to suppress stray prompt output.
@@ -880,6 +1273,7 @@ function inv.items.refresh(delay, refreshLoc, endTag, callback)
     end
 
     local function startDiscovery()
+        dbot.perf("refresh discovery start", inv.items.refreshPerfStart)
         -- Use the staged discovery pipeline for refreshes.
         -- discoverCR also issues a timed standalone "invdata" command,
         -- which duplicates main-inventory scans and can leak container context.
@@ -892,7 +1286,19 @@ function inv.items.refresh(delay, refreshLoc, endTag, callback)
 
     local function startWithFence()
         if dbot and dbot.execute and dbot.execute.queue and dbot.execute.queue.fence then
-            dbot.execute.queue.fence(startDiscovery)
+            local validationOwner = inv.items.refreshValidation
+            local retval = dbot.execute.queue.fence(startDiscovery, nil, function()
+                if inv.items.refreshInProgress
+                    and inv.items.refreshValidation == validationOwner
+                    and validationOwner
+                    and not validationOwner.discoveryStarted then
+                    inv.items.invalidateRefresh("timed out waiting for refresh fence")
+                    inv.items.abortInvalidRefresh()
+                end
+            end)
+            if retval ~= DRL_RET_SUCCESS then
+                startDiscovery()
+            end
         else
             startDiscovery()
         end
@@ -903,6 +1309,7 @@ function inv.items.refresh(delay, refreshLoc, endTag, callback)
     else
         startWithFence()
     end
+    dbot.perf("refresh setup returned", perfStart)
 
     -- Refresh should not mass-identify items; the build pipeline handles identify safely.
     
@@ -968,6 +1375,13 @@ function inv.items.build(endTag)
     cecho("<yellow>  To abort: dinv build abort\n")
     cecho("\n")
 
+    -- Preserve legacy item-attached organize rules before the rebuild resets item state.
+    if inv.organize and inv.organize.migrateItemRulesToConfig then
+        inv.organize.migrateItemRulesToConfig()
+    end
+
+    inv.items.buildOriginalTable = copyRefreshValue(inv.items.table or {})
+
     -- Reset inventory table
     inv.items.reset()
     inv.state = invStateDiscovery
@@ -1010,6 +1424,13 @@ function inv.items.buildSingleItem(objId, source)
     if not objId or objId == "" then
         dbot.debug("buildSingleItem: missing objId (source=" .. tostring(source) .. ")", "inv.items")
         return DRL_RET_INVALID_PARAM
+    end
+    -- A refresh owns the eqdata/invdata protocol stream. Starting a one-item
+    -- identify here would switch buildPhase to 4, discard the refresh tags,
+    -- and leave that refresh waiting until its timeout.
+    if inv.items.refreshInProgress then
+        dbot.debug("buildSingleItem: refresh active, deferring objId=" .. tostring(objId), "inv.items")
+        return DRL_RET_BUSY
     end
     if inv.items.buildInProgress or inv.items.identifyInProgress then
         if inv.items.singleIdentifyMode and type(inv.items.identifyQueue) == "table" then
@@ -1265,7 +1686,7 @@ function inv.items.finishIdentifyHydrateInvdata()
 
     dbot.debug("identify hydrate: starting identify for objId=" .. objId, "inv.items")
     local retval = inv.items.buildSingleItem(objId, source)
-    if retval == DRL_RET_IN_COMBAT then
+    if retval == DRL_RET_BUSY or retval == DRL_RET_IN_COMBAT then
         inv.items.enqueueDeferredIdentify(objId, source)
         return DRL_RET_SUCCESS
     elseif retval ~= DRL_RET_SUCCESS then
@@ -1295,7 +1716,7 @@ function inv.items.enqueueDeferredIdentify(objId, source)
 end
 
 function inv.items.processDeferredIdentifyQueue(source)
-    if inv.items.buildInProgress or inv.items.identifyInProgress then
+    if inv.items.buildInProgress or inv.items.identifyInProgress or inv.items.refreshInProgress then
         return DRL_RET_BUSY
     end
 
@@ -1318,6 +1739,25 @@ function inv.items.processDeferredIdentifyQueue(source)
     return DRL_RET_SUCCESS
 end
 
+function inv.items.scheduleDeferredIdentifyProcessing(source)
+    if not inv.items.deferredIdentifyQueue or #inv.items.deferredIdentifyQueue == 0 then
+        return DRL_RET_SUCCESS
+    end
+
+    local function processQueue()
+        if inv and inv.items and inv.items.processDeferredIdentifyQueue then
+            inv.items.processDeferredIdentifyQueue(tostring(source or "deferred"))
+        end
+    end
+
+    if tempTimer then
+        tempTimer(0.1, processQueue)
+    else
+        processQueue()
+    end
+    return DRL_RET_SUCCESS
+end
+
 ----------------------------------------------------------------------------------------------------
 -- Item Access Functions
 ----------------------------------------------------------------------------------------------------
@@ -1327,6 +1767,16 @@ function inv.items.getItem(objId)
         return nil
     end
     return inv.items.table[tostring(objId)]
+end
+
+function inv.items.isTransientItem(item)
+    if type(item) ~= "table" then
+        return false
+    end
+    if item.__dinvTransient == true then
+        return true
+    end
+    return type(item.stats) == "table" and item.stats.__dinvTransient == true
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -1463,17 +1913,46 @@ function inv.items.parseQuery(query)
     return clauses
 end
 
-function inv.items.setItem(objId, itemData)
+function inv.items.setItem(objId, itemData, options)
     if inv.items.table == nil then
         inv.items.table = {}
     end
-    inv.items.table[tostring(objId)] = itemData
+    local key = tostring(objId)
+    local previousItem = inv.items.table[key]
+    inv.items.table[key] = itemData
+    local bulkWorkflow = inv.items.refreshInProgress
+        or inv.items.buildInProgress
+        or inv.items.identifyInProgress
+    local silentApi = options == true
+        or (type(options) == "table" and options.silentApi == true)
+        or inv.items.suppressApiEvents == true
+        or inv.items.isTransientItem(itemData)
+    if not bulkWorkflow
+        and not silentApi
+        and DINV and DINV.api and DINV.api._onItemSet then
+        pcall(DINV.api._onItemSet, key, previousItem, itemData)
+    end
     return DRL_RET_SUCCESS
 end
 
-function inv.items.removeItem(objId)
+function inv.items.removeItem(objId, options)
     if inv.items.table then
-        inv.items.table[tostring(objId)] = nil
+        local key = tostring(objId)
+        local previousItem = inv.items.table[key]
+        inv.items.table[key] = nil
+        local bulkWorkflow = inv.items.refreshInProgress
+            or inv.items.buildInProgress
+            or inv.items.identifyInProgress
+        local silentApi = options == true
+            or (type(options) == "table" and options.silentApi == true)
+            or inv.items.suppressApiEvents == true
+            or inv.items.isTransientItem(previousItem)
+        if previousItem
+            and not bulkWorkflow
+            and not silentApi
+            and DINV and DINV.api and DINV.api._onItemRemoved then
+            pcall(DINV.api._onItemRemoved, key, previousItem)
+        end
     end
     return DRL_RET_SUCCESS
 end
@@ -1569,8 +2048,9 @@ function inv.items.applyCachedStats(item)
                     elseif k == invStatFieldLocation
                         or k == invStatFieldContainer
                         or k == invStatFieldWorn
-                        or k == invStatFieldLastStored then
-                        -- Never restore dynamic location fields from cache.
+                        or k == invStatFieldLastStored
+                        or k == invStatFieldKeepflag then
+                        -- Never restore dynamic protocol state from cache.
                     else
                         item.stats[k] = v
                     end
@@ -1598,8 +2078,9 @@ function inv.items.applyCachedStats(item)
                                 elseif k == invStatFieldLocation
                                     or k == invStatFieldContainer
                                     or k == invStatFieldWorn
-                                    or k == invStatFieldLastStored then
-                                    -- Never restore dynamic location fields from cache.
+                                    or k == invStatFieldLastStored
+                                    or k == invStatFieldKeepflag then
+                                    -- Never restore dynamic protocol state from cache.
                                 else
                                     item.stats[k] = v
                                 end
@@ -1666,16 +2147,22 @@ function inv.items.isFrequentCacheType(itemType)
     end
 
     local typeName = tostring(itemType):lower()
+    local compactTypeName = typeName:gsub("%s+", "")
     return typeName == "potion"
         or typeName == "pill"
         or typeName == "food"
         or typeName == "wand"
         or typeName == "stave"
         or typeName == "scroll"
+        or compactTypeName:match("^rawmaterial") ~= nil
 end
 
 function inv.items.cacheIdentifiedItem(item)
     if not item or not item.stats then
+        return
+    end
+
+    if item.stats.identifyLevel ~= invIdLevelFull then
         return
     end
 
@@ -1687,22 +2174,30 @@ function inv.items.cacheIdentifiedItem(item)
     local itemType = item.stats[invStatFieldType]
     local isFrequent = inv.items.isFrequentCacheType(itemType)
 
-    if item.stats.identifyLevel == invIdLevelPartial and not isFrequent then
-        return
-    end
-
     if not inv.cache or not inv.cache.set then
         return
     end
 
-    inv.cache.set("recent", tostring(itemId), item)
+    local recent = {}
+    for k, v in pairs(item) do
+        if k ~= "stats" then
+            recent[k] = v
+        end
+    end
+    recent.stats = {}
+    for k, v in pairs(item.stats) do
+        if k ~= invStatFieldKeepflag then
+            recent.stats[k] = v
+        end
+    end
+    inv.cache.set("recent", tostring(itemId), recent)
 
     if isFrequent then
         local nameKeys = inv.items.getFrequentCacheKeys(item)
         if nameKeys then
             local stored = { stats = {} }
             for k, v in pairs(item.stats) do
-                if k ~= invStatFieldId then
+                if k ~= invStatFieldId and k ~= invStatFieldKeepflag then
                     stored.stats[k] = v
                 end
             end
@@ -1797,8 +2292,9 @@ function inv.items.cacheObservedItem(item)
     local cached = inv.cache.get("frequent", key)
     if cached and cached.stats then
         cached.stats = cached.stats or {}
+        cached.stats[invStatFieldKeepflag] = nil
         for k, v in pairs(item.stats) do
-            if k ~= "identifyLevel" then
+            if k ~= "identifyLevel" and k ~= invStatFieldKeepflag then
                 cached.stats[k] = v
             end
         end
@@ -1811,7 +2307,9 @@ function inv.items.cacheObservedItem(item)
 
     local stored = { stats = {} }
     for k, v in pairs(item.stats) do
-        stored.stats[k] = v
+        if k ~= invStatFieldKeepflag then
+            stored.stats[k] = v
+        end
     end
     if stored.stats.identifyLevel ~= invIdLevelFull then
         stored.stats.identifyLevel = invIdLevelSoft
@@ -1822,6 +2320,38 @@ end
 ----------------------------------------------------------------------------------------------------
 -- Invdata/Eqdata Parsing
 ----------------------------------------------------------------------------------------------------
+
+function inv.items.updateKeepFlagFromProtocol(item, flags)
+    if not item then
+        return false
+    end
+
+    item.stats = item.stats or {}
+    local isKept = tostring(flags or ""):find("K", 1, true) ~= nil
+    local changed = item.stats[invStatFieldKeepflag] ~= isKept
+    item.stats[invStatFieldKeepflag] = isKept
+    return changed
+end
+
+function inv.items.updateKeepFlagFromDataLine(dataLine)
+    local objId, flags = tostring(dataLine or ""):match("^(%d+),([^,]*),")
+    if not objId then
+        return DRL_RET_INVALID_PARAM, false
+    end
+
+    local item = inv.items.getItem(objId)
+    if not item then
+        return DRL_RET_MISSING_ENTRY, false
+    end
+
+    inv.items.rememberKeepFlagForSync(objId, item)
+    local changed = inv.items.updateKeepFlagFromProtocol(item, flags)
+    if changed then
+        inv.items.setItem(objId, item)
+    end
+    inv.items.armKeepFlagSyncTimeout()
+    return DRL_RET_SUCCESS, changed
+end
 
 function inv.items._parseDataLine(dataLine, source)
     if dataLine == nil or dataLine == "" then
@@ -1907,6 +2437,7 @@ function inv.items._parseDataLine(dataLine, source)
     local existingColorName = item.stats[invStatFieldColorName]
     item.stats[invStatFieldId] = objId
     item.stats[invStatFieldName] = dbot.stripColors(itemName)
+    local keepFlagChanged = inv.items.updateKeepFlagFromProtocol(item, flags)
     -- Always update colorname from invdata if we have a valid name
     -- Only keep existing if the new itemName is empty or worse
     if itemName and itemName ~= "" then
@@ -1972,7 +2503,7 @@ function inv.items._parseDataLine(dataLine, source)
         local cached = inv.cache.get("frequent", tostring(objId))
         if cached and cached.stats and cached.stats.identifyLevel == invIdLevelFull then
             for k, v in pairs(cached.stats) do
-                if item.stats[k] == nil then
+                if k ~= invStatFieldKeepflag and item.stats[k] == nil then
                     item.stats[k] = v
                 end
             end
@@ -1993,7 +2524,7 @@ function inv.items._parseDataLine(dataLine, source)
 
     dbot.debug("Parsed: " .. objId .. " [" .. typeName .. "] " .. itemName:sub(1, 25), "inv.items")
 
-    return DRL_RET_SUCCESS
+    return DRL_RET_SUCCESS, keepFlagChanged
 end
 
 function inv.items.onInvdata(dataLine)
@@ -2028,7 +2559,7 @@ function inv.items.onInvitem(dataLine)
         if item then
             item.stats = item.stats or {}
             for k, v in pairs(persisted.stats) do
-                if item.stats[k] == nil then
+                if k ~= invStatFieldKeepflag and item.stats[k] == nil then
                     item.stats[k] = v
                 end
             end
@@ -2043,7 +2574,7 @@ function inv.items.onInvitem(dataLine)
 
     if objId and (not persisted or not (persisted.stats and persisted.stats.identifyLevel == invIdLevelFull)) then
         local retval = inv.items.buildSingleItem(objId, "invitem")
-        if retval == DRL_RET_IN_COMBAT then
+        if retval == DRL_RET_BUSY or retval == DRL_RET_IN_COMBAT then
             inv.items.enqueueDeferredIdentify(objId, "invitem")
         end
     end
@@ -2119,10 +2650,19 @@ end
 function inv.items.sendDiscoveryCommand(command)
     local cmd = tostring(command or "")
     local requestedContainerId = cmd:match("^invdata%s+(%d+)%s*$")
+    local scanAccepted = true
     if requestedContainerId then
         inv.items.awaitingInvdataContainerId = tostring(requestedContainerId)
+        scanAccepted = inv.items.expectRefreshScan("invdata", requestedContainerId)
     elseif cmd:match("^invdata%s*$") then
         inv.items.awaitingInvdataContainerId = nil
+        scanAccepted = inv.items.expectRefreshScan("invdata", nil)
+    elseif cmd:match("^eqdata%s*$") then
+        scanAccepted = inv.items.expectRefreshScan("eqdata", nil)
+    end
+
+    if scanAccepted == false then
+        return DRL_RET_BUSY
     end
 
     if DINV and DINV.discovery and DINV.discovery.bumpRawSuppressWindow then
@@ -2133,9 +2673,18 @@ function inv.items.sendDiscoveryCommand(command)
         DINV.discovery.queuePromptSuppress()
     end
     sendSilent(cmd)
+    return DRL_RET_SUCCESS
 end
 
 function inv.items.discoverChain()
+    if inv.items.refreshInProgress and inv.items.refreshValidation then
+        if inv.items.refreshValidation.discoveryStarted then
+            inv.items.invalidateRefresh("refresh discovery was started more than once")
+            return
+        end
+        inv.items.refreshValidation.discoveryStarted = true
+    end
+
     inv.items.discoveryStage = 1
     inv.items.discoveryContainers = {}
     inv.items.discoveryItemCount = 0
@@ -2161,6 +2710,13 @@ end
 
 function inv.items.onEqdataComplete()
     if not inv.items.buildInProgress and not inv.items.refreshInProgress then
+        return
+    end
+
+    if inv.items.refreshInProgress
+        and inv.items.refreshValidation
+        and inv.items.refreshValidation.phase == "recheck" then
+        inv.items.sendNextRefreshRecheck()
         return
     end
 
@@ -2190,6 +2746,14 @@ function inv.items.onInvdataComplete(containerId)
         return
     end
 
+    if inv.items.refreshInProgress
+        and inv.items.refreshValidation
+        and inv.items.refreshValidation.phase == "recheck" then
+        inv.items.reconcileInvdataLocations(containerId)
+        inv.items.sendNextRefreshRecheck()
+        return
+    end
+
     -- If this was a container scan, continue to next container
     local normalizedContainerId = inv.items.normalizeContainerId(containerId)
     if normalizedContainerId then
@@ -2203,11 +2767,6 @@ function inv.items.onInvdataComplete(containerId)
         inv.items.discoveryStage = 3
         inv.items.applyMainInvdataInventoryLocations()
         inv.items.reconcileInvdataLocations(nil)
-
-        if inv.items.refreshInProgress and inv.items.save then
-            inv.items.save()
-            dbot.debug("Refresh main invdata complete: persisted inventory state.", "inv.items")
-        end
 
         local itemCount = inv.items.getCount()
         if not inv.items.refreshInProgress then
@@ -2332,6 +2891,127 @@ function inv.items.pruneRefreshOrphans()
     end
 end
 
+function inv.items.buildRefreshRecheckQueue()
+    if not inv.items.refreshSeen then
+        return {}
+    end
+
+    local scopes = {}
+    for objId, item in pairs(inv.items.table or {}) do
+        if not inv.items.refreshSeen[tostring(objId)] and item and item.stats then
+            local location = tostring(item.stats[invStatFieldLocation] or "")
+            local container = tostring(item.stats[invStatFieldContainer] or "")
+            local worn = tostring(item.stats[invStatFieldWorn] or "")
+
+            if not inv.items.normalizeKeyringLocation(item)
+                and not (container ~= "" and inv.config.isIgnored(container)) then
+                local isWorn = location == tostring(invItemLocWorn or "worn")
+                    or (worn ~= ""
+                        and worn ~= "undefined"
+                        and worn ~= tostring(invItemWornNotWorn or "not-worn"))
+                    or (inv.items.resolveWearSlot and inv.items.resolveWearSlot(location) ~= nil)
+                local containerId = inv.items.normalizeContainerId(container)
+                if not containerId and not isWorn then
+                    containerId = inv.items.normalizeContainerId(location)
+                end
+
+                if isWorn then
+                    scopes.worn = { kind = "eqdata" }
+                elseif containerId then
+                    scopes["container:" .. containerId] = {
+                        kind = "invdata",
+                        containerId = containerId,
+                    }
+                elseif location == tostring(invItemLocInventory or "inventory")
+                    or location == "" then
+                    scopes.inventory = { kind = "invdata" }
+                end
+            end
+        end
+    end
+
+    local queue = {}
+    if scopes.worn then
+        table.insert(queue, scopes.worn)
+    end
+    if scopes.inventory then
+        table.insert(queue, scopes.inventory)
+    end
+
+    local containerIds = {}
+    for key, scope in pairs(scopes) do
+        if scope.containerId then
+            table.insert(containerIds, scope.containerId)
+        end
+    end
+    table.sort(containerIds, function(left, right)
+        return tostring(left) < tostring(right)
+    end)
+    for _, containerId in ipairs(containerIds) do
+        table.insert(queue, scopes["container:" .. containerId])
+    end
+
+    return queue
+end
+
+function inv.items.startRefreshRecheck()
+    local validation = inv.items.refreshValidation
+    if not inv.items.refreshInProgress or not validation then
+        return false
+    end
+
+    local recheckStart = dbot.perfNow and dbot.perfNow() or nil
+    validation.initialComplete = true
+    validation.phase = "recheck"
+    inv.items.refreshRecheckQueue = inv.items.buildRefreshRecheckQueue()
+    inv.items.refreshRecheckIndex = 0
+    dbot.perf(
+        "refresh build recheck queue size=" .. tostring(#inv.items.refreshRecheckQueue),
+        recheckStart
+    )
+
+    if #inv.items.refreshRecheckQueue == 0 then
+        validation.recheckComplete = true
+        return false
+    end
+
+    dbot.debug("Refresh verifying " .. #inv.items.refreshRecheckQueue ..
+        " location(s) containing unseen items.", "inv.items")
+    inv.items.sendNextRefreshRecheck()
+    return true
+end
+
+function inv.items.sendNextRefreshRecheck()
+    local validation = inv.items.refreshValidation
+    if not inv.items.refreshInProgress or not validation then
+        return
+    end
+
+    inv.items.refreshRecheckIndex = (inv.items.refreshRecheckIndex or 0) + 1
+    local scope = inv.items.refreshRecheckQueue
+        and inv.items.refreshRecheckQueue[inv.items.refreshRecheckIndex]
+        or nil
+    if not scope then
+        validation.recheckComplete = true
+        dbot.perf("refresh recheck complete", inv.items.refreshPerfStart)
+        inv.items.finishDiscovery()
+        return
+    end
+
+    inv.items.currentInvdataSeen = nil
+    inv.items.inEqdata = false
+    inv.items.inInvdata = false
+    if scope.kind == "eqdata" then
+        inv.items.sendDiscoveryCommand("eqdata")
+    elseif scope.containerId then
+        inv.items.expectedInvdataContainerId = tostring(scope.containerId)
+        inv.items.sendDiscoveryCommand("invdata " .. tostring(scope.containerId))
+    else
+        inv.items.expectedInvdataContainerId = nil
+        inv.items.sendDiscoveryCommand("invdata")
+    end
+end
+
 function inv.items.discoverContainers()
     inv.items.discoveryContainers = {}
 
@@ -2355,6 +3035,9 @@ function inv.items.discoverContainers()
     local numContainers = #inv.items.discoveryContainers
     if numContainers == 0 then
         dbot.debug("No containers found to scan", "inv.items")
+        if inv.items.refreshInProgress and inv.items.startRefreshRecheck() then
+            return
+        end
         inv.items.finishDiscovery()
         return
     end
@@ -2374,6 +3057,9 @@ function inv.items.discoverNextContainer()
         inv.items.expectedInvdataContainerId = nil
         inv.items.awaitingInvdataContainerId = nil
         dbot.debug("Finished scanning all containers", "inv.items")
+        if inv.items.refreshInProgress and inv.items.startRefreshRecheck() then
+            return
+        end
         inv.items.finishDiscovery()
         return
     end
@@ -2400,8 +3086,44 @@ end
 
 function inv.items.finishDiscovery()
     if inv.items.refreshInProgress then
+        local finishStart = dbot.perfNow and dbot.perfNow() or nil
+        dbot.perf("refresh finish begin", inv.items.refreshPerfStart)
+        local validation = inv.items.refreshValidation
+        local validationStart = dbot.perfNow and dbot.perfNow() or nil
+        if validation then
+            for key, requestedCount in pairs(validation.requested or {}) do
+                local completedCount = validation.completed
+                    and validation.completed[key]
+                    or 0
+                if completedCount ~= requestedCount then
+                    inv.items.invalidateRefresh("scan count mismatch for " .. tostring(key) ..
+                        " (requested " .. tostring(requestedCount) ..
+                        ", completed " .. tostring(completedCount) .. ")")
+                end
+            end
+        end
+        dbot.perf("refresh finish validation", validationStart)
+        if not validation
+            or not validation.valid
+            or validation.expected ~= nil
+            or not validation.discoveryStarted
+            or not validation.initialComplete
+            or not validation.recheckComplete then
+            if validation and validation.valid then
+                inv.items.invalidateRefresh("refresh ended before all required scans completed")
+            end
+            inv.items.abortInvalidRefresh()
+            return
+        end
+
+        local refreshOriginalTable = validation.originalTable
+        local pruneStart = dbot.perfNow and dbot.perfNow() or nil
         inv.items.pruneRefreshOrphans()
+        dbot.perf("refresh prune orphans", pruneStart)
         inv.items.refreshSeen = nil
+        inv.items.refreshValidation = nil
+        inv.items.refreshRecheckQueue = nil
+        inv.items.refreshRecheckIndex = nil
         inv.items.refreshInProgress = false
 
         inv.items.discoveryStage = 0
@@ -2415,7 +3137,9 @@ function inv.items.finishDiscovery()
         -- Refresh changes dynamic fields (location/container/worn) via invdata/eqdata,
         -- so persist immediately when refresh completes.
         if inv.items.save then
+            local saveStart = dbot.perfNow and dbot.perfNow() or nil
             inv.items.save()
+            dbot.perf("refresh save items", saveStart)
             dbot.debug("Refresh complete: persisted inventory state.", "inv.items")
         end
 
@@ -2426,13 +3150,25 @@ function inv.items.finishDiscovery()
 
         if inv.items.refreshIdentifyPartials then
             inv.items.refreshIdentifyPartials = false
+            local partialStart = dbot.perfNow and dbot.perfNow() or nil
             local identifyRet = inv.items.identifyPartialItems()
+            dbot.perf("refresh start partial identify", partialStart)
             if identifyRet ~= DRL_RET_SUCCESS then
                 dbot.warn("Refresh complete: unable to start partial identification (" .. tostring(identifyRet) .. ")")
             end
         else
             inv.items.eqdataSeen = {}
         end
+        if DINV and DINV.api and DINV.api._onRefreshComplete then
+            local apiStart = dbot.perfNow and dbot.perfNow() or nil
+            pcall(DINV.api._onRefreshComplete, refreshOriginalTable)
+            dbot.perf("refresh API complete callbacks", apiStart)
+        end
+        inv.items.maybeStartKeepFlagSync()
+        if not inv.items.buildInProgress and not inv.items.identifyInProgress then
+            inv.items.scheduleDeferredIdentifyProcessing("refreshComplete")
+        end
+        dbot.perf("refresh finish total", finishStart)
         return
     end
 
@@ -2518,10 +3254,12 @@ function inv.items.identifyCR()
 end
 
 function inv.items.identifyPartialItems()
+    local partialStart = dbot.perfNow and dbot.perfNow() or nil
     if inv.items.buildInProgress or inv.items.identifyInProgress then
         return DRL_RET_BUSY
     end
 
+    dbot.perf("identifyPartialItems begin")
     inv.items.partialIdentifyMode = true
     inv.items.identifyPartialOnly = true
     inv.items.buildInProgress = true
@@ -2536,10 +3274,12 @@ function inv.items.identifyPartialItems()
 
     inv.state = invStateIdentify
     inv.items.startIdentification()
+    dbot.perf("identifyPartialItems setup", partialStart)
     return DRL_RET_SUCCESS
 end
 
 function inv.items.startIdentification()
+    local startIdentificationPerf = dbot.perfNow and dbot.perfNow() or nil
     inv.items.clearInlineProgress()
     inv.items.identifyQueue = {}
     inv.items.identifyIndex = 0
@@ -2570,14 +3310,21 @@ function inv.items.startIdentification()
     end
 
     inv.items.identifyTotal = #inv.items.identifyQueue
+    dbot.perf(
+        "startIdentification queue build total=" .. tostring(inv.items.identifyTotal),
+        startIdentificationPerf
+    )
 
     if inv.items.identifyTotal == 0 then
         cecho("\n<green>[DINV] All items already identified (or cached)!\n")
+        local completeStart = dbot.perfNow and dbot.perfNow() or nil
         inv.items.buildComplete()
+        dbot.perf("startIdentification buildComplete no queue", completeStart)
         return
     end
 
-    cecho("\n<cyan>[DINV] Need to identify " .. inv.items.identifyTotal .. " item(s)...\n")
+    local identifyMessage = inv.items.forceIdentify and "Need to process " or "Need to identify "
+    cecho("\n<cyan>[DINV] " .. identifyMessage .. inv.items.identifyTotal .. " item(s)...\n")
     if DINV and DINV.setBuildPhase then
         DINV.setBuildPhase(4)
 		sendGMCP("config prompt off")
@@ -2663,7 +3410,9 @@ function inv.items.identifyNext()
         return
     end
 
-    if not inv.items.forceIdentify and inv.items.applyCachedStats(item) then
+    local itemType = item.stats and item.stats[invStatFieldType]
+    local canUseCache = not inv.items.forceIdentify or inv.items.isFrequentCacheType(itemType)
+    if canUseCache and inv.items.applyCachedStats(item) then
         item.stats.identifyLevel = invIdLevelFull
         inv.items.setItem(objId, item)
         local cachedName = (item.stats and item.stats[invStatFieldColorName])
@@ -3052,20 +3801,26 @@ function inv.items.buildComplete()
             DINV.setBuildPhase(0)
             sendGMCP("config prompt on")
         end
+        if inv.organize and inv.organize.syncRulesFromConfig then
+            inv.organize.syncRulesFromConfig({ warnMissing = false, saveItems = false })
+        end
         if inv.items.save then
             inv.items.save()
         end
         if raiseEvent and singleId then
             raiseEvent("DINV.identifyComplete", tostring(singleId))
         end
+        if DINV and DINV.api and DINV.api._onIdentifyComplete and singleId then
+            pcall(DINV.api._onIdentifyComplete, tostring(singleId))
+        end
         dbot.debug("buildComplete: single-item identify complete for objId=" .. tostring(singleId), "inv.items")
-        tempTimer(0.1, function()
-            if inv and inv.items and inv.items.processDeferredIdentifyQueue then
-                inv.items.processDeferredIdentifyQueue("buildComplete")
-            end
-        end)
+        inv.items.scheduleDeferredIdentifyProcessing("buildComplete")
+        inv.items.maybeStartKeepFlagSync()
         return
     end
+
+    local wasPartialIdentify = inv.items.partialIdentifyMode
+        or inv.items.identifyPartialOnly
 
     inv.items.buildInProgress = false
     inv.items.identifyInProgress = false
@@ -3078,6 +3833,9 @@ function inv.items.buildComplete()
     if DINV and DINV.setBuildPhase then
         DINV.setBuildPhase(0)
 		sendGMCP("config prompt on")
+    end
+    if inv.organize and inv.organize.syncRulesFromConfig then
+        inv.organize.syncRulesFromConfig({ warnMissing = false, saveItems = false })
     end
 
     -- Count results
@@ -3106,9 +3864,19 @@ function inv.items.buildComplete()
 
     -- Save data
     if inv.items.save then inv.items.save() end
-    if inv.config and inv.config.save then inv.config.save() end
-    if inv.config and inv.config.table then
-        inv.config.table.isBuildExecuted = true
+    if not wasPartialIdentify then
+        if inv.config and inv.config.save then inv.config.save() end
+        if inv.config and inv.config.table then
+            inv.config.table.isBuildExecuted = true
+        end
+    end
+
+    if wasPartialIdentify then
+        dbot.note("Partial identify complete. Fully identified: " ..
+            tostring(identifiedItems) .. "; partial: " .. tostring(partialItems) .. ".")
+        inv.items.maybeStartKeepFlagSync()
+        inv.items.scheduleDeferredIdentifyProcessing("partialIdentifyComplete")
+        return
     end
 
     -- Print results
@@ -3137,6 +3905,13 @@ function inv.items.buildComplete()
     if endTag and inv.tags and inv.tags.stop then
         inv.tags.stop(invTagsBuild, endTag, DRL_RET_SUCCESS)
     end
+    local buildOriginalTable = inv.items.buildOriginalTable
+    inv.items.buildOriginalTable = nil
+    if DINV and DINV.api and DINV.api._onBuildComplete then
+        pcall(DINV.api._onBuildComplete, buildOriginalTable)
+    end
+    inv.items.maybeStartKeepFlagSync()
+    inv.items.scheduleDeferredIdentifyProcessing("buildComplete")
 end
 
 function inv.items.buildAbort()
@@ -3168,6 +3943,7 @@ function inv.items.buildAbort()
     inv.items.identifyCreatedMissing = {}
     inv.items.identifySawOutput = {}
     inv.items.identifyHydratedFromInvdata = {}
+    inv.items.buildOriginalTable = nil
     inv.state = invStateIdle
     if DINV and DINV.setBuildPhase then
         DINV.setBuildPhase(0)
@@ -3188,6 +3964,7 @@ function inv.items.buildAbort()
         inv.tags.stop(invTagsBuild, endTag, DRL_RET_HALTED)
     end
 
+    inv.items.maybeStartKeepFlagSync()
     return DRL_RET_SUCCESS
 end
 
@@ -3509,6 +4286,16 @@ function inv.items.onInvmon(dataLine)
         inv.items.scheduleSaveFromInvmon()
     end
 
+    if DINV and DINV.api and DINV.api._onInventoryAction then
+        pcall(DINV.api._onInventoryAction, objId, actionName, {
+            previousLocation = preLocation,
+            previousContainer = preContainer,
+            existedBefore = item ~= nil or preLocation ~= "unknown",
+            containerId = containerId,
+            wearLocation = wearLoc,
+        })
+    end
+
     return DRL_RET_SUCCESS
 end
 
@@ -3691,6 +4478,129 @@ end
 -- Search Functions
 ----------------------------------------------------------------------------------------------------
 
+function inv.items.hasSearchFlag(objId, value)
+    local normalized = tostring(value or ""):lower()
+    if normalized == "kept" then
+        return inv.items.getStatField(objId, invStatFieldKeepflag) == true
+    end
+
+    local flagsStr = inv.items.getStatField(objId, invStatFieldFlags) or ""
+    for flag in tostring(flagsStr):gmatch("%S+") do
+        flag = flag:gsub(",", "")
+        if string.find(string.lower(flag), normalized, 1, true) ~= nil then
+            return true
+        end
+    end
+    return false
+end
+
+function inv.items.matchesParsedQuery(objId, clauses)
+    local item = inv.items.getItem(objId)
+    if not item then
+        return false
+    end
+
+    local itemName = inv.items.getStatField(objId, invStatFieldName) or ""
+    local itemType = inv.items.getStatField(objId, invStatFieldType) or ""
+    local level = tonumber(inv.items.getStatField(objId, invStatFieldLevel)) or 0
+    local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
+    local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
+
+    for _, criteria in ipairs(clauses or {}) do
+        local matchedAll = true
+
+        for _, entry in ipairs(criteria) do
+            local key = tostring(entry.key or ""):lower()
+            local value = entry.value
+            local negated = entry.negated
+            local match = false
+
+            if key == "type" then
+                match = string.lower(itemType) == string.lower(value)
+            elseif key == "name" then
+                local relativeIndex, relativeName = inv.items.convertRelative(value)
+                local target = relativeIndex and relativeName or value
+                match = string.find(string.lower(itemName), string.lower(target), 1, true) ~= nil
+            elseif key == "wearable" then
+                match = string.find(string.lower(wearable), string.lower(value), 1, true) ~= nil
+            elseif key == "keyword" or key == "keywords" then
+                local keywordsStr = inv.items.getStatField(objId, invStatFieldKeywords) or ""
+                for word in tostring(keywordsStr):gmatch("%S+") do
+                    word = word:gsub(",", "")
+                    if string.find(string.lower(word), string.lower(value), 1, true) ~= nil then
+                        match = true
+                        break
+                    end
+                end
+            elseif key == invStatFieldLeadsTo then
+                local leadsTo = inv.items.getStatField(objId, invStatFieldLeadsTo) or ""
+                match = string.find(string.lower(leadsTo), string.lower(value), 1, true) ~= nil
+            elseif key == invStatFieldMaterial then
+                local material = inv.items.getStatField(objId, invStatFieldMaterial) or ""
+                match = string.find(string.lower(material), string.lower(value), 1, true) ~= nil
+            elseif key == "flag" or key == "flags" then
+                match = inv.items.hasSearchFlag(objId, value)
+            elseif key == "id" then
+                match = tostring(objId) == tostring(value)
+            elseif key == "container" then
+                match = tostring(container) == tostring(value)
+            elseif key == "location" or key == "loc" then
+                local location = inv.items.getStatField(objId, invStatFieldLocation) or ""
+                match = string.find(string.lower(tostring(location)), string.lower(tostring(value)), 1, true) ~= nil
+            elseif key == "rname" then
+                local _, relVal = inv.items.convertRelative(value)
+                local target = relVal or value
+                match = string.find(string.lower(itemName), string.lower(tostring(target)), 1, true) ~= nil
+            elseif key == "rlocation" or key == "rloc" then
+                local _, relVal = inv.items.convertRelative(value)
+                local target = relVal or value
+                local location = inv.items.getStatField(objId, invStatFieldLocation) or ""
+                match = string.find(string.lower(tostring(location)), string.lower(tostring(target)), 1, true) ~= nil
+            elseif key == "worn" then
+                match = inv.items.isWorn(objId)
+            elseif key == "minlevel" then
+                local minLevel = tonumber(value)
+                match = minLevel ~= nil and level >= minLevel
+            elseif key == "maxlevel" then
+                local maxLevel = tonumber(value)
+                match = maxLevel ~= nil and level <= maxLevel
+            elseif key == "level" then
+                local exactLevel = tonumber(value)
+                match = exactLevel ~= nil and level == exactLevel
+            elseif inv.items.isKnownQueryKey(key) then
+                local statValue = inv.items.getStatField(objId, key)
+                local lhs = tostring(statValue or ""):lower()
+                local rhs = tostring(value or ""):lower()
+                local lhsNum = tonumber(lhs)
+                local rhsNum = tonumber(rhs)
+                if lhsNum ~= nil and rhsNum ~= nil then
+                    match = (lhsNum == rhsNum)
+                else
+                    match = string.find(lhs, rhs, 1, true) ~= nil
+                end
+            end
+
+            if negated then
+                match = not match
+            end
+            if not match then
+                matchedAll = false
+                break
+            end
+        end
+
+        if matchedAll then
+            return true
+        end
+    end
+
+    return false
+end
+
+function inv.items.matchesQuery(objId, query)
+    return inv.items.matchesParsedQuery(objId, inv.items.parseQuery(query or ""))
+end
+
 function inv.items.search(query, displayMode)
     displayMode = displayMode or "basic"
 
@@ -3702,140 +4612,9 @@ function inv.items.search(query, displayMode)
     local results = {}
     local clauses = inv.items.parseQuery(query or "")
 
-    for objId, item in pairs(inv.items.table) do
-        local itemName = inv.items.getStatField(objId, invStatFieldName) or ""
-        local itemType = inv.items.getStatField(objId, invStatFieldType) or ""
-        local level = tonumber(inv.items.getStatField(objId, invStatFieldLevel)) or 0
-        local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
-        local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
-        local wornLoc = inv.items.getStatField(objId, invStatFieldWorn) or ""
-
-        local clauseMatch = false
-        for _, criteria in ipairs(clauses) do
-            local matchedAll = true
-            local relativeIndex = nil
-            local relativeName = nil
-
-            for _, entry in ipairs(criteria) do
-                local key = tostring(entry.key or ""):lower()
-                local value = entry.value
-                local negated = entry.negated
-                local match = false
-
-                if key == "type" then
-                    match = string.lower(itemType) == string.lower(value)
-                elseif key == "name" then
-                    relativeIndex, relativeName = inv.items.convertRelative(value)
-                    if relativeIndex then
-                        match = string.find(string.lower(itemName), string.lower(relativeName), 1, true) ~= nil
-                    else
-                        match = string.find(string.lower(itemName), string.lower(value), 1, true) ~= nil
-                    end
-                elseif key == "wearable" then
-                    match = string.find(string.lower(wearable), string.lower(value), 1, true) ~= nil
-                elseif key == "keyword" or key == "keywords" then
-                    local keywordsStr = inv.items.getStatField(objId, invStatFieldKeywords) or ""
-                    for word in keywordsStr:gmatch("%S+") do
-                        word = word:gsub(",", "")
-                        if string.find(string.lower(word), string.lower(value), 1, true) ~= nil then
-                            match = true
-                            break
-                        end
-                    end
-                elseif key == invStatFieldLeadsTo then
-                    local leadsTo = inv.items.getStatField(objId, invStatFieldLeadsTo) or ""
-                    match = string.find(string.lower(leadsTo), string.lower(value), 1, true) ~= nil
-                elseif key == invStatFieldMaterial then
-                    local material = inv.items.getStatField(objId, invStatFieldMaterial) or ""
-                    match = string.find(string.lower(material), string.lower(value), 1, true) ~= nil
-                elseif key == "flag" or key == "flags" then
-                    local flagsStr = inv.items.getStatField(objId, invStatFieldFlags) or ""
-                    for flag in flagsStr:gmatch("%S+") do
-                        flag = flag:gsub(",", "")
-                        if string.find(string.lower(flag), string.lower(value), 1, true) ~= nil then
-                            match = true
-                            break
-                        end
-                    end
-                elseif key == "id" then
-                    match = tostring(objId) == tostring(value)
-                elseif key == "container" then
-                    match = tostring(container) == tostring(value)
-                elseif key == "location" or key == "loc" then
-                    local location = inv.items.getStatField(objId, invStatFieldLocation) or ""
-                    match = string.find(string.lower(tostring(location)), string.lower(tostring(value)), 1, true) ~= nil
-                elseif key == "rname" then
-                    local relIdx, relVal = inv.items.convertRelative(value)
-                    local target = relVal or value
-                    local hay = string.lower(itemName)
-                    local needle = string.lower(tostring(target))
-                    match = string.find(hay, needle, 1, true) ~= nil
-                    if match and relIdx then
-                        relativeIndex = relIdx
-                        relativeName = target
-                    end
-                elseif key == "rlocation" or key == "rloc" then
-                    local relIdx, relVal = inv.items.convertRelative(value)
-                    local target = relVal or value
-                    local location = inv.items.getStatField(objId, invStatFieldLocation) or ""
-                    match = string.find(string.lower(tostring(location)), string.lower(tostring(target)), 1, true) ~= nil
-                    if match and relIdx then
-                        relativeIndex = relIdx
-                        relativeName = target
-                    end
-                elseif key == "worn" then
-                    match = inv.items.isWorn(objId)
-                elseif key == "minlevel" then
-                    local minLevel = tonumber(value)
-                    if minLevel ~= nil then
-                        match = level >= minLevel
-                    else
-                        match = false
-                    end
-                elseif key == "maxlevel" then
-                    local maxLevel = tonumber(value)
-                    if maxLevel ~= nil then
-                        match = level <= maxLevel
-                    else
-                        match = false
-                    end
-                elseif key == "level" then
-                    local exactLevel = tonumber(value)
-                    if exactLevel ~= nil then
-                        match = level == exactLevel
-                    else
-                        match = false
-                    end
-                elseif inv.items.isKnownQueryKey(key) then
-                    local statValue = inv.items.getStatField(objId, key)
-                    local lhs = tostring(statValue or ""):lower()
-                    local rhs = tostring(value or ""):lower()
-                    local lhsNum = tonumber(lhs)
-                    local rhsNum = tonumber(rhs)
-                    if lhsNum ~= nil and rhsNum ~= nil then
-                        match = (lhsNum == rhsNum)
-                    else
-                        match = string.find(lhs, rhs, 1, true) ~= nil
-                    end
-                end
-
-                if negated then
-                    match = not match
-                end
-
-                if not match then
-                    matchedAll = false
-                    break
-                end
-            end
-
-            if matchedAll then
-                clauseMatch = true
-                break
-            end
-        end
-
-        if clauseMatch then
+    for objId, _ in pairs(inv.items.table) do
+        if inv.items.matchesParsedQuery(objId, clauses) then
+            local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
             if container ~= "" and inv.config.isIgnored(container) then
                 -- Skip ignored containers.
             else
@@ -3953,6 +4732,8 @@ function inv.items.displayItem(objId, displayMode, options)
 
     local idColorCode = isItemWornForDisplay() and "@G" or "@Y"
     local idMudletColor = isItemWornForDisplay() and "<green>" or "<yellow>"
+    local includeId = displayMode ~= "basic"
+    local includeExtendedStats = displayMode ~= "basic"
 
     local function printLine(msg)
         local raw = tostring(msg or "")
@@ -4251,6 +5032,53 @@ function inv.items.displayItem(objId, displayMode, options)
                 return out
             end
 
+            local function truncateColoredText(value, width)
+                local raw = tostring(value or "")
+                local limit = tonumber(width) or 0
+                if limit <= 0 or #dbot.stripColors(raw) <= limit then
+                    return raw
+                end
+
+                local suffix = "..."
+                if limit <= #suffix then
+                    return suffix:sub(1, limit)
+                end
+
+                local keep = limit - #suffix
+                local out = {}
+                local visible = 0
+                local idx = 1
+
+                while idx <= #raw and visible < keep do
+                    local c = raw:sub(idx, idx)
+                    if c == "@" then
+                        local escapedAt = raw:sub(idx, idx + 1) == "@@"
+                        local xcode = raw:match("^@x%d+", idx)
+                        if escapedAt then
+                            table.insert(out, "@@")
+                            idx = idx + 2
+                            visible = visible + 1
+                        elseif xcode then
+                            table.insert(out, xcode)
+                            idx = idx + #xcode
+                        elseif idx < #raw then
+                            table.insert(out, raw:sub(idx, idx + 1))
+                            idx = idx + 2
+                        else
+                            table.insert(out, c)
+                            idx = idx + 1
+                            visible = visible + 1
+                        end
+                    else
+                        table.insert(out, c)
+                        idx = idx + 1
+                        visible = visible + 1
+                    end
+                end
+
+                return table.concat(out, "") .. suffix .. "@w"
+            end
+
             local isWeapon = tostring(itemType):lower() == "weapon"
             local weaponType = ""
             local weaponDam = ""
@@ -4316,22 +5144,21 @@ function inv.items.displayItem(objId, displayMode, options)
 
             local wrappedNameLines
             if options and options.truncateName then
-                local plainName = dbot.stripColors(nameText)
-                local limit = tonumber(effectiveNameWidth) or 0
-                if limit > 0 and #plainName > limit then
-                    local keep = math.max(1, limit - 1)
-                    plainName = plainName:sub(1, keep) .. "…"
-                end
-                wrappedNameLines = { plainName }
+                wrappedNameLines = { truncateColoredText(nameText, effectiveNameWidth) }
             else
                 wrappedNameLines = wrapColoredText(nameText, effectiveNameWidth)
             end
 
-            local cells = {
-                idColorCode, formattedId, "@W ",
-                padColored(wrappedNameLines[1] or "", effectiveNameWidth), sep,
-                padColored(levelText, levelWidth), sep,
-            }
+            local cells = {}
+            if includeId then
+                table.insert(cells, idColorCode)
+                table.insert(cells, formattedId)
+                table.insert(cells, "@W ")
+            end
+            table.insert(cells, padColored(wrappedNameLines[1] or "", effectiveNameWidth))
+            table.insert(cells, sep)
+            table.insert(cells, padColored(levelText, levelWidth))
+            table.insert(cells, sep)
 
             if includeWearLoc then
                 table.insert(cells, padColored("@C" .. wearLocCell .. "@w", wearLocWidth))
@@ -4361,23 +5188,28 @@ function inv.items.displayItem(objId, displayMode, options)
             table.insert(cells, sep)
             table.insert(cells, padColored(drText, rollWidth))
             table.insert(cells, sep)
-            table.insert(cells, padColored(hpText, resourceWidth))
-            table.insert(cells, sep)
-            table.insert(cells, padColored(mnText, resourceWidth))
-            table.insert(cells, sep)
-            table.insert(cells, padColored(mvText, resourceWidth))
-            table.insert(cells, sep)
-            table.insert(cells, padColored(risText, risWidth))
+            if includeExtendedStats then
+                table.insert(cells, padColored(hpText, resourceWidth))
+                table.insert(cells, sep)
+                table.insert(cells, padColored(mnText, resourceWidth))
+                table.insert(cells, sep)
+                table.insert(cells, padColored(mvText, resourceWidth))
+                table.insert(cells, sep)
+                table.insert(cells, padColored(risText, risWidth))
+            end
 
             local firstLine = table.concat(cells, "")
             if #wrappedNameLines > 1 then
                 local continuationLines = {}
-                local idBlank = string.rep(" ", #formattedId)
                 for i = 2, #wrappedNameLines do
-                    table.insert(continuationLines, table.concat({
-                        idColorCode, idBlank, "@W ",
-                        padColored(wrappedNameLines[i], effectiveNameWidth)
-                    }, ""))
+                    local continuation = {}
+                    if includeId then
+                        table.insert(continuation, idColorCode)
+                        table.insert(continuation, string.rep(" ", #formattedId))
+                        table.insert(continuation, "@W ")
+                    end
+                    table.insert(continuation, padColored(wrappedNameLines[i], effectiveNameWidth))
+                    table.insert(continuationLines, table.concat(continuation, ""))
                 end
                 line = firstLine .. "\n" .. table.concat(continuationLines, "\n")
             else
@@ -4628,6 +5460,10 @@ function inv.items.store(query, endTag)
     if #itemIds == 0 then
         dbot.info("No items matching '" .. query .. "' found.")
         return DRL_RET_MISSING_ENTRY
+    end
+
+    if inv.organize and inv.organize.syncRulesFromConfig then
+        inv.organize.syncRulesFromConfig({ warnMissing = false })
     end
 
     local function parseOrganizeTypeRules()

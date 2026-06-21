@@ -290,38 +290,163 @@ end
 -- Organize Rules Management
 ----------------------------------------------------------------------------------------------------
 
-function inv.config.addOrganizeRule(containerName, query)
-    if inv.config.table.organizeRules == nil then
-        inv.config.table.organizeRules = {}
-    end
-    
-    if inv.config.table.organizeRules[containerName] == nil then
-        inv.config.table.organizeRules[containerName] = {}
-    end
-    
-    table.insert(inv.config.table.organizeRules[containerName], query)
-    return DRL_RET_SUCCESS
+local function trimOrganizeString(value)
+    return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
 end
 
-function inv.config.clearOrganizeRules(containerName)
-    if inv.config.table.organizeRules then
-        if containerName then
-            inv.config.table.organizeRules[containerName] = nil
-        else
-            inv.config.table.organizeRules = {}
+local function splitOrganizeQuery(query)
+    local rules = {}
+    for clause in tostring(query or ""):gmatch("[^|]+") do
+        local trimmed = trimOrganizeString(clause)
+        if trimmed ~= "" then
+            table.insert(rules, trimmed)
         end
     end
-    return DRL_RET_SUCCESS
+    return rules
+end
+
+local function joinOrganizeRules(rules)
+    local parts = {}
+    if type(rules) == "table" then
+        for _, rule in ipairs(rules) do
+            local trimmed = trimOrganizeString(rule)
+            if trimmed ~= "" then
+                table.insert(parts, trimmed)
+            end
+        end
+    end
+    return table.concat(parts, " || ")
+end
+
+function inv.config.normalizeOrganizeRules()
+    if inv.config.table == nil then
+        inv.config.reset()
+    end
+
+    local current = inv.config.table.organizeRules
+    if type(current) ~= "table" then
+        current = {}
+    end
+
+    local normalized = {}
+    for key, value in pairs(current) do
+        local containerId = trimOrganizeString(key)
+        local label = nil
+        local query = ""
+
+        if type(value) == "table" and (value.id or value.containerId or value.query or value.rules) then
+            containerId = trimOrganizeString(value.id or value.containerId or key)
+            label = value.label or value.name or value.containerName
+            query = trimOrganizeString(value.query or joinOrganizeRules(value.rules))
+        elseif type(value) == "table" then
+            -- Legacy shape: organizeRules[containerName] = { "type potion", ... }
+            label = tostring(key)
+            query = joinOrganizeRules(value)
+        elseif type(value) == "string" then
+            query = trimOrganizeString(value)
+        end
+
+        if containerId ~= "" and query ~= "" then
+            normalized[containerId] = {
+                id = containerId,
+                query = query,
+                rules = splitOrganizeQuery(query),
+            }
+            if label ~= nil and tostring(label) ~= "" then
+                normalized[containerId].label = tostring(label)
+            end
+        end
+    end
+
+    inv.config.table.organizeRules = normalized
+    return normalized
+end
+
+function inv.config.getOrganizeRules()
+    return inv.config.normalizeOrganizeRules()
+end
+
+function inv.config.getOrganizeRule(containerId)
+    local normalizedId = trimOrganizeString(containerId)
+    if normalizedId == "" then
+        return nil
+    end
+
+    local rules = inv.config.getOrganizeRules()
+    return rules[normalizedId]
+end
+
+function inv.config.getOrganizeQuery(containerId)
+    local entry = inv.config.getOrganizeRule(containerId)
+    if entry == nil then
+        return ""
+    end
+    return trimOrganizeString(entry.query or joinOrganizeRules(entry.rules))
+end
+
+function inv.config.setOrganizeRule(containerId, query, label)
+    local normalizedId = trimOrganizeString(containerId)
+    local normalizedQuery = trimOrganizeString(query)
+    if normalizedId == "" then
+        return DRL_RET_INVALID_PARAM
+    end
+
+    local rules = inv.config.getOrganizeRules()
+    if normalizedQuery == "" then
+        rules[normalizedId] = nil
+    else
+        rules[normalizedId] = {
+            id = normalizedId,
+            query = normalizedQuery,
+            rules = splitOrganizeQuery(normalizedQuery),
+        }
+        if label ~= nil and tostring(label) ~= "" then
+            rules[normalizedId].label = tostring(label)
+        end
+    end
+
+    return inv.config.save()
+end
+
+function inv.config.addOrganizeRule(containerId, query, label)
+    local normalizedId = trimOrganizeString(containerId)
+    local normalizedQuery = trimOrganizeString(query)
+    if normalizedId == "" or normalizedQuery == "" then
+        return DRL_RET_INVALID_PARAM
+    end
+
+    local existingQuery = inv.config.getOrganizeQuery(normalizedId)
+    if existingQuery ~= "" then
+        normalizedQuery = existingQuery .. " || " .. normalizedQuery
+    end
+
+    return inv.config.setOrganizeRule(normalizedId, normalizedQuery, label)
+end
+
+function inv.config.clearOrganizeRules(containerId)
+    local rules = inv.config.getOrganizeRules()
+    if containerId then
+        rules[trimOrganizeString(containerId)] = nil
+    else
+        inv.config.table.organizeRules = {}
+    end
+    return inv.config.save()
 end
 
 function inv.config.displayOrganizeRules()
-    local rules = inv.config.get("organizeRules") or {}
+    local rules = inv.config.getOrganizeRules()
     local count = 0
     
     dbot.print("@WOrganize Rules:@w")
-    for containerName, queries in pairs(rules) do
-        dbot.print("  @CContainer:@W " .. containerName)
-        for i, query in ipairs(queries) do
+    for containerId, entry in pairs(rules) do
+        local label = entry.label
+        if label and label ~= "" then
+            dbot.print("  @CContainer:@W " .. containerId .. " (" .. tostring(label) .. ")")
+        else
+            dbot.print("  @CContainer:@W " .. containerId)
+        end
+
+        for i, query in ipairs(entry.rules or splitOrganizeQuery(entry.query)) do
             dbot.print("    @G" .. i .. ".@w " .. query)
             count = count + 1
         end

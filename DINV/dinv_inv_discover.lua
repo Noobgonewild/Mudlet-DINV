@@ -25,6 +25,8 @@ inv.discover.state = inv.discover.state or {
     parsedCount = 0,
     totalToInspect = 0,
     scoreProgressStep = 10,
+    activeContext = nil,
+    resultContext = nil,
 }
 
 inv.cli.discover = inv.cli.discover or {}
@@ -148,10 +150,12 @@ local function clearRuntime(keepCache)
     st.itemWork = nil
     st.eligiblePriorities = {}
     st.priorityFilter = nil
+    st.tempIdentifyPrevious = {}
     if not keepCache then
         st.cachedResults = {}
         st.cachedAt = nil
         st.itemCache = {}
+        st.resultContext = nil
     end
     unregisterTriggers()
 end
@@ -212,15 +216,42 @@ local function sendSilentCommand(cmd)
     end
 end
 
+local function markTransientItem(item)
+    item = item or {}
+    item.__dinvTransient = true
+    item.stats = item.stats or {}
+    item.stats.__dinvTransient = true
+    return item
+end
+
+local function setTransientItem(objId, item)
+    inv.items.setItem(objId, markTransientItem(item), { silentApi = true })
+end
+
+local function restoreTransientItem(objId, previous)
+    if previous then
+        inv.items.setItem(objId, previous, { silentApi = true })
+    else
+        inv.items.removeItem(objId, { silentApi = true })
+    end
+end
+
 local function beginTempIdentifyParse(objId)
     if not objId then
         return
     end
 
     local idNum = tonumber(objId) or objId
+    local key = tostring(idNum)
+    local st = inv.discover.state
+    st.tempIdentifyPrevious = st.tempIdentifyPrevious or {}
+    if st.tempIdentifyPrevious[key] == nil then
+        st.tempIdentifyPrevious[key] = copyTable(inv.items.getItem(idNum)) or false
+    end
     inv.items.currentIdentifyId = idNum
+    inv.items.identifyCurrentId = idNum
     inv.items.identifyResetId = nil
-    inv.items.setItem(idNum, {
+    setTransientItem(idNum, {
         stats = {
             [invStatFieldId] = tostring(objId),
         },
@@ -246,9 +277,20 @@ clearTempIdentifyParse = function(objId)
     end
 
     local idNum = tonumber(objId) or objId
-    inv.items.removeItem(idNum)
+    local key = tostring(idNum)
+    local st = inv.discover.state
+    local previous = st.tempIdentifyPrevious and st.tempIdentifyPrevious[key]
+    if previous ~= nil then
+        restoreTransientItem(idNum, previous ~= false and previous or nil)
+        st.tempIdentifyPrevious[key] = nil
+    else
+        inv.items.removeItem(idNum, { silentApi = true })
+    end
     if inv.items.currentIdentifyId == idNum then
         inv.items.currentIdentifyId = nil
+    end
+    if inv.items.identifyCurrentId == idNum then
+        inv.items.identifyCurrentId = nil
     end
     if inv.items.identifyResetId == idNum then
         inv.items.identifyResetId = nil
@@ -257,24 +299,34 @@ end
 
 local function discoverEligiblePriorities(priorityFilter)
     local out = {}
+    local stale = {}
     local tableData = (inv.analyze and inv.analyze.table) or {}
 
     if priorityFilter and priorityFilter ~= "" then
         local data = tableData[priorityFilter]
         if data and data.levels and next(data.levels) then
+            local staleReason = inv.analyze and inv.analyze.getStaleReason and inv.analyze.getStaleReason(priorityFilter) or nil
+            if staleReason then
+                stale[#stale + 1] = { name = priorityFilter, reason = staleReason }
+            end
             out[#out + 1] = priorityFilter
-            return out, DRL_RET_SUCCESS
+            return out, DRL_RET_SUCCESS, stale
         end
-        return out, DRL_RET_MISSING_ENTRY
+        return out, DRL_RET_MISSING_ENTRY, stale
     end
 
     for priorityName, data in pairs(tableData) do
         if data and data.levels and next(data.levels) then
+            local staleReason = inv.analyze and inv.analyze.getStaleReason and inv.analyze.getStaleReason(priorityName) or nil
+            if staleReason then
+                stale[#stale + 1] = { name = priorityName, reason = staleReason }
+            end
             out[#out + 1] = priorityName
         end
     end
     table.sort(out)
-    return out, DRL_RET_SUCCESS
+    table.sort(stale, function(a, b) return tostring(a.name) < tostring(b.name) end)
+    return out, DRL_RET_SUCCESS, stale
 end
 
 local function emitScoredRow(entry)
@@ -374,70 +426,6 @@ local function emitScoredRow(entry)
     return nil
 end
 
-function inv.discover.showPriorityAnalysis(auctionNum, priorityName)
-    local entry = findCachedEntryByAuctionNum(auctionNum)
-    local pr = tostring(priorityName or "")
-    if not entry then
-        dbot.warn("No cached discover result found for auction #" .. tostring(auctionNum))
-        return DRL_RET_MISSING_ENTRY
-    end
-
-    local details = entry.priorityDetails and entry.priorityDetails[pr] or nil
-    if not details or #details == 0 then
-        dbot.warn("No cached discover analysis for auction #" .. tostring(auctionNum) .. " priority '" .. pr .. "'.")
-        return DRL_RET_MISSING_ENTRY
-    end
-
-    dbot.print("@WDiscover Analysis:@w")
-    if cecho and cechoLink then
-        cecho("  <cyan>Target<white>: <reset>")
-        cechoLink(
-            "<yellow>" .. tostring(auctionNum) .. "<reset>",
-            "send([[lbid " .. tostring(auctionNum) .. "]])",
-            "Run: lbid " .. tostring(auctionNum),
-            true
-        )
-        cecho("<white> Auction #" .. tostring(auctionNum) .. " <yellow>(level " .. tostring(entry.level or "?") .. ")<reset>\n")
-    else
-        dbot.print("  @CTarget@W: " .. tostring(auctionNum) .. " Auction #" .. tostring(auctionNum) .. " @Y(level " .. tostring(entry.level or "?") .. ")@w")
-    end
-    dbot.print("  @CPriority@W: " .. pr)
-    dbot.print("  @CBest score delta@W: @G+" .. tostring(roundInt((entry.priorityScores or {})[pr] or 0)) .. "@w")
-    dbot.print("  @CPositive levels@W: " .. tostring((entry.priorityLevelRanges or {})[pr] or "-"))
-    dbot.print("")
-
-    local idx = 1
-    while idx <= #details do
-        local start = idx
-        local delta = roundInt(details[idx].scoreDelta or 0)
-        while idx + 1 <= #details
-            and (details[idx + 1].level == details[idx].level + 1)
-            and roundInt(details[idx + 1].scoreDelta or 0) == delta do
-            idx = idx + 1
-        end
-
-        local startLvl = details[start].level
-        local endLvl = details[idx].level
-        if startLvl == endLvl then
-            dbot.print(string.format("  @D-- @WLevel %d@w  @Gscore +%d@w", startLvl, delta))
-        else
-            dbot.print(string.format("  @D-- @WLevels %d-%d@w  @Gscore +%d@w", startLvl, endLvl, delta))
-        end
-        idx = idx + 1
-    end
-
-    return DRL_RET_SUCCESS
-end
-local function findCachedEntryByAuctionNum(auctionNum)
-    local st = inv.discover.state
-    local key = tostring(auctionNum or "")
-    for _, entry in ipairs(st.cachedResults or {}) do
-        if tostring(entry.num or "") == key then
-            return entry
-        end
-    end
-    return nil
-end
 local function findCachedEntryByAuctionNum(auctionNum)
     local st = inv.discover.state
     local key = tostring(auctionNum or "")
@@ -484,21 +472,17 @@ function inv.discover.showPriorityAnalysis(auctionNum, priorityName)
     tempItem.stats[invStatFieldColorName] = "Auction #" .. key
     tempItem.stats[invStatFieldLocation] = "auction"
 
-    inv.items.setItem(key, tempItem)
+    setTransientItem(key, tempItem)
 
     local ok, retval = pcall(function()
         return inv.compare.covetAnalyze(pr, tonumber(key) or key, 1)
     end)
 
-    if previous then
-        inv.items.setItem(key, previous)
-    else
-        inv.items.removeItem(key)
-    end
+    restoreTransientItem(key, previous)
 
     if not ok then
         dbot.warn("Failed to render discover analysis for auction #" .. tostring(auctionNum))
-        return DRL_RET_OPERATION_FAILED
+        return DRL_RET_INTERNAL_ERROR
     end
 
     return retval or DRL_RET_SUCCESS
@@ -580,94 +564,99 @@ local function buildTemporaryItem(item)
         end
     end
 
-    inv.items.setItem(objId, {
+    setTransientItem(objId, {
         stats = stats,
-        location = invItemLocInventory,
+        location = "auction",
     })
 
     return objId, previous
 end
 
 local function restoreTemporaryItem(objId, previous)
-    if previous then
-        inv.items.setItem(objId, previous)
-    else
-        inv.items.removeItem(objId)
-    end
+    restoreTransientItem(objId, previous)
 end
 
 local function scoreItemAgainstPriorities(item, priorities)
     local objId, previous = buildTemporaryItem(item)
-    local locs = (inv.compare and inv.compare._expandWearLocations and inv.compare._expandWearLocations(objId)) or {}
-    local betterFor = {}
-    local priorityScores = {}
-    local priorityLevelRanges = {}
-    local priorityDetails = {}
-    local totalScore = 0
-    local itemLevel = getItemLevelForScore(item)
-    local tier = (dbot.gmcp and dbot.gmcp.getTier and dbot.gmcp.getTier()) or 0
-    local tierBonus = tier * 10
-    local minLevel = math.max(1, itemLevel - tierBonus)
-    local maxLevel = 201
+    local ok, totalScore, betterFor, priorityScores, priorityLevelRanges, priorityDetails = pcall(function()
+        local locs = (inv.compare and inv.compare._expandWearLocations and inv.compare._expandWearLocations(objId)) or {}
+        local foundBetterFor = {}
+        local foundPriorityScores = {}
+        local foundPriorityLevelRanges = {}
+        local foundPriorityDetails = {}
+        local foundTotalScore = 0
+        local itemLevel = getItemLevelForScore(item)
+        local tier = (dbot.gmcp and dbot.gmcp.getTier and dbot.gmcp.getTier()) or 0
+        local tierBonus = tier * 10
+        local minLevel = math.max(1, itemLevel - tierBonus)
+        local maxLevel = 201
 
-    for _, priorityName in ipairs(priorities) do
-        local analysis = inv.analyze.table and inv.analyze.table[priorityName]
-        local levels = analysis and analysis.levels or nil
-        local bestDelta = 0
-        local positiveLevels = {}
-        local rows = {}
-        local positiveDeltaSum = 0
-        local positiveDeltaCount = 0
+        for _, priorityName in ipairs(priorities) do
+            local analysis = inv.analyze.table and inv.analyze.table[priorityName]
+            local levels = analysis and analysis.levels or nil
+            local bestDelta = 0
+            local positiveLevels = {}
+            local rows = {}
+            local positiveDeltaSum = 0
+            local positiveDeltaCount = 0
 
-        if levels then
-            for lvl = minLevel, maxLevel do
-                local entry = levels[tostring(lvl)]
-                if entry and entry.equipment then
-                    local effectiveLevel = lvl + tierBonus
-                    local levelBestDelta = nil
+            if levels then
+                for lvl = minLevel, maxLevel do
+                    local entry = levels[tostring(lvl)]
+                    if entry and entry.equipment then
+                        local effectiveLevel = lvl + tierBonus
+                        local levelBestDelta = nil
 
-                    for loc in pairs(locs) do
-                        local wornId = entry.equipment[loc]
-                        if wornId then
-                            local targetScore = inv.score.getItemScoreForLoc(objId, priorityName, effectiveLevel, loc)
-                            local wornScore = inv.score.getItemScoreForLoc(wornId, priorityName, effectiveLevel, loc)
-                            local delta = (tonumber(targetScore) or 0) - (tonumber(wornScore) or 0)
-                            if not levelBestDelta or delta > levelBestDelta then
-                                levelBestDelta = delta
+                        for loc in pairs(locs) do
+                            local wornId = entry.equipment[loc]
+                            if wornId then
+                                local targetScore = inv.score.getItemScoreForLoc(objId, priorityName, effectiveLevel, loc)
+                                local wornScore = inv.score.getItemScoreForLoc(wornId, priorityName, effectiveLevel, loc)
+                                local delta = (tonumber(targetScore) or 0) - (tonumber(wornScore) or 0)
+                                if not levelBestDelta or delta > levelBestDelta then
+                                    levelBestDelta = delta
+                                end
                             end
                         end
-                    end
 
-                    if levelBestDelta and levelBestDelta > bestDelta then
-                        bestDelta = levelBestDelta
-                    end
-                    if levelBestDelta and levelBestDelta > 0 then
-                        positiveLevels[#positiveLevels + 1] = lvl
-                        rows[#rows + 1] = {
-                            level = lvl,
-                            scoreDelta = levelBestDelta,
-                        }
-                        positiveDeltaSum = positiveDeltaSum + levelBestDelta
-                        positiveDeltaCount = positiveDeltaCount + 1
+                        if levelBestDelta and levelBestDelta > bestDelta then
+                            bestDelta = levelBestDelta
+                        end
+                        if levelBestDelta and levelBestDelta > 0 then
+                            positiveLevels[#positiveLevels + 1] = lvl
+                            rows[#rows + 1] = {
+                                level = lvl,
+                                scoreDelta = levelBestDelta,
+                            }
+                            positiveDeltaSum = positiveDeltaSum + levelBestDelta
+                            positiveDeltaCount = positiveDeltaCount + 1
+                        end
                     end
                 end
             end
+
+            if bestDelta > 0 then
+                foundBetterFor[#foundBetterFor + 1] = priorityName
+                local averageDelta = 0
+                if positiveDeltaCount > 0 then
+                    averageDelta = roundInt(positiveDeltaSum / positiveDeltaCount)
+                end
+                foundPriorityScores[priorityName] = averageDelta
+                foundPriorityLevelRanges[priorityName] = formatLevelRanges(positiveLevels)
+                foundPriorityDetails[priorityName] = rows
+                foundTotalScore = foundTotalScore + averageDelta
+            end
         end
 
-        if bestDelta > 0 then
-            betterFor[#betterFor + 1] = priorityName
-            local averageDelta = 0
-            if positiveDeltaCount > 0 then
-                averageDelta = roundInt(positiveDeltaSum / positiveDeltaCount)
-            end
-            priorityScores[priorityName] = averageDelta
-            priorityLevelRanges[priorityName] = formatLevelRanges(positiveLevels)
-            priorityDetails[priorityName] = rows
-            totalScore = totalScore + averageDelta
-        end
-    end
+        return foundTotalScore, foundBetterFor, foundPriorityScores, foundPriorityLevelRanges, foundPriorityDetails
+    end)
 
     restoreTemporaryItem(objId, previous)
+
+    if not ok then
+        warn("Failed to score market item #" .. tostring(item and item.num or objId) .. ": " .. tostring(totalScore))
+        return 0, {}, {}, {}, {}
+    end
 
     return totalScore, betterFor, priorityScores, priorityLevelRanges, priorityDetails
 end
@@ -722,12 +711,18 @@ local function scoreCollectedItems()
 
     st.cachedResults = scored
     st.cachedAt = os.time()
+    st.resultContext = inv.context and inv.context.copy and inv.context.copy(st.activeContext)
+        or (inv.context and inv.context.capture and inv.context.capture())
 
     return scored
 end
 
 local function printCachedResults()
     local st = inv.discover.state
+    local staleReason = inv.context and inv.context.getStaleReason and inv.context.getStaleReason(st.resultContext) or nil
+    if st.cachedAt and staleReason then
+        warn("Cached scan results are stale: " .. staleReason .. ". Displaying them anyway; run dinv discover scan to refresh them.")
+    end
     if not st.cachedResults or #st.cachedResults == 0 then
         info("no scored upgrades in cache")
         return DRL_RET_SUCCESS
@@ -809,6 +804,7 @@ function inv.discover.onRawItemLine(v)
 
     if inv.items and inv.items.onIdentifyLine then
         inv.items.currentIdentifyId = tonumber(st.currentNum) or st.currentNum
+        inv.items.identifyCurrentId = inv.items.currentIdentifyId
         inv.items.onIdentifyLine(v or "")
     end
 
@@ -1041,6 +1037,15 @@ function inv.discover.registerTriggers()
         end
     )
 
+    st.triggers.emptyLine = tempRegexTrigger(
+        "^\\s*$",
+        function()
+            if inv.discover.state.busy and deleteLine then
+                deleteLine()
+            end
+        end
+    )
+
     st.triggers.listRow = tempRegexTrigger(
         "^\\s*(\\d+)\\s+(.+?)\\s+(\\d+)\\s+(\\*?\\s*\\S+)\\s+((?:[\\d,]+(?:\\*)?)|[A-Za-z]+)\\s+(\\d+)\\s+(?:(?:\\d+\\s+day[s]?\\s+and\\s+)|(?:\\d+d\\s+))?\\d{2}:\\d{2}:\\d{2}\\s*$",
         function()
@@ -1147,7 +1152,11 @@ function inv.discover.scan(priorityFilter)
         return DRL_RET_MISSING_ENTRY
     end
 
-    local priorities, retval = discoverEligiblePriorities(priorityFilter)
+    local priorities, retval, stalePriorities = discoverEligiblePriorities(priorityFilter)
+    for _, staleEntry in ipairs(stalePriorities or {}) do
+        warn("Analysis '" .. tostring(staleEntry.name) .. "' is stale: " .. tostring(staleEntry.reason) .. ".")
+        dbot.info("Run @Gdinv analyze create " .. tostring(staleEntry.name) .. "@W to refresh it.")
+    end
     if retval ~= DRL_RET_SUCCESS or #priorities == 0 then
         warn("No eligible analysis data found for discover scan.")
         if priorityFilter and priorityFilter ~= "" then
@@ -1160,6 +1169,7 @@ function inv.discover.scan(priorityFilter)
     st.busy = true
     st.priorityFilter = priorityFilter
     st.eligiblePriorities = priorities
+    st.activeContext = inv.context and inv.context.capture and inv.context.capture() or nil
 
     local itemCacheSize = 0
     for _ in pairs(st.itemCache or {}) do
@@ -1201,6 +1211,8 @@ function inv.discover.clearType()
     st.cachedResults = {}
     st.cachedAt = nil
     st.itemCache = {}
+    st.activeContext = nil
+    st.resultContext = nil
     dbot.info("Discover type and cached results cleared.")
     return DRL_RET_SUCCESS
 end

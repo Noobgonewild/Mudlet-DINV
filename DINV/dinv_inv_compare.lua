@@ -65,6 +65,16 @@ local function covetDebugDumpItem(item)
     }, ", ")
 end
 
+local function covetMarkTransientItem(item)
+    if type(item) ~= "table" then
+        return item
+    end
+    item.__dinvTransient = true
+    item.stats = item.stats or {}
+    item.stats.__dinvTransient = true
+    return item
+end
+
 local function covetCleanup(removeTemp)
     local pkg = inv.compare.covetPkg
     if not pkg then
@@ -94,7 +104,7 @@ local function covetCleanup(removeTemp)
         if inv.items.removeItemFromCache then
             inv.items.removeItemFromCache(pkg.objId, item)
         end
-        inv.items.removeItem(pkg.objId)
+        inv.items.removeItem(pkg.objId, { silentApi = true })
     end
 
     inv.compare.covetPkg = nil
@@ -109,7 +119,7 @@ function inv.compare._covetFinishFromMarket()
     local item = inv.items.getItem and inv.items.getItem(pkg.objId) or nil
     local itemName = item and item.stats and item.stats[invStatFieldName] or nil
     if item and item.stats then
-        inv.items.setItem(pkg.objId, item)
+        inv.items.setItem(pkg.objId, covetMarkTransientItem(item), { silentApi = true })
     end
 
     if not itemName or itemName == "" then
@@ -138,9 +148,11 @@ function inv.compare._covetFinishFromMarket()
     end
 
     dbot.info("Evaluating market item '#" .. tostring(pkg.auctionNum) .. "' against analyzed level sets.")
-    inv.compare.covetAnalyze(pkg.priorityName, pkg.objId, pkg.skipLevels)
+    local analyzeRetval = inv.compare.covetAnalyze(pkg.priorityName, pkg.objId, pkg.skipLevels, {
+        analysisChecked = pkg.analysisChecked == true,
+    })
     covetCleanup(true)
-    return inv.tags.stop(invTagsCovet, pkg.endTag, DRL_RET_SUCCESS)
+    return inv.tags.stop(invTagsCovet, pkg.endTag, analyzeRetval or DRL_RET_SUCCESS)
 end
 
 function inv.compare._expandWearLocations(itemId)
@@ -293,6 +305,12 @@ end
 
 function inv.compare.covetAnalyze(priorityName, targetId, skipLevels, opts)
     opts = opts or {}
+    if not opts.analysisChecked and inv.analyze and inv.analyze.checkAvailable then
+        local fresh, freshRetval = inv.analyze.checkAvailable(priorityName, "Covet/compare")
+        if not fresh then
+            return freshRetval
+        end
+    end
     local analysisData = inv.analyze and inv.analyze.table and inv.analyze.table[priorityName] or nil
     if not analysisData or not analysisData.levels then
         dbot.warn("Covet requires analysis data. Run 'dinv analyze create " .. priorityName .. "' first.")
@@ -718,13 +736,13 @@ function inv.compare.items(priorityName, itemName, skipLevels, endTag)
                      or inv.items.getStatField(targetId, invStatFieldName)
                      or tostring(targetId)
 
-    inv.compare.covetAnalyze(priorityName, targetId, skipLevels, {
+    local compareRetval = inv.compare.covetAnalyze(priorityName, targetId, skipLevels, {
         title           = "@WCompare Results:@w",
         targetLabel     = targetLabel,
         skipTargetHeader = true,
     })
 
-    return inv.tags.stop(invTagsCompare, endTag, DRL_RET_SUCCESS)
+    return inv.tags.stop(invTagsCompare, endTag, compareRetval or DRL_RET_SUCCESS)
 end
 
 function inv.compare.covet(priorityName, auctionNum, skipLevels, endTag)
@@ -740,6 +758,14 @@ function inv.compare.covet(priorityName, auctionNum, skipLevels, endTag)
         return inv.tags.stop(invTagsCovet, endTag, DRL_RET_MISSING_ENTRY)
     end
 
+
+    if inv.analyze and inv.analyze.checkAvailable then
+        local fresh, freshRetval = inv.analyze.checkAvailable(priorityName, "Covet")
+        if not fresh then
+            return inv.tags.stop(invTagsCovet, endTag, freshRetval)
+        end
+    end
+
     local objId = tonumber(auctionNum)
     if not objId then
         dbot.warn("inv.compare.covet: auction # must be numeric")
@@ -749,8 +775,8 @@ function inv.compare.covet(priorityName, auctionNum, skipLevels, endTag)
     local cachedItem = inv.items.getItem(objId)
     if cachedItem then
         dbot.info("Auction #" .. objId .. " is already in memory; evaluating against analyzed level sets.")
-        inv.compare.covetAnalyze(priorityName, objId, skipLevels)
-        return inv.tags.stop(invTagsCovet, endTag, DRL_RET_SUCCESS)
+        local covetRetval = inv.compare.covetAnalyze(priorityName, objId, skipLevels, { analysisChecked = true })
+        return inv.tags.stop(invTagsCovet, endTag, covetRetval or DRL_RET_SUCCESS)
     end
 
     if inv.compare.covetPkg then
@@ -762,7 +788,13 @@ function inv.compare.covet(priorityName, auctionNum, skipLevels, endTag)
     local marketCmd = (objId < threshold) and "bid " or "lbid "
     local fence = "DINV covet fence " .. tostring(objId) .. " " .. tostring(os.time())
 
-    inv.items.setItem(objId, { stats = { [invStatFieldId] = tostring(objId), identifyLevel = invIdLevelNone, [invStatFieldLocation] = "auction" } })
+    inv.items.setItem(objId, covetMarkTransientItem({
+        stats = {
+            [invStatFieldId] = tostring(objId),
+            identifyLevel = invIdLevelNone,
+            [invStatFieldLocation] = "auction",
+        },
+    }), { silentApi = true })
     inv.compare.covetPkg = {
         priorityName = priorityName,
         auctionNum = objId,
@@ -771,6 +803,7 @@ function inv.compare.covet(priorityName, auctionNum, skipLevels, endTag)
         endTag = endTag,
         fence = fence,
         addedTempItem = true,
+        analysisChecked = true,
     }
 
     inv.items.inIdentify = true
