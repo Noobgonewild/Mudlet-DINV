@@ -2572,10 +2572,11 @@ function inv.items.onInvitem(dataLine)
         end
     end
 
-    if objId and (not persisted or not (persisted.stats and persisted.stats.identifyLevel == invIdLevelFull)) then
-        local retval = inv.items.buildSingleItem(objId, "invitem")
-        if retval == DRL_RET_BUSY or retval == DRL_RET_IN_COMBAT then
-            inv.items.enqueueDeferredIdentify(objId, "invitem")
+    if objId then
+        local item = inv.items.getItem(objId)
+        local idLevel = item and item.stats and item.stats.identifyLevel
+        if idLevel ~= invIdLevelFull then
+            dbot.debug("onInvitem: stored partial item data; full identify deferred to build/refresh", "inv.items")
         end
     end
 
@@ -5758,6 +5759,16 @@ function inv.items.resolveStoreContainer(objId, isUsableContainerFn)
             return nil
         end
 
+        -- Ignored containers must never become automatic storage destinations,
+        -- even when an item's stale lastStored/container field points at one.
+        if inv.config and inv.config.isIgnored and inv.config.isIgnored(normalized) then
+            return nil
+        end
+
+        if isUsableContainerFn then
+            return isUsableContainerFn(normalized)
+        end
+
         local containerItem = inv.items.table and inv.items.table[normalized]
         if not containerItem then
             return nil
@@ -5772,7 +5783,7 @@ function inv.items.resolveStoreContainer(objId, isUsableContainerFn)
         return nil
     end
 
-    local usableContainer = isUsableContainerFn or isUsableContainer
+    local usableContainer = isUsableContainer
     local lastStored = inv.items.getStatField(objId, invStatFieldLastStored)
     local normalizedLastStored = usableContainer(lastStored)
     if normalizedLastStored then
