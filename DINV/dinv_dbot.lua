@@ -513,8 +513,11 @@ function dbot.ensureDirectory(path)
         local cacheKey = normalized
 
         if dbot.ensuredDirectories[cacheKey] then
-            dbot.perf("ensureDirectory cached " .. cacheKey, perfStart)
-            return
+            if lfs.attributes(cacheKey, "mode") == "directory" then
+                dbot.perf("ensureDirectory cached " .. cacheKey, perfStart)
+                return
+            end
+            dbot.ensuredDirectories[cacheKey] = nil
         end
 
         if lfs.attributes(normalized, "mode") == "directory" then
@@ -1095,6 +1098,8 @@ dbot.backup.inProgress = false
 dbot.backup.timer = {}
 dbot.backup.timer.name = "drlInvBackupTimer"
 dbot.backup.timer.intervalSeconds = 4 * 60 * 60 + 30  -- 4 hours, 30 seconds
+dbot.backup.automaticPrefix = "auto-"
+dbot.backup.maxAutomatic = 3
 
 function dbot.backup._sanitizeName(name)
     if name == nil or name == "" then
@@ -1105,6 +1110,24 @@ function dbot.backup._sanitizeName(name)
         cleaned = os.date("backup-%Y%m%d-%H%M%S")
     end
     return cleaned
+end
+
+function dbot.backup._normalizeDirPath(dirPath)
+    local normalized = tostring(dirPath or ""):gsub("\\", "/")
+    -- Keep filesystem roots intact while removing trailing separators that some
+    -- Windows LuaFileSystem builds reject in attributes/dir/rmdir calls.
+    if normalized == "/" or normalized:match("^%a:/$") then
+        return normalized
+    end
+    return normalized:gsub("/+$", "")
+end
+
+function dbot.backup._joinPath(dirPath, entry)
+    local normalized = dbot.backup._normalizeDirPath(dirPath)
+    if normalized == "" or normalized:sub(-1) == "/" then
+        return normalized .. tostring(entry or "")
+    end
+    return normalized .. "/" .. tostring(entry or "")
 end
 
 function dbot.backup._copyFile(sourcePath, destPath)
@@ -1125,12 +1148,13 @@ end
 
 function dbot.backup._listFiles(dirPath)
     local files = {}
-    if not lfs then
+    dirPath = dbot.backup._normalizeDirPath(dirPath)
+    if not lfs or lfs.attributes(dirPath, "mode") ~= "directory" then
         return files
     end
     for entry in lfs.dir(dirPath) do
         if entry ~= "." and entry ~= ".." then
-            local fullPath = dirPath .. entry
+            local fullPath = dbot.backup._joinPath(dirPath, entry)
             local attr = lfs.attributes(fullPath)
             if attr and attr.mode == "file" then
                 table.insert(files, entry)
@@ -1142,12 +1166,13 @@ end
 
 function dbot.backup._listDirs(dirPath)
     local dirs = {}
-    if not lfs then
+    dirPath = dbot.backup._normalizeDirPath(dirPath)
+    if not lfs or lfs.attributes(dirPath, "mode") ~= "directory" then
         return dirs
     end
     for entry in lfs.dir(dirPath) do
         if entry ~= "." and entry ~= ".." then
-            local fullPath = dirPath .. entry
+            local fullPath = dbot.backup._joinPath(dirPath, entry)
             local attr = lfs.attributes(fullPath)
             if attr and attr.mode == "directory" then
                 table.insert(dirs, entry)
@@ -1162,19 +1187,27 @@ function dbot.backup._removeDir(dirPath)
     if not lfs then
         return false
     end
+    dirPath = dbot.backup._normalizeDirPath(dirPath)
+    if lfs.attributes(dirPath, "mode") ~= "directory" then
+        return true
+    end
     for entry in lfs.dir(dirPath) do
         if entry ~= "." and entry ~= ".." then
-            local fullPath = dirPath .. entry
+            local fullPath = dbot.backup._joinPath(dirPath, entry)
             local attr = lfs.attributes(fullPath)
             if attr and attr.mode == "directory" then
-                dbot.backup._removeDir(fullPath .. "/")
+                if not dbot.backup._removeDir(fullPath) then
+                    return false
+                end
             else
-                os.remove(fullPath)
+                local removed = os.remove(fullPath)
+                if not removed then
+                    return false
+                end
             end
         end
     end
-    lfs.rmdir(dirPath)
-    return true
+    return lfs.rmdir(dirPath) and true or false
 end
 
 function dbot.backup.init.atInstall()
@@ -1187,13 +1220,16 @@ function dbot.backup.init.atActive()
     
     -- Set up periodic backup timer
     if tempTimer then
-        tempTimer(dbot.backup.timer.intervalSeconds, [[dbot.backup.current()]], true)
+        dbot.deleteTimer(dbot.backup.timer.name)
+        dbot.timers[dbot.backup.timer.name] =
+            tempTimer(dbot.backup.timer.intervalSeconds, [[dbot.backup.current()]], true)
     end
     
     return DRL_RET_SUCCESS
 end
 
 function dbot.backup.fini(doSaveState)
+    dbot.deleteTimer(dbot.backup.timer.name)
     return DRL_RET_SUCCESS
 end
 
@@ -1216,12 +1252,80 @@ function dbot.backup.getCurrentDir()
 end
 
 function dbot.backup.getBackupDir()
+    if DINV and DINV.database and DINV.database.getBackupDirectory then
+        return DINV.database.getBackupDirectory(), DRL_RET_SUCCESS
+    end
     local name = dbot.gmcp.getName()
-    return getPluginStatePath() .. name .. "/backup/", DRL_RET_SUCCESS
+    return getMudletHomeDir() .. "/dinv-database/" .. tostring(name) .. "/backup/", DRL_RET_SUCCESS
+end
+
+function dbot.backup.getLegacyBackupDirs()
+    local name = tostring(dbot.gmcp.getName() or "Unknown")
+    local candidates = {
+        getPluginStatePath() .. name .. "/backup/",
+        getMudletHomeDir() .. "/dinv-unknown/" .. name .. "/backup/",
+    }
+    if pluginId and tostring(pluginId) ~= "" then
+        table.insert(candidates, getMudletHomeDir() .. "/dinv-" .. tostring(pluginId) ..
+            "/" .. name .. "/backup/")
+    end
+    local unique, result = {}, {}
+    for _, candidate in ipairs(candidates) do
+        local normalized = tostring(candidate):gsub("\\", "/")
+        if not unique[normalized] then
+            unique[normalized] = true
+            table.insert(result, normalized)
+        end
+    end
+    return result
+end
+
+function dbot.backup.find(name)
+    local backupName = dbot.backup._sanitizeName(name)
+    local currentDir = dbot.backup.getBackupDir() .. backupName .. "/"
+    local currentFile = currentDir .. "dinv.db"
+    if lfs and lfs.attributes(currentFile, "mode") == "file" then
+        return "sqlite", currentDir, currentFile
+    end
+    for _, root in ipairs(dbot.backup.getLegacyBackupDirs()) do
+        local legacyDir = root .. backupName .. "/"
+        if lfs and lfs.attributes(legacyDir .. "inv-items.state", "mode") == "file" then
+            return "legacy", legacyDir, nil
+        end
+    end
+    return nil
+end
+
+local function reloadPersistentModules()
+    local loaderNames = {
+        "config", "items", "cache", "priority", "set", "statBonus",
+        "consume", "snapshot", "tags", "analyze", "levelup",
+    }
+    for _, moduleName in ipairs(loaderNames) do
+        local module = inv and inv[moduleName]
+        if module and module.load then
+            local loadRet = module.load()
+            if loadRet ~= nil and loadRet ~= DRL_RET_SUCCESS then
+                return false, "module inv." .. tostring(moduleName) .. " could not be reloaded"
+            end
+        end
+    end
+    if dbot.notify and dbot.notify.load then
+        local loadRet = dbot.notify.load()
+        if loadRet ~= nil and loadRet ~= DRL_RET_SUCCESS then
+            return false, "notification state could not be reloaded"
+        end
+    end
+    if DINV.debug and DINV.debug.load then
+        local loadRet = DINV.debug.load()
+        if loadRet ~= nil and loadRet ~= DRL_RET_SUCCESS then
+            return false, "debug state could not be reloaded"
+        end
+    end
+    return true
 end
 
 function dbot.backup.current()
-    -- Placeholder for automatic backup functionality
     if not dbot.gmcp.isInitialized then
         return DRL_RET_UNINITIALIZED
     end
@@ -1229,9 +1333,49 @@ function dbot.backup.current()
     if not dbot.init.initializedActive then
         return DRL_RET_UNINITIALIZED
     end
-    
-    dbot.debug("dbot.backup.current: Automatic backup triggered", "dbot.backup")
-    return DRL_RET_SUCCESS
+    if dbot.backup.inProgress then
+        return DRL_RET_BUSY
+    end
+    if inv and inv.items and (inv.items.buildInProgress or inv.items.refreshInProgress
+        or inv.items.identifyInProgress) then
+        dbot.debug("dbot.backup.current: workflow active; automatic backup deferred to next interval",
+            "dbot.backup")
+        return DRL_RET_BUSY
+    end
+
+    dbot.backup.inProgress = true
+    local ok, retval = pcall(function()
+        local backupName = dbot.backup.automaticPrefix .. os.date("%Y%m%d-%H%M%S")
+        local createRet = dbot.backup.create(backupName, nil)
+        if createRet ~= DRL_RET_SUCCESS then
+            return createRet
+        end
+
+        local automatic = {}
+        local backupDir = dbot.backup.getBackupDir()
+        for _, name in ipairs(dbot.backup._listDirs(backupDir)) do
+            if name:sub(1, #dbot.backup.automaticPrefix) == dbot.backup.automaticPrefix then
+                table.insert(automatic, name)
+            end
+        end
+        table.sort(automatic)
+        while #automatic > dbot.backup.maxAutomatic do
+            local oldest = table.remove(automatic, 1)
+            if not dbot.backup._removeDir(backupDir .. oldest .. "/") then
+                dbot.warn("Unable to remove expired automatic backup " .. oldest)
+                return DRL_RET_INTERNAL_ERROR
+            end
+            dbot.debug("Removed expired automatic backup " .. oldest, "dbot.backup")
+        end
+        return DRL_RET_SUCCESS
+    end)
+    -- Always release the guard, including unexpected filesystem/SQLite errors.
+    dbot.backup.inProgress = false
+    if not ok then
+        dbot.warn("Automatic backup failed: " .. tostring(retval))
+        return DRL_RET_INTERNAL_ERROR
+    end
+    return retval
 end
 
 function dbot.backup.create(name, endTag)
@@ -1239,26 +1383,56 @@ function dbot.backup.create(name, endTag)
         dbot.warn("Backup creation requires LuaFileSystem (lfs)")
         return DRL_RET_UNSUPPORTED
     end
+    if inv and inv.items and (inv.items.buildInProgress or inv.items.refreshInProgress
+        or inv.items.identifyInProgress) then
+        dbot.warn("Cannot create a backup while an inventory workflow is active")
+        return DRL_RET_BUSY
+    end
 
     local backupName = dbot.backup._sanitizeName(name)
-    local currentDir = dbot.backup.getCurrentDir()
-    local backupDir = dbot.backup.getBackupDir()
-    local targetDir = backupDir .. backupName .. "/"
+    local backupDir = dbot.backup._normalizeDirPath(dbot.backup.getBackupDir())
+    local targetDir = dbot.backup._joinPath(backupDir, backupName)
+    local targetFile = dbot.backup._joinPath(targetDir, "dinv.db")
 
     dbot.ensureDirectory(backupDir)
-    dbot.ensureDirectory(targetDir)
+    if lfs.attributes(targetDir, "mode") == "directory"
+        or lfs.attributes(targetFile, "mode") == "file" then
+        dbot.warn("Backup '" .. backupName .. "' already exists")
+        return DRL_RET_BUSY
+    end
 
-    local files = dbot.backup._listFiles(currentDir)
-    for _, fileName in ipairs(files) do
-        local sourcePath = currentDir .. fileName
-        local destPath = targetDir .. fileName
-        if not dbot.backup._copyFile(sourcePath, destPath) then
-            dbot.warn("Failed to copy file '" .. fileName .. "' to backup '" .. backupName .. "'")
+    if not DINV or not DINV.database or not DINV.database.createBackupSnapshot then
+        dbot.warn("SQLite backup support is unavailable")
+        return DRL_RET_UNSUPPORTED
+    end
+    if inv and inv.items and inv.items.save then
+        local saveRet = inv.items.save()
+        if saveRet ~= DRL_RET_SUCCESS and saveRet ~= DRL_RET_UNINITIALIZED then
+            dbot.warn("Unable to flush inventory before backup: " .. dbot.retval.getString(saveRet))
             return DRL_RET_INTERNAL_ERROR
         end
     end
+    -- Do not create the destination directory until all preflight/flush work
+    -- succeeds; failed automatic runs must not leave empty entries in `backup list`.
+    dbot.ensureDirectory(targetDir)
+    if lfs.attributes(targetDir, "mode") ~= "directory" then
+        dbot.warn("Unable to create backup directory '" .. targetDir .. "'")
+        return DRL_RET_INTERNAL_ERROR
+    end
+    local callOk, backupOk, backupErr = pcall(DINV.database.createBackupSnapshot, targetFile)
+    if not callOk then
+        backupErr = backupOk
+        backupOk = false
+    end
+    if not backupOk then
+        if lfs.attributes(targetDir) then
+            dbot.backup._removeDir(targetDir)
+        end
+        dbot.warn("Failed to create SQLite backup '" .. backupName .. "': " .. tostring(backupErr))
+        return DRL_RET_INTERNAL_ERROR
+    end
 
-    dbot.info("Created backup '" .. backupName .. "' with " .. #files .. " file(s)")
+    dbot.info("Created consistent SQLite backup '" .. backupName .. "'")
     if inv and inv.tags and inv.tags.stop then
         return inv.tags.stop(invTagsBackup, endTag, DRL_RET_SUCCESS)
     end
@@ -1272,16 +1446,22 @@ function dbot.backup.delete(name, endTag, isQuiet)
     end
 
     local backupName = dbot.backup._sanitizeName(name)
-    local backupDir = dbot.backup.getBackupDir() .. backupName .. "/"
+    local _, backupDir = dbot.backup.find(backupName)
 
-    if lfs.attributes(backupDir) == nil then
+    if not backupDir
+        or lfs.attributes(dbot.backup._normalizeDirPath(backupDir)) == nil then
         if not isQuiet then
             dbot.warn("Backup '" .. backupName .. "' does not exist")
         end
         return DRL_RET_MISSING_ENTRY
     end
 
-    dbot.backup._removeDir(backupDir)
+    if not dbot.backup._removeDir(backupDir) then
+        if not isQuiet then
+            dbot.warn("Unable to delete backup '" .. backupName .. "'")
+        end
+        return DRL_RET_INTERNAL_ERROR
+    end
     if not isQuiet then
         dbot.info("Deleted backup '" .. backupName .. "'")
     end
@@ -1299,32 +1479,132 @@ function dbot.backup.restore(name, endTag)
     end
 
     local backupName = dbot.backup._sanitizeName(name)
-    local backupDir = dbot.backup.getBackupDir() .. backupName .. "/"
-    local currentDir = dbot.backup.getCurrentDir()
-
-    if lfs.attributes(backupDir) == nil then
+    local backupKind, backupDir, backupFile = dbot.backup.find(backupName)
+    if not backupKind then
         dbot.warn("Backup '" .. backupName .. "' does not exist")
         return DRL_RET_MISSING_ENTRY
     end
-
-    dbot.ensureDirectory(currentDir)
-
-    local currentFiles = dbot.backup._listFiles(currentDir)
-    for _, fileName in ipairs(currentFiles) do
-        os.remove(currentDir .. fileName)
+    if inv and inv.items and (inv.items.buildInProgress or inv.items.refreshInProgress
+        or inv.items.identifyInProgress) then
+        dbot.warn("Cannot restore a backup while an inventory workflow is active")
+        return DRL_RET_BUSY
+    end
+    if inv and inv.operations and next(inv.operations.active or {}) ~= nil then
+        dbot.warn("Cannot restore a backup while an observed operation is active")
+        return DRL_RET_BUSY
+    end
+    if not DINV or not DINV.database or not DINV.database.getFile then
+        dbot.warn("SQLite restore support is unavailable")
+        return DRL_RET_UNSUPPORTED
     end
 
-    local backupFiles = dbot.backup._listFiles(backupDir)
-    for _, fileName in ipairs(backupFiles) do
-        local sourcePath = backupDir .. fileName
-        local destPath = currentDir .. fileName
-        if not dbot.backup._copyFile(sourcePath, destPath) then
-            dbot.warn("Failed to restore file '" .. fileName .. "' from backup '" .. backupName .. "'")
+    if backupKind == "legacy" then
+        if not DINV.database.restoreLegacyStateDirectory then
+            dbot.warn("Legacy state backup restore support is unavailable")
+            return DRL_RET_UNSUPPORTED
+        end
+        local restored, restoreErr = DINV.database.restoreLegacyStateDirectory(backupDir)
+        if not restored then
+            dbot.warn("Legacy backup was not restored: " .. tostring(restoreErr))
+            return DRL_RET_INTERNAL_ERROR
+        end
+        local loaded, loadErr = reloadPersistentModules()
+        if not loaded then
+            dbot.warn("Legacy backup was imported, but " .. tostring(loadErr))
+            return DRL_RET_INTERNAL_ERROR
+        end
+        dbot.info("Restored legacy state backup '" .. backupName .. "' into SQLite")
+        if inv and inv.tags and inv.tags.stop then
+            return inv.tags.stop(invTagsBackup, endTag, DRL_RET_SUCCESS)
+        end
+        return DRL_RET_SUCCESS
+    end
+
+    local currentFile = DINV.database.getFile()
+    local currentDir = DINV.database.getDirectory()
+    local restoreToken = string.format("%d-%06d", os.time(), math.random(0, 999999))
+    local restoreFile = currentFile .. ".restore-new-" .. restoreToken
+    local rollbackFile = currentFile .. ".restore-rollback-" .. restoreToken
+    dbot.ensureDirectory(currentDir)
+    os.remove(restoreFile)
+    if not dbot.backup._copyFile(backupFile, restoreFile) then
+        dbot.warn("Failed to stage backup '" .. backupName .. "' for restore")
+        return DRL_RET_INTERNAL_ERROR
+    end
+    if not DINV.database.quickCheckFile then
+        os.remove(restoreFile)
+        dbot.warn("Staged backup validation support is unavailable")
+        return DRL_RET_UNSUPPORTED
+    end
+    local stagedHealthy, stagedDetail = DINV.database.quickCheckFile(restoreFile)
+    if not stagedHealthy then
+        os.remove(restoreFile)
+        dbot.warn("Backup '" .. backupName .. "' failed validation: " .. tostring(stagedDetail))
+        return DRL_RET_INTERNAL_ERROR
+    end
+
+    DINV.database.close()
+    os.remove(currentFile .. "-wal")
+    os.remove(currentFile .. "-shm")
+    local hadCurrent = lfs.attributes(currentFile, "mode") == "file"
+    if hadCurrent then
+        local moved, moveErr = os.rename(currentFile, rollbackFile)
+        if not moved then
+            os.remove(restoreFile)
+            DINV.database.reopenAfterExternalReplace()
+            dbot.warn("Unable to stage current database for restore: " .. tostring(moveErr))
             return DRL_RET_INTERNAL_ERROR
         end
     end
+    local installed, installErr = os.rename(restoreFile, currentFile)
+    if not installed then
+        if hadCurrent then os.rename(rollbackFile, currentFile) end
+        DINV.database.reopenAfterExternalReplace()
+        dbot.warn("Unable to install restored database: " .. tostring(installErr))
+        return DRL_RET_INTERNAL_ERROR
+    end
 
-    dbot.info("Restored backup '" .. backupName .. "' (" .. #backupFiles .. " file(s))")
+    local function rollbackRestore(reason)
+        DINV.database.close()
+        os.remove(currentFile .. "-wal")
+        os.remove(currentFile .. "-shm")
+        os.remove(currentFile)
+        local rollbackOk = true
+        local rollbackErr = nil
+        if hadCurrent then
+            rollbackOk, rollbackErr = os.rename(rollbackFile, currentFile)
+        end
+        local reopened, reopenPreviousErr = DINV.database.reopenAfterExternalReplace()
+        if not rollbackOk or not reopened then
+            dbot.warn("Restore failed and the previous database could not be reopened automatically: " ..
+                tostring(rollbackErr or reopenPreviousErr))
+        else
+            reloadPersistentModules()
+        end
+        return reason
+    end
+
+    local reopened, reopenErr = DINV.database.reopenAfterExternalReplace()
+    if not reopened then
+        dbot.warn("Database restore failed: " ..
+            tostring(rollbackRestore("restored database could not be reopened: " .. tostring(reopenErr))))
+        return DRL_RET_INTERNAL_ERROR
+    end
+    local healthy, healthDetail = DINV.database.quickCheck()
+    if not healthy then
+        dbot.warn("Database restore failed: " ..
+            tostring(rollbackRestore("restored database failed quick_check: " .. tostring(healthDetail))))
+        return DRL_RET_INTERNAL_ERROR
+    end
+    local loaded, loadErr = reloadPersistentModules()
+    if not loaded then
+        dbot.warn("Database restore failed: " .. tostring(rollbackRestore(loadErr)))
+        return DRL_RET_INTERNAL_ERROR
+    end
+
+    if hadCurrent then os.remove(rollbackFile) end
+
+    dbot.info("Restored SQLite backup '" .. backupName .. "'")
     if inv and inv.tags and inv.tags.stop then
         return inv.tags.stop(invTagsBackup, endTag, DRL_RET_SUCCESS)
     end
@@ -1340,13 +1620,30 @@ function dbot.backup.list(endTag)
     local backupDir = dbot.backup.getBackupDir()
     dbot.ensureDirectory(backupDir)
 
-    local backups = dbot.backup._listDirs(backupDir)
+    local backups = {}
+    local seen = {}
+    for _, backupName in ipairs(dbot.backup._listDirs(backupDir)) do
+        seen[backupName] = true
+        table.insert(backups, { name = backupName, legacy = false })
+    end
+    for _, legacyRoot in ipairs(dbot.backup.getLegacyBackupDirs()) do
+        if lfs.attributes(dbot.backup._normalizeDirPath(legacyRoot), "mode") == "directory" then
+            for _, backupName in ipairs(dbot.backup._listDirs(legacyRoot)) do
+                if not seen[backupName]
+                    and lfs.attributes(legacyRoot .. backupName .. "/inv-items.state", "mode") == "file" then
+                    seen[backupName] = true
+                    table.insert(backups, { name = backupName, legacy = true })
+                end
+            end
+        end
+    end
+    table.sort(backups, function(left, right) return left.name < right.name end)
     dbot.print("@WBackups:@w")
     if #backups == 0 then
         dbot.print("  @Y(none)@w")
     else
-        for _, backupName in ipairs(backups) do
-            dbot.print("  @G" .. backupName .. "@w")
+        for _, backup in ipairs(backups) do
+            dbot.print("  @G" .. backup.name .. (backup.legacy and " @Y(legacy state)" or "") .. "@w")
         end
     end
 
@@ -1902,7 +2199,11 @@ dbot.version.changelog = {}
 dbot.version.update = {}
 
 function dbot.version.display()
-    dbot.print("@WDINV Version: @G" .. (DINV.version or "unknown"))
+    local version = DINV.version or "unknown"
+    if type(version) == "table" then
+        version = string.format("%d.%04d", tonumber(version.major) or 0, tonumber(version.minor) or 0)
+    end
+    dbot.print("@WDINV Version: @G" .. tostring(version))
 end
 
 ----------------------------------------------------------------------------------------------------

@@ -153,6 +153,42 @@ Available topics: build, refresh, identify, search, query, set, priority, analyz
 ]])
 end
 
+-- Hidden diagnostics: available through `dinv help developer`, intentionally
+-- omitted from the normal command list.
+inv.cli.developer = {}
+
+function inv.cli.developer.usage()
+    dbot.printRaw(string.format("@W    %-50s @w- %s",
+        pluginNameCmd .. " help developer", "SQLite and operation diagnostics"))
+end
+
+function inv.cli.developer.examples()
+    dbot.print("@YDeveloper diagnostics@W")
+    if DINV and DINV.database and DINV.database.getStatus then
+        local status = DINV.database.getStatus()
+        dbot.print("  @CDatabase:@W " .. tostring(status.file or "unavailable"))
+        dbot.print("  @CCharacter:@W " .. tostring(status.character or "unknown"))
+        dbot.print(string.format(
+            "  @CItems:@W active=%d detached=%d pending-removal=%d staged=%d consumable-templates=%d module-stores=%d",
+            tonumber(status.activeItems) or 0,
+            tonumber(status.detachedItems) or 0,
+            tonumber(status.pendingRemovedItems) or 0,
+            tonumber(status.stagedItems) or 0,
+            tonumber(status.consumableTemplates) or 0,
+            tonumber(status.moduleNamespaces) or 0
+        ))
+        local healthy, detail = DINV.database.quickCheck()
+        dbot.print("  @CSQLite quick_check:@W " .. (healthy and "@Gok@W" or ("@R" .. tostring(detail) .. "@W")))
+    else
+        dbot.print("  @RSQLite database is not initialized.@W")
+    end
+    local activeOperations = inv.operations and inv.operations.active
+        and dbot.table.getNumEntries(inv.operations.active) or 0
+    dbot.print("  @CObserved operations in progress:@W " .. tostring(activeOperations))
+    dbot.print("  @CRefresh generation:@W " .. tostring(inv.items and inv.items.refreshGeneration or 0))
+    dbot.print("  @CInvmon event sequence:@W " .. tostring(inv.items and inv.items.eventSequence or 0))
+end
+
 ----------------------------------------------------------------------------------------------------
 -- Full Usage Display
 ----------------------------------------------------------------------------------------------------
@@ -439,9 +475,12 @@ Shows the current inventory tracking status. Changes to your inventory are
 tracked automatically via invmon/invitem events.
 
 Refresh scans worn equipment, main inventory, and each known container. Items
-not seen in that scan are removed from persistence, and newly seen partial
-items are queued for identify. Kept state is refreshed from each observed
-eqdata/invdata K flag.
+not seen in that scan are removed from active inventory: partial singletons are
+deleted, fully identified singletons are retained temporarily as pending
+removals, and tracked container subtrees are detached. A successful later
+refresh purges pending removals only after their minimum age has elapsed.
+Newly seen partial items are queued for identify. Kept state is refreshed from
+each observed eqdata/invdata K flag.
 
 Subcommands:
   on            Enable automatic refreshes using the configured period.
@@ -501,18 +540,23 @@ end
 
 inv.cli.search = {}
 
-function inv.cli.search.fn(name, line, wildcards)
-    local tokens = wildcards or {}
+local function extractSearchDisplayMode(tokens)
     local displayMode = "objid"
     local explicitMode = false
-    if #tokens > 0 then
-        local mode = tostring(tokens[1]):lower()
-        if mode == "basic" or mode == "objid" or mode == "full" then
-            displayMode = mode
-            explicitMode = true
-            table.remove(tokens, 1)
-        end
+    local mode = tostring(tokens[1] or ""):lower()
+
+    if mode == "basic" or mode == "objid" or mode == "full" then
+        displayMode = mode
+        explicitMode = true
+        table.remove(tokens, 1)
     end
+
+    return displayMode, explicitMode
+end
+
+function inv.cli.search.fn(name, line, wildcards)
+    local tokens = wildcards or {}
+    local displayMode, explicitMode = extractSearchDisplayMode(tokens)
 
     local query = table.concat(tokens, " ")
     local endTag = inv.tags.new(line)
@@ -727,6 +771,7 @@ function inv.cli.report.fn(name, line, wildcards)
         return DRL_RET_UNINITIALIZED
     end
 
+    local displayMode, explicitMode = extractSearchDisplayMode(tokens)
     local query = table.concat(tokens, " ")
     local trimmed = tostring(query or ""):gsub("^%s*(.-)%s*$", "%1")
     if trimmed == "" then
@@ -737,12 +782,16 @@ function inv.cli.report.fn(name, line, wildcards)
     local itemIds, retval = inv.items.search(query)
     if retval == DRL_RET_SUCCESS then
         inv.items.sort(itemIds)
-        local displayMode = trimmed:match("^%d+$") and "itemid" or "basic"
+        if (not explicitMode) and trimmed:match("^%d+$") then
+            displayMode = "itemid"
+        end
         if displayMode ~= "itemid" or channel ~= "echo" then
             inv.items.displayResults(itemIds, displayMode)
         end
         if displayMode == "itemid" and inv.report and inv.report.reportItemIds then
             inv.report.reportItemIds(itemIds, channel)
+        elseif displayMode == "basic" then
+            dbot.info("@WBasic mode omits IDs. Use '@Gdinv report objid <query>@W' to show clickable IDs.")
         elseif displayMode ~= "itemid" then
             dbot.info("@WClick an ID or use '@Gdinv report <itemid>@W' to send a report over the configured channel (@G" ..
                 tostring(channel) .. "@W).")
@@ -754,7 +803,8 @@ end
 
 function inv.cli.report.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s",
-               pluginNameCmd .. " report @G<itemid|itemname|set|channel>", "Report item or set stats"))
+               pluginNameCmd .. " report @G[basic|objid|full] <itemid|itemname|set|channel>",
+               "Report item or search with clickable IDs (default: objid)"))
 end
 
 function inv.cli.report.examples()
@@ -762,7 +812,8 @@ function inv.cli.report.examples()
 Usage:
     dinv report channel @G<channel>@W        - Set the report channel (default: echo)
     dinv report @G<itemid>@W                 - Report an item summary to the configured channel
-    dinv report @G<itemname>@W               - Run a search (reports require an id)
+    dinv report @G<itemname>@W               - Search with clickable object IDs (default: objid)
+    dinv report @G[basic|objid|full] <query>@W - Search using an explicit display mode
     dinv report set @G<priority> [level]@W   - Report set bonuses for a priority
 ]])
 end
@@ -1515,8 +1566,8 @@ Types:
     @Call@W       Clears all cache buckets: recent, frequent, and custom.
     @Crecent@W    Object-id cache for items identified recently. This helps the same
               tracked object keep full stats during normal inventory updates.
-    @Cfrequent@W  Shared name cache for repeat deterministic items: potions, pills,
-              food, wands, staves, scrolls, and raw materials such as ores.
+    @Cfrequent@W  Shared name cache for deterministic consumables only: potions,
+              pills, food, wands, staves, and scrolls.
     @Ccustom@W    Reserved/user-managed cache bucket for explicit cache entries.
 ]])
 end
@@ -2536,9 +2587,6 @@ Display version information.
 Examples:
   1) Display your current version
      "@Gdinv version@W"
-
-  2) Check for updates
-     "@Gdinv version check@W"
 ]])
 end
 

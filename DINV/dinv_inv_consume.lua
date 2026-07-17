@@ -167,35 +167,16 @@ local function itemMatchesConsumeEntry(entry, objId)
 
     return false
 end
-local function loadPersistentItemsTable()
-    if not dbot or not dbot.backup or not dbot.backup.getCurrentDir then
+local function loadPersistentConsumableTemplates()
+    if not DINV or not DINV.database or not DINV.database.listConsumableTemplates then
         return nil
     end
-    local fileName = dbot.backup.getCurrentDir() .. (inv.items and inv.items.stateName or "inv-items.state")
-    local f = io.open(fileName, "r")
-    if f == nil then
-        dbot.debug("inv.consume.add: persistence file not found: " .. fileName, "inv.consume")
+    local templates, err = DINV.database.listConsumableTemplates()
+    if not templates then
+        dbot.warn("inv.consume.add: SQLite consumable lookup failed: " .. tostring(err))
         return nil
     end
-    local content = f:read("*a")
-    f:close()
-    if not content or content == "" then
-        return nil
-    end
-
-    local chunk, err = loadstring(content)
-    if not chunk then
-        dbot.warn("inv.consume.add: Failed to parse persistence file: " .. (err or "unknown"))
-        return nil
-    end
-
-    local env = { inv = { items = {} } }
-    setmetatable(env, { __index = _G })
-    if setfenv then
-        setfenv(chunk, env)
-    end
-    chunk()
-    return env.inv.items.table
+    return templates
 end
 
 local function isConsumableType(itemType)
@@ -208,9 +189,9 @@ local function isConsumableType(itemType)
 end
 
 local function lookupPersistentConsumable(itemName, expectedLevel, expectedType)
-    local itemsTable = loadPersistentItemsTable()
-    if not itemsTable then
-        dbot.debug("inv.consume.add: persistence lookup skipped (no inv-items.state)", "inv.consume")
+    local templates = loadPersistentConsumableTemplates()
+    if not templates then
+        dbot.debug("inv.consume.add: SQLite consumable-template lookup skipped", "inv.consume")
         return nil
     end
 
@@ -226,7 +207,7 @@ local function lookupPersistentConsumable(itemName, expectedLevel, expectedType)
     local bestMatch = nil
     local bestScore = -1
 
-    for _, entry in pairs(itemsTable) do
+    for _, entry in ipairs(templates) do
         local stats = entry and entry.stats
         if stats then
             local itemType = tostring(stats[invStatFieldType] or "")
@@ -346,8 +327,7 @@ function inv.consume.save()
     if inv.consume.table == nil then
         return inv.consume.reset()
     end
-    local retval = dbot.storage.saveTable(dbot.backup.getCurrentDir() .. inv.consume.stateName,
-        "inv.consume.table", inv.consume.table, true)
+    local retval = DINV.database.saveModuleTable("consume", inv.consume.table)
     if retval ~= DRL_RET_SUCCESS and retval ~= DRL_RET_UNINITIALIZED then
         dbot.warn("inv.consume.save: Failed to save consume table: " .. dbot.retval.getString(retval))
     end
@@ -355,10 +335,11 @@ function inv.consume.save()
 end
 
 function inv.consume.load()
-    local retval = dbot.storage.loadTable(dbot.backup.getCurrentDir() .. inv.consume.stateName, inv.consume.reset)
+    local value, retval = DINV.database.loadModuleTable("consume", inv.consume.reset)
+    if value then inv.consume.table = value end
     if retval ~= DRL_RET_SUCCESS then
-        dbot.warn("inv.consume.load: Failed to load table from file \"@R" ..
-            dbot.backup.getCurrentDir() .. inv.consume.stateName .. "@W\": " .. dbot.retval.getString(retval))
+        dbot.warn("inv.consume.load: Failed to load consume rules from SQLite: " ..
+            dbot.retval.getString(retval))
         return retval
     end
 

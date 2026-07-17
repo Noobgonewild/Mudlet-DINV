@@ -51,16 +51,13 @@ function inv.levelup.save()
     if inv.levelup.table == nil then
         return inv.levelup.reset()
     end
-    return dbot.storage.saveTable(
-        dbot.backup.getCurrentDir() .. inv.levelup.name,
-        "inv.levelup.table",
-        inv.levelup.table,
-        true
-    )
+    return DINV.database.saveModuleTable("levelup", inv.levelup.table)
 end
 
 function inv.levelup.load()
-    return dbot.storage.loadTable(dbot.backup.getCurrentDir() .. inv.levelup.name, inv.levelup.reset)
+    local value, retval = DINV.database.loadModuleTable("levelup", inv.levelup.reset)
+    if value then inv.levelup.table = value end
+    return retval
 end
 
 function inv.levelup.init.atInstall()

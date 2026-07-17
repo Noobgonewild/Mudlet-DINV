@@ -29,6 +29,7 @@ DINV.debug.descriptions = DINV.debug.descriptions or {
     ["inv.items"] = "Inventory parsing and item actions.",
     ["inv.keyword"] = "Keyword tagging for items.",
     ["inv.organize"] = "Container organization helpers.",
+    ["inv.operations"] = "Observed item-operation progress and confirmations.",
     ["inv.pass"] = "Pass items to other players.",
     ["inv.portal"] = "Portal usage helpers.",
     ["inv.priority"] = "Priority tables for item scoring.",
@@ -57,20 +58,17 @@ function DINV.debug.reset()
 end
 
 function DINV.debug.load()
-    if dbot and dbot.storage and dbot.backup then
-        return dbot.storage.loadTable(dbot.backup.getCurrentDir() .. DINV.debug.name, DINV.debug.reset)
+    if DINV and DINV.database and DINV.database.loadModuleTable then
+        local value, retval = DINV.database.loadModuleTable("debug", DINV.debug.reset)
+        if value then DINV.debug.table = value end
+        return retval
     end
     return DRL_RET_UNINITIALIZED
 end
 
 function DINV.debug.save()
-    if dbot and dbot.storage and dbot.backup then
-        return dbot.storage.saveTable(
-            dbot.backup.getCurrentDir() .. DINV.debug.name,
-            "DINV.debug.table",
-            DINV.debug.table,
-            true
-        )
+    if DINV and DINV.database and DINV.database.saveModuleTable then
+        return DINV.database.saveModuleTable("debug", DINV.debug.table)
     end
     return DRL_RET_UNINITIALIZED
 end
@@ -311,6 +309,7 @@ end
 -- Initialization
 ----------------------------------------------------------------------------------------------------
 
-DINV.debug.load()
+-- Loaded from inv.init.atActiveDirect after GMCP has supplied the character
+-- name and the per-character database is open.
 
 dbot.debug("debug module loaded", "debug")

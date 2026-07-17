@@ -8,6 +8,8 @@ inv = inv or {}
 inv.items = inv.items or {}
 inv.items.init = inv.items.init or {}
 inv.items.table = inv.items.table or {}
+inv.items.detached = inv.items.detached or {}
+inv.items.pendingRemoved = inv.items.pendingRemoved or {}
 inv.items.timer = inv.items.timer or { name = "drlInvItemsRefreshTimer" }
 inv.items.stateName = inv.items.stateName or "inv-items.state"
 inv.items.keepSync = inv.items.keepSync or {
@@ -25,6 +27,7 @@ inv.items.timer.name = inv.items.timer.name or "drlInvItemsRefreshTimer"
 inv.items.timer.invmonSaveName = inv.items.timer.invmonSaveName or "drlInvItemsInvmonSaveTimer"
 inv.items.timer.keepSyncStartName = inv.items.timer.keepSyncStartName or "drlInvItemsKeepSyncStartTimer"
 inv.items.timer.keepSyncTimeoutName = inv.items.timer.keepSyncTimeoutName or "drlInvItemsKeepSyncTimeoutTimer"
+inv.items.timer.databaseBatchName = inv.items.timer.databaseBatchName or "drlInvItemsDatabaseBatchTimer"
 inv.items.timer.refreshMin = 5
 inv.items.timer.refreshEagerSec = 0
 inv.items.timer.refreshNextTs = nil
@@ -62,6 +65,14 @@ inv.items.refreshIdentifyPartials = inv.items.refreshIdentifyPartials or false
 inv.items.partialIdentifyMode = inv.items.partialIdentifyMode or false
 inv.items.identifyPartialOnly = inv.items.identifyPartialOnly or false
 inv.items.deferredIdentifyQueue = inv.items.deferredIdentifyQueue or {}
+inv.items.eventSequence = inv.items.eventSequence or 0
+inv.items.refreshGeneration = inv.items.refreshGeneration or 0
+inv.items.databaseBuildId = inv.items.databaseBuildId or nil
+inv.items.databaseBuildBatchSize = 10
+inv.items.databaseBuildBatchSeconds = 10
+inv.items.databaseBuildIdentifiedSinceFlush = 0
+inv.items.eventTombstones = inv.items.eventTombstones or {}
+inv.items.workflowRemovalEvents = inv.items.workflowRemovalEvents or {}
 
 function inv.items.getProgressString()
     local p = inv.items.progress
@@ -480,11 +491,26 @@ function inv.items.init.atInstall()
 end
 
 function inv.items.init.atActive()
+    if not DINV or not DINV.database then
+        dbot.warn("inv.items.init.atActive: SQLite database module is not loaded")
+        return DRL_RET_INTERNAL_ERROR
+    end
+
+    local databaseOk, databaseResult = DINV.database.initialize()
+    if not databaseOk then
+        dbot.warn("inv.items.init.atActive: Failed to initialize SQLite persistence: " .. tostring(databaseResult))
+        return DRL_RET_INTERNAL_ERROR
+    end
+
     local retval = inv.items.load()
     if retval ~= DRL_RET_SUCCESS then
-        dbot.warn("inv.items.init.atActive: Failed to load items data from storage: " ..
+        dbot.warn("inv.items.init.atActive: Failed to load items data from SQLite: " ..
                   dbot.retval.getString(retval))
     end
+    inv.items.eventSequence = math.max(
+        tonumber(inv.items.eventSequence) or 0,
+        tonumber(DINV.database.getMaxEventSequence and DINV.database.getMaxEventSequence()) or 0
+    )
     
     -- Set up refresh timer if enabled
     if inv.config.isRefreshEnabled() then
@@ -496,7 +522,26 @@ end
 
 function inv.items.fini(doSaveState)
     local retval = DRL_RET_SUCCESS
-    
+
+    -- A Mudlet profile can reload or reconnect as another character while a
+    -- workflow is in flight. Resolve that workflow against the old database
+    -- before the connection is closed, then clear every runtime-only marker so
+    -- it cannot redirect writes into the next character's build staging.
+    if inv.items.refreshInProgress and inv.items.refreshValidation then
+        inv.items.abortInvalidRefresh({ quiet = true })
+    elseif inv.items.refreshInProgress then
+        inv.items.refreshInProgress = false
+        inv.items.suppressDatabaseWrites = false
+        inv.items.applyWorkflowRemovalEvents("shutdown_refresh")
+    end
+    if inv.items.buildInProgress or inv.items.identifyInProgress then
+        inv.items.buildAbort({ quiet = true, interrupt = true })
+    elseif inv.items.databaseBuildId and DINV and DINV.database
+        and DINV.database.interruptBuild then
+        DINV.database.interruptBuild(inv.items.databaseBuildId)
+        inv.items.databaseBuildId = nil
+    end
+
     if doSaveState then
         retval = inv.items.save()
         if retval ~= DRL_RET_SUCCESS and retval ~= DRL_RET_UNINITIALIZED then
@@ -507,9 +552,31 @@ function inv.items.fini(doSaveState)
     
     -- Clean up timer
     dbot.deleteTimer(inv.items.timer.name)
+    dbot.deleteTimer(inv.items.timer.invmonSaveName)
     dbot.deleteTimer(inv.items.timer.keepSyncStartName)
     dbot.deleteTimer(inv.items.timer.keepSyncTimeoutName)
-    
+    dbot.deleteTimer(inv.items.timer.databaseBatchName)
+
+    inv.items.refreshInProgress = false
+    inv.items.identifyInProgress = false
+    inv.items.buildInProgress = false
+    inv.items.suppressDatabaseWrites = false
+    inv.items.databaseBuildId = nil
+    inv.items.databaseBuildIdentifiedSinceFlush = 0
+    inv.items.refreshValidation = nil
+    inv.items.refreshSeen = nil
+    inv.items.buildOriginalTable = nil
+    inv.items.buildOriginalDetached = nil
+    inv.items.buildOriginalPendingRemoved = nil
+    inv.items.buildStartEventSequence = nil
+    inv.items.workflowRemovalEvents = {}
+    inv.items.eventTombstones = {}
+    inv.items.pendingInvmonSave = nil
+    inv.items.pendingRemoval = {}
+    inv.items.pendingRemoved = {}
+    inv.items._invmonLastPayload = nil
+    inv.items._invmonLastAt = nil
+
     return retval
 end
 
@@ -517,79 +584,88 @@ end
 -- Save/Load/Reset
 ----------------------------------------------------------------------------------------------------
 
-function inv.items.save()
+function inv.items.save(options)
     if inv.items.table == nil then
         return inv.items.reset()
     end
-    
-    return dbot.storage.saveTable(dbot.backup.getCurrentDir() .. inv.items.stateName,
-                                   "inv.items.table", inv.items.table, true)
+
+    if inv.items.refreshInProgress and inv.items.suppressDatabaseWrites then
+        inv.items.pendingInvmonSave = true
+        return DRL_RET_SUCCESS, {}
+    end
+
+    if not DINV or not DINV.database or not DINV.database.syncItems then
+        return DRL_RET_INTERNAL_ERROR
+    end
+    local target = inv.items.databaseBuildId and "build" or "active"
+    local identifiedBatchCount = tonumber(inv.items.databaseBuildIdentifiedSinceFlush) or 0
+    local ok, result, purgedPendingIds = DINV.database.syncItems(inv.items.table, target, options)
+    if not ok then
+        dbot.warn("inv.items.save: SQLite batch failed: " .. tostring(result))
+        return DRL_RET_INTERNAL_ERROR
+    end
+    if inv.items.databaseBuildId and identifiedBatchCount > 0
+        and DINV.database.noteBuildIdentified then
+        local noted, noteErr = DINV.database.noteBuildIdentified(
+            inv.items.databaseBuildId,
+            identifiedBatchCount
+        )
+        if not noted then
+            dbot.warn("inv.items.save: Unable to record build progress: " .. tostring(noteErr))
+            return DRL_RET_INTERNAL_ERROR
+        end
+    end
+    inv.items.databaseBuildIdentifiedSinceFlush = 0
+    return DRL_RET_SUCCESS, purgedPendingIds or {}
 end
 
-function inv.items.loadPersistentItemsTable()
-    if not dbot or not dbot.backup or not dbot.backup.getCurrentDir then
-        return nil
-    end
-    local fileName = dbot.backup.getCurrentDir() .. (inv.items and inv.items.stateName or "inv-items.state")
-    local f = io.open(fileName, "r")
-    if f == nil then
-        dbot.debug("inv.items: persistence file not found: " .. fileName, "inv.items")
-        return nil
-    end
-    local content = f:read("*a")
-    f:close()
-    if not content or content == "" then
-        return nil
-    end
+function inv.items.normalizePersistentItem(item)
+    local stats = item and item.stats
+    if not stats then return false end
+    local changed = false
+    local loc = tostring(stats[invStatFieldLocation] or "")
+    local wornLoc = tostring(stats[invStatFieldWorn] or "")
 
-    local chunk, err = loadstring(content)
-    if not chunk then
-        dbot.warn("inv.items: Failed to parse persistence file: " .. (err or "unknown"))
-        return nil
-    end
-
-    local env = { inv = { items = {} } }
-    setmetatable(env, { __index = _G })
-    if setfenv then
-        setfenv(chunk, env)
-    end
-    chunk()
-
-    local persisted = env.inv.items.table
-    if persisted then
-        for _, entry in pairs(persisted) do
-            local stats = entry and entry.stats
-            if stats then
-                local loc = tostring(stats[invStatFieldLocation] or "")
-                local wornLoc = tostring(stats[invStatFieldWorn] or "")
-
-                if loc == invItemLocWorn and wornLoc ~= "" and wornLoc ~= "undefined" and wornLoc ~= invItemWornNotWorn then
-                    local wearNum = inv.wearLocId and inv.wearLocId[wornLoc]
-                    if wearNum ~= nil then
-                        stats[invStatFieldLocation] = tostring(wearNum)
-                        loc = tostring(wearNum)
-                    end
-                end
-
-                local lastStored = tostring(stats[invStatFieldLastStored] or "")
-                if lastStored ~= "" and not inv.items.isStorageLocation(lastStored) then
-                    stats[invStatFieldLastStored] = ""
-                end
-
-                if loc ~= "" and inv.items.isStorageLocation(loc) then
-                    stats[invStatFieldLastStored] = loc
-                end
-
-                if tostring(stats[invStatFieldLastStored] or "") == invItemLocKeyring
-                    and tostring(stats[invStatFieldLocation] or "") == "unknown" then
-                    stats[invStatFieldLocation] = invItemLocKeyring
-                    stats[invStatFieldContainer] = invItemLocKeyring
-                end
-            end
+    if loc == tostring(invItemLocWorn or "worn")
+        and wornLoc ~= "" and wornLoc ~= "undefined"
+        and wornLoc ~= tostring(invItemWornNotWorn or "not-worn") then
+        local wearNum = inv.wearLocId and inv.wearLocId[wornLoc]
+        if wearNum ~= nil then
+            stats[invStatFieldLocation] = tostring(wearNum)
+            loc = tostring(wearNum)
+            changed = true
         end
     end
 
-    return persisted
+    local lastStored = tostring(stats[invStatFieldLastStored] or "")
+    if lastStored ~= "" and not inv.items.isStorageLocation(lastStored) then
+        stats[invStatFieldLastStored] = ""
+        lastStored = ""
+        changed = true
+    end
+    if loc ~= "" and inv.items.isStorageLocation(loc)
+        and tostring(stats[invStatFieldLastStored] or "") ~= loc then
+        stats[invStatFieldLastStored] = loc
+        lastStored = loc
+        changed = true
+    end
+    if lastStored == tostring(invItemLocKeyring or "keyring") and loc == "unknown" then
+        stats[invStatFieldLocation] = invItemLocKeyring or "keyring"
+        stats[invStatFieldContainer] = invItemLocKeyring or "keyring"
+        changed = true
+    end
+    return changed
+end
+
+function inv.items.loadPersistentItemsTable()
+    if not DINV or not DINV.database then
+        return nil
+    end
+    local items = DINV.database.loadActiveItems()
+    for _, item in pairs(items or {}) do
+        inv.items.normalizePersistentItem(item)
+    end
+    return items
 end
 
 function inv.items.lookupPersistentItem(objId)
@@ -597,13 +673,15 @@ function inv.items.lookupPersistentItem(objId)
         return nil
     end
 
-    local itemsTable = inv.items.loadPersistentItemsTable()
-    if not itemsTable then
-        dbot.debug("inv.items: persistence lookup skipped (no inv-items.state)", "inv.items")
-        return nil
+    local key = tostring(objId)
+    local entry = (inv.items.table and inv.items.table[key])
+        or (inv.items.detached and inv.items.detached[key])
+        or (inv.items.pendingRemoved and inv.items.pendingRemoved[key])
+    if not entry and not inv.items.databaseBuildId
+        and DINV and DINV.database and DINV.database.loadActiveItem then
+        entry = DINV.database.loadActiveItem(key)
     end
-
-    local entry = itemsTable[tostring(objId)]
+    if entry then inv.items.normalizePersistentItem(entry) end
     if entry then
         dbot.debug("inv.items: persistence hit for objId=" .. tostring(objId), "inv.items")
     else
@@ -613,7 +691,37 @@ function inv.items.lookupPersistentItem(objId)
 end
 
 function inv.items.load()
-    return dbot.storage.loadTable(dbot.backup.getCurrentDir() .. inv.items.stateName, inv.items.reset)
+    if not DINV or not DINV.database then
+        return DRL_RET_INTERNAL_ERROR
+    end
+    local active, activeErr = DINV.database.loadActiveItems()
+    if not active then
+        dbot.warn("inv.items.load: " .. tostring(activeErr))
+        return DRL_RET_INTERNAL_ERROR
+    end
+    local detached, detachedErr = DINV.database.loadDetachedItems()
+    if not detached then
+        dbot.warn("inv.items.load detached: " .. tostring(detachedErr))
+        return DRL_RET_INTERNAL_ERROR
+    end
+    local pendingRemoved, pendingErr = DINV.database.loadPendingRemovedItems()
+    if not pendingRemoved then
+        dbot.warn("inv.items.load pending removals: " .. tostring(pendingErr))
+        return DRL_RET_INTERNAL_ERROR
+    end
+    local normalized = false
+    for _, item in pairs(active) do
+        normalized = inv.items.normalizePersistentItem(item) or normalized
+    end
+    for _, item in pairs(pendingRemoved) do
+        normalized = inv.items.normalizePersistentItem(item) or normalized
+    end
+    inv.items.table = active
+    inv.items.detached = detached
+    inv.items.pendingRemoved = pendingRemoved
+    inv.items.pendingForget = nil
+    if normalized then inv.items.save() end
+    return DRL_RET_SUCCESS
 end
 
 function inv.items.reset()
@@ -1079,15 +1187,62 @@ function inv.items.completeMissingRefreshContainer(objId)
     return inv.items.completeRefreshScan("invdata", normalizedId)
 end
 
-function inv.items.abortInvalidRefresh()
+function inv.items.abortInvalidRefresh(options)
     local validation = inv.items.refreshValidation
     if not inv.items.refreshInProgress or not validation then
         return
     end
+    local quiet = options == true
+        or (type(options) == "table" and options.quiet == true)
 
     if validation.originalTable then
-        inv.items.table = validation.originalTable
+        local restored = validation.originalTable
+        local restoredDetached = validation.originalDetached or {}
+        local restoredPendingRemoved = validation.originalPendingRemoved or {}
+        local startEventSequence = tonumber(validation.startEventSequence) or 0
+        local reattached = {}
+        local pendingReattached = {}
+        -- A refresh rollback must not undo invmon events that arrived after
+        -- the refresh began.
+        for objId, currentItem in pairs(inv.items.table or {}) do
+            if (tonumber(currentItem and currentItem.__dinvLastEventSeq) or 0) > startEventSequence then
+                local key = tostring(objId)
+                if restoredDetached[key] then reattached[key] = currentItem end
+                if restoredPendingRemoved[key] then pendingReattached[key] = currentItem end
+                restored[key] = currentItem
+                restoredDetached[key] = nil
+                restoredPendingRemoved[key] = nil
+            end
+        end
+        for objId, eventSeq in pairs(inv.items.eventTombstones or {}) do
+            if (tonumber(eventSeq) or 0) > startEventSequence then
+                restored[tostring(objId)] = nil
+                restoredDetached[tostring(objId)] = nil
+                restoredPendingRemoved[tostring(objId)] = nil
+            end
+        end
+        inv.items.table = restored
+        inv.items.detached = restoredDetached
+        inv.items.pendingRemoved = restoredPendingRemoved
+        if DINV and DINV.database and DINV.database.discardPending then
+            DINV.database.discardPending("active")
+        end
+        -- The scan itself is rolled back, but a post-start invmon return is
+        -- authoritative. Move those rows out of detached persistence when the
+        -- restored active snapshot is saved.
+        if DINV and DINV.database and DINV.database.markReattached then
+            for objId, item in pairs(reattached) do
+                DINV.database.markReattached(objId, item, "active")
+            end
+        end
+        if DINV and DINV.database and DINV.database.markPendingReattached then
+            for objId, item in pairs(pendingReattached) do
+                DINV.database.markPendingReattached(objId, item, "active")
+            end
+        end
     end
+
+    inv.items.suppressDatabaseWrites = validation.previousSuppressDatabaseWrites == true
 
     local reason = table.concat(validation.errors or {}, "; ")
     inv.items.refreshValidation = nil
@@ -1113,10 +1268,18 @@ function inv.items.abortInvalidRefresh()
         DINV.setBuildPhase(0)
     end
 
-    dbot.warn("Refresh was not internally consistent; no items were removed or saved." ..
-        (reason ~= "" and " Reason: " .. reason or ""))
-    inv.items.maybeStartKeepFlagSync()
-    inv.items.scheduleDeferredIdentifyProcessing("refreshAbort")
+    if not quiet then
+        dbot.warn("Refresh was not internally consistent; no refresh detachments were committed." ..
+            (reason ~= "" and " Reason: " .. reason or ""))
+    end
+    inv.items.applyWorkflowRemovalEvents("refresh_abort")
+    if inv.items.save then
+        inv.items.save()
+    end
+    if not quiet then
+        inv.items.maybeStartKeepFlagSync()
+        inv.items.scheduleDeferredIdentifyProcessing("refreshAbort")
+    end
 end
 
 function inv.items.refreshOn(periodMin, eagerSec)
@@ -1223,6 +1386,17 @@ function inv.items.refresh(delay, refreshLoc, endTag, callback)
         dbot.debug("inv.items.refresh: workflow already in progress, skipping refresh", "inv.items")
         return DRL_RET_BUSY
     end
+
+    -- Establish a clean persistence boundary before discovery. Refresh mutations
+    -- remain memory-only until every requested scan and recheck validates, so a
+    -- search or backup cannot flush a half-reattached detached subtree.
+    if inv.items.save then
+        local saveRet = inv.items.save()
+        if saveRet ~= DRL_RET_SUCCESS then
+            dbot.warn("Unable to start refresh because the current SQLite state could not be committed.")
+            return saveRet
+        end
+    end
     
     dbot.debug("inv.items.refresh: Refresh requested for location '" .. tostring(refreshLoc or "nil") .. "'", "inv.items")
 
@@ -1231,14 +1405,17 @@ function inv.items.refresh(delay, refreshLoc, endTag, callback)
     end
 
     inv.items.refreshPerfStart = perfStart
-    inv.items.refreshIdentifyPartials = refreshLoc == invItemsRefreshLocAll
-        or (type(callback) == "table" and callback.identifyPartials == true)
+    inv.items.refreshIdentifyPartials = type(callback) == "table"
+        and callback.identifyPartials == true
     inv.state = invStateDiscovery
     inv.items.refreshInProgress = true
     inv.items.refreshSeen = {}
+    inv.items.refreshGeneration = (tonumber(inv.items.refreshGeneration) or 0) + 1
 
     local copyStart = dbot.perfNow and dbot.perfNow() or nil
     local originalTable = copyRefreshValue(inv.items.table or {})
+    local originalDetached = copyRefreshValue(inv.items.detached or {})
+    local originalPendingRemoved = copyRefreshValue(inv.items.pendingRemoved or {})
     dbot.perf("refresh copy original table", copyStart)
 
     inv.items.refreshValidation = {
@@ -1252,7 +1429,15 @@ function inv.items.refresh(delay, refreshLoc, endTag, callback)
         initialComplete = false,
         recheckComplete = false,
         originalTable = originalTable,
+        originalDetached = originalDetached,
+        originalPendingRemoved = originalPendingRemoved,
+        reattached = {},
+        pendingReattached = {},
+        previousSuppressDatabaseWrites = inv.items.suppressDatabaseWrites == true,
+        generation = inv.items.refreshGeneration,
+        startEventSequence = tonumber(inv.items.eventSequence) or 0,
     }
+    inv.items.suppressDatabaseWrites = true
     inv.items.refreshRecheckQueue = nil
     inv.items.refreshRecheckIndex = nil
     inv.items.eqdataSeen = {}
@@ -1332,6 +1517,32 @@ function inv.items.build(endTag)
         return DRL_RET_BUSY
     end
 
+    if not DINV or not DINV.database or not DINV.database.beginBuild then
+        dbot.warn("Cannot start build: SQLite persistence is unavailable")
+        return DRL_RET_INTERNAL_ERROR
+    end
+    -- Keep the active inventory as a clean rollback boundary. All subsequent
+    -- build writes go only to staging until finishBuild activates them.
+    if inv.items.save then
+        local activeSaveRet = inv.items.save()
+        if activeSaveRet ~= DRL_RET_SUCCESS then
+            dbot.warn("Cannot start build because the active SQLite inventory could not be committed.")
+            return activeSaveRet
+        end
+    end
+    local databaseBuildId, resumedOrError = DINV.database.beginBuild()
+    if not databaseBuildId then
+        dbot.warn("Cannot start crash-safe build: " .. tostring(resumedOrError))
+        return DRL_RET_INTERNAL_ERROR
+    end
+    inv.items.databaseBuildId = databaseBuildId
+    inv.items.databaseBuildIdentifiedSinceFlush = 0
+    inv.items.buildResumeItems = nil
+    if resumedOrError == true and DINV.database.loadStagedItems then
+        inv.items.buildResumeItems = DINV.database.loadStagedItems() or {}
+        dbot.info("Resuming staged SQLite build data; unchanged object IDs will not be re-identified.")
+    end
+
     -- Reset state
     inv.items.buildInProgress = true
     inv.items.buildEndTag = endTag
@@ -1345,6 +1556,19 @@ function inv.items.build(endTag)
     inv.items.inInvdata = false
     inv.items.eqdataSeen = {}
     inv.items.forceIdentify = true
+
+    dbot.deleteTimer(inv.items.timer.databaseBatchName)
+    if tempTimer then
+        dbot.timers[inv.items.timer.databaseBatchName] = tempTimer(
+            inv.items.databaseBuildBatchSeconds,
+            function()
+                if inv.items.databaseBuildId and inv.items.save then
+                    inv.items.save()
+                end
+            end,
+            true
+        )
+    end
 
     -- Reset progress
     inv.items.progress = {
@@ -1381,6 +1605,9 @@ function inv.items.build(endTag)
     end
 
     inv.items.buildOriginalTable = copyRefreshValue(inv.items.table or {})
+    inv.items.buildOriginalDetached = copyRefreshValue(inv.items.detached or {})
+    inv.items.buildOriginalPendingRemoved = copyRefreshValue(inv.items.pendingRemoved or {})
+    inv.items.buildStartEventSequence = tonumber(inv.items.eventSequence) or 0
 
     -- Reset inventory table
     inv.items.reset()
@@ -1769,6 +1996,343 @@ function inv.items.getItem(objId)
     return inv.items.table[tostring(objId)]
 end
 
+function inv.items.getDetachedItem(objId)
+    if inv.items.detached == nil then
+        return nil
+    end
+    return inv.items.detached[tostring(objId)]
+end
+
+function inv.items.getPendingRemovedItem(objId)
+    if inv.items.pendingRemoved == nil then
+        return nil
+    end
+    return inv.items.pendingRemoved[tostring(objId)]
+end
+
+function inv.items.nextEventSequence()
+    inv.items.eventSequence = (tonumber(inv.items.eventSequence) or 0) + 1
+    return inv.items.eventSequence
+end
+
+function inv.items.markLocationObserved(item, source, eventSeq)
+    if not item then
+        return
+    end
+    item.__dinvPresence = "active"
+    item.__dinvDetachedRoot = nil
+    item.__dinvRemovedAt = nil
+    item.__dinvPurgeAfter = nil
+    item.__dinvRemovalAction = nil
+    item.__dinvRemovalReason = nil
+    item.__dinvLocationSource = tostring(source or "unknown")
+    item.__dinvLocationSession = DINV and DINV.database and DINV.database.getSessionId
+        and DINV.database.getSessionId() or nil
+    item.__dinvLocationConfirmedAt = os.time()
+    if eventSeq then
+        item.__dinvLastEventSeq = tonumber(eventSeq) or 0
+    end
+    if inv.items.refreshInProgress then
+        item.__dinvRefreshGeneration = tonumber(inv.items.refreshGeneration) or 0
+    end
+end
+
+function inv.items.collectActiveSubtree(rootId)
+    local rootKey = tostring(rootId or "")
+    if rootKey == "" or not inv.items.table or not inv.items.table[rootKey] then
+        return nil
+    end
+
+    local subtree = {}
+    local queue = { rootKey }
+    local queued = { [rootKey] = true }
+    local index = 1
+    while index <= #queue do
+        local currentId = queue[index]
+        index = index + 1
+        local current = inv.items.table[currentId]
+        if current then
+            subtree[currentId] = current
+            for childId, child in pairs(inv.items.table) do
+                local container = child and child.stats and child.stats[invStatFieldContainer]
+                if tostring(container or "") == currentId and not queued[tostring(childId)] then
+                    local childKey = tostring(childId)
+                    queued[childKey] = true
+                    table.insert(queue, childKey)
+                end
+            end
+        end
+    end
+
+    return subtree
+end
+
+function inv.items.detachSubtree(rootId, reason)
+    local rootKey = tostring(rootId or "")
+    local subtree = inv.items.collectActiveSubtree(rootKey)
+    if not subtree then
+        return false
+    end
+
+    if DINV and DINV.database and DINV.database.detachItems then
+        local ok, err = DINV.database.detachItems(subtree, rootKey)
+        if not ok then
+            dbot.warn("Unable to detach inventory subtree " .. rootKey .. ": " .. tostring(err))
+            return false
+        end
+    else
+        return false
+    end
+
+    inv.items.detached = inv.items.detached or {}
+    for objId, item in pairs(subtree) do
+        if inv.items.databaseBuildId and DINV.database.markDeleted then
+            DINV.database.markDeleted(objId, "build")
+        end
+        item.__dinvPresence = "detached"
+        item.__dinvDetachedRoot = rootKey
+        inv.items.detached[objId] = item
+        inv.items.table[objId] = nil
+    end
+    dbot.debug(string.format("Detached subtree root=%s items=%d reason=%s",
+        rootKey, dbot.table.getNumEntries(subtree), tostring(reason or "unknown")), "inv.items")
+    return true
+end
+
+function inv.items.isFullyIdentified(item)
+    return item and item.stats and item.stats.identifyLevel == invIdLevelFull
+end
+
+function inv.items.getPendingRemovalRetentionSeconds()
+    local periodMinutes = inv.config and inv.config.getRefreshPeriod
+        and tonumber(inv.config.getRefreshPeriod()) or nil
+    if not periodMinutes or periodMinutes <= 0 then
+        periodMinutes = tonumber(inv.items.timer and inv.items.timer.refreshMin) or 5
+    end
+    return math.max(1, math.floor(periodMinutes * 60))
+end
+
+function inv.items.moveItemsToPendingRemoval(entries, reason, action)
+    if type(entries) ~= "table" or not next(entries)
+        or not DINV or not DINV.database or not DINV.database.moveItemsToPendingRemoval then
+        return false, 0
+    end
+    local removedAt = os.time()
+    local purgeAfter = removedAt + inv.items.getPendingRemovalRetentionSeconds()
+    local target = inv.items.databaseBuildId and "build" or "active"
+    local prepared = {}
+    local databaseEntries = {}
+    for _, entry in pairs(entries) do
+        local key = tostring(entry and entry.objId or "")
+        local item = entry and entry.item or nil
+        if key == "" or not item or not inv.items.isFullyIdentified(item) then
+            for _, restore in ipairs(prepared) do
+                restore.item.__dinvLastEventSeq = restore.previousEventSeq
+            end
+            return false, 0
+        end
+        local removalSeq = tonumber(entry.eventSeq) or tonumber(inv.items.eventSequence) or 0
+        local entryAction = tonumber(entry.action)
+        if entryAction == nil then entryAction = tonumber(action) or invmonActionRemovedFromInv end
+        local entryReason = tostring(entry.reason or reason or "removed_from_inventory")
+        local preparedEntry = {
+            key = key,
+            item = item,
+            removalSeq = removalSeq,
+            previousEventSeq = item.__dinvLastEventSeq,
+            action = entryAction,
+            reason = entryReason,
+        }
+        item.__dinvLastEventSeq = removalSeq
+        table.insert(prepared, preparedEntry)
+        table.insert(databaseEntries, {
+            objId = key,
+            item = item,
+            details = {
+                removedAt = removedAt,
+                purgeAfter = purgeAfter,
+                action = entryAction,
+                reason = entryReason,
+            },
+        })
+    end
+
+    local moved, moveErr = DINV.database.moveItemsToPendingRemoval(databaseEntries, target)
+    if not moved then
+        for _, restore in ipairs(prepared) do
+            restore.item.__dinvLastEventSeq = restore.previousEventSeq
+        end
+        dbot.warn("Unable to preserve removed objects: " .. tostring(moveErr))
+        return false, 0
+    end
+
+    inv.items.pendingRemoved = inv.items.pendingRemoved or {}
+    for _, pending in ipairs(prepared) do
+        inv.items.removeItemFromCache(pending.key, pending.item)
+        inv.items.removeItem(pending.key, { skipDatabase = true })
+        pending.item.__dinvPresence = "pending-removal"
+        pending.item.__dinvDetachedRoot = nil
+        pending.item.__dinvRemovedAt = removedAt
+        pending.item.__dinvPurgeAfter = purgeAfter
+        pending.item.__dinvRemovalAction = pending.action
+        pending.item.__dinvRemovalReason = pending.reason
+        inv.items.pendingRemoved[pending.key] = pending.item
+        inv.items.eventTombstones[pending.key] = pending.removalSeq
+        dbot.debug(string.format(
+            "Pending removal objId=%s identify=full purgeAfter=%d reason=%s",
+            pending.key, purgeAfter, pending.reason), "inv.items")
+    end
+    return true, #prepared
+end
+
+function inv.items.moveToPendingRemoval(objId, item, eventSeq, reason, action)
+    local moved = inv.items.moveItemsToPendingRemoval({ {
+        objId = objId,
+        item = item,
+        eventSeq = eventSeq,
+        reason = reason,
+        action = action,
+    } }, reason, action)
+    return moved
+end
+
+function inv.items.removePurgedPendingItems(objIds)
+    local removed = 0
+    for _, objId in ipairs(objIds or {}) do
+        local key = tostring(objId)
+        local item = inv.items.pendingRemoved and inv.items.pendingRemoved[key] or nil
+        if item then
+            inv.items.removeItemFromCache(key, item)
+            inv.items.pendingRemoved[key] = nil
+            removed = removed + 1
+        end
+    end
+    if removed > 0 then
+        dbot.debug("Purged " .. tostring(removed) .. " expired pending removal(s)", "inv.items")
+    end
+    return removed
+end
+
+function inv.items.finalizeRemovedFromInventory(objId, eventSeq, reason, action)
+    local key = tostring(objId or "")
+    if key == "" then
+        return false
+    end
+
+    local subtree = inv.items.collectActiveSubtree(key)
+    if subtree and dbot.table.getNumEntries(subtree) > 1 then
+        local root = subtree[key]
+        if root then root.__dinvLastEventSeq = tonumber(eventSeq) or 0 end
+        return inv.items.detachSubtree(key, reason or "removed_from_inventory")
+    end
+
+    local item = inv.items.getItem(key) or inv.items.getDetachedItem(key)
+    if item then
+        item.__dinvLastEventSeq = tonumber(eventSeq) or tonumber(inv.items.eventSequence) or 0
+        if inv.items.isFullyIdentified(item) then
+            return inv.items.moveToPendingRemoval(key, item, eventSeq, reason, action)
+        end
+        inv.items.removeItemFromCache(key, item)
+        inv.items.removeItem(key)
+    end
+    inv.items.eventTombstones[key] = tonumber(eventSeq) or tonumber(inv.items.eventSequence) or 0
+    dbot.debug("Terminal removal for partial singleton object " .. key, "inv.items")
+    return true
+end
+
+function inv.items.reattachDetachedSubtree(rootId, eventSeq)
+    local rootKey = tostring(rootId or "")
+    if rootKey == "" or not inv.items.detached then
+        return 0
+    end
+
+    local selected = {}
+    local reachable = { [rootKey] = true }
+    local changed = true
+    while changed do
+        changed = false
+        for objId, item in pairs(inv.items.detached) do
+            local key = tostring(objId)
+            local container = item and item.stats and item.stats[invStatFieldContainer] or ""
+            local detachedRoot = tostring(item and item.__dinvDetachedRoot or "")
+            local belongsToRoot = key == rootKey or detachedRoot == rootKey
+            -- Current detached rows always carry their root ID. Only rows from
+            -- an older/incomplete store may fall back to container ancestry;
+            -- an explicit different root must never cross-attach.
+            local legacyReachable = detachedRoot == "" and reachable[tostring(container)]
+            if not selected[key]
+                and (belongsToRoot or legacyReachable) then
+                selected[key] = item
+                reachable[key] = true
+                changed = true
+            end
+        end
+    end
+
+    local count = 0
+    for objId, item in pairs(selected) do
+        inv.items.markLocationObserved(item, "detached_return", eventSeq)
+        inv.items.setItem(objId, item, { silentApi = true })
+        count = count + 1
+    end
+    if count > 0 then
+        dbot.debug(string.format("Reattached detached subtree root=%s descendants=%d",
+            rootKey, count), "inv.items")
+    end
+    return count
+end
+
+function inv.items.recordWorkflowRemoval(objId, action, eventSeq)
+    local key = tostring(objId or "")
+    if key == "" then return end
+    inv.items.workflowRemovalEvents = inv.items.workflowRemovalEvents or {}
+    inv.items.workflowRemovalEvents[key] = {
+        action = tonumber(action),
+        eventSeq = tonumber(eventSeq) or 0,
+    }
+end
+
+function inv.items.applyWorkflowRemovalEvents(reason, options)
+    local pending = inv.items.workflowRemovalEvents or {}
+    local retainApplied = type(options) == "table" and options.retainApplied == true
+    local ordered = {}
+    for objId, event in pairs(pending) do
+        table.insert(ordered, { objId = tostring(objId), event = event })
+    end
+    table.sort(ordered, function(left, right)
+        return (tonumber(left.event.eventSeq) or 0) < (tonumber(right.event.eventSeq) or 0)
+    end)
+
+    for _, entry in ipairs(ordered) do
+        local action = tonumber(entry.event.action)
+        local applied = true
+        if action == invmonActionRemovedFromInv then
+            local item = inv.items.getItem(entry.objId)
+            if item then
+                applied = inv.items.finalizeRemovedFromInventory(
+                    entry.objId,
+                    entry.event.eventSeq,
+                    tostring(reason or "workflow") .. "_invmon_" .. tostring(action),
+                    action)
+            end
+        elseif action == invmonActionPutIntoVault then
+            local item = inv.items.getItem(entry.objId)
+            if item then
+                item.__dinvLastEventSeq = tonumber(entry.event.eventSeq) or 0
+                applied = inv.items.detachSubtree(entry.objId,
+                    tostring(reason or "workflow") .. "_invmon_" .. tostring(action))
+            end
+        end
+        if applied then
+            if not retainApplied then
+                pending[entry.objId] = nil
+            end
+        else
+            dbot.warn("Unable to apply deferred inventory removal for object " .. entry.objId)
+        end
+    end
+end
+
 function inv.items.isTransientItem(item)
     if type(item) ~= "table" then
         return false
@@ -1791,11 +2355,46 @@ function inv.items.convertRelative(relativeName)
     return tonumber(index), name
 end
 
-function inv.items._parseQuerySegment(segment)
+local function tokenizeQuerySegment(segment)
     local tokens = {}
-    for token in tostring(segment):gmatch("%S+") do
-        table.insert(tokens, token)
+    local text = tostring(segment or "")
+    local index = 1
+    while index <= #text do
+        while index <= #text and text:sub(index, index):match("%s") do
+            index = index + 1
+        end
+        if index > #text then break end
+        local quote = text:sub(index, index)
+        if quote == '"' or quote == "'" then
+            index = index + 1
+            local value = {}
+            while index <= #text do
+                local character = text:sub(index, index)
+                if character == quote then
+                    index = index + 1
+                    break
+                elseif character == "\\" and index < #text then
+                    index = index + 1
+                    table.insert(value, text:sub(index, index))
+                else
+                    table.insert(value, character)
+                end
+                index = index + 1
+            end
+            table.insert(tokens, table.concat(value))
+        else
+            local startIndex = index
+            while index <= #text and not text:sub(index, index):match("%s") do
+                index = index + 1
+            end
+            table.insert(tokens, text:sub(startIndex, index - 1))
+        end
     end
+    return tokens
+end
+
+function inv.items._parseQuerySegment(segment)
+    local tokens = tokenizeQuerySegment(segment)
 
     local function normalizeKey(rawKey)
         local key = tostring(rawKey or "")
@@ -1918,8 +2517,50 @@ function inv.items.setItem(objId, itemData, options)
         inv.items.table = {}
     end
     local key = tostring(objId)
-    local previousItem = inv.items.table[key]
+    local detachedItem = inv.items.detached and inv.items.detached[key]
+    local pendingRemovedItem = inv.items.pendingRemoved and inv.items.pendingRemoved[key]
+    local previousItem = inv.items.table[key] or detachedItem
+    if itemData then
+        itemData.__dinvPresence = "active"
+        itemData.__dinvDetachedRoot = nil
+        itemData.__dinvRemovedAt = nil
+        itemData.__dinvPurgeAfter = nil
+        itemData.__dinvRemovalAction = nil
+        itemData.__dinvRemovalReason = nil
+    end
     inv.items.table[key] = itemData
+    if detachedItem then
+        inv.items.detached[key] = nil
+        if inv.items.refreshInProgress and inv.items.refreshValidation then
+            inv.items.refreshValidation.reattached = inv.items.refreshValidation.reattached or {}
+            inv.items.refreshValidation.reattached[key] = true
+        end
+    end
+    if pendingRemovedItem then
+        inv.items.pendingRemoved[key] = nil
+        if inv.items.refreshInProgress and inv.items.refreshValidation then
+            inv.items.refreshValidation.pendingReattached =
+                inv.items.refreshValidation.pendingReattached or {}
+            inv.items.refreshValidation.pendingReattached[key] = true
+        end
+    end
+    if not inv.items.suppressDatabaseWrites and DINV and DINV.database then
+        if pendingRemovedItem and DINV.database.markPendingReattached then
+            DINV.database.markPendingReattached(
+                key,
+                itemData,
+                inv.items.databaseBuildId and "build" or "active"
+            )
+        elseif detachedItem and DINV.database.markReattached then
+            DINV.database.markReattached(
+                key,
+                itemData,
+                inv.items.databaseBuildId and "build" or "active"
+            )
+        elseif DINV.database.markItem then
+            DINV.database.markItem(key, itemData, inv.items.databaseBuildId and "build" or "active")
+        end
+    end
     local bulkWorkflow = inv.items.refreshInProgress
         or inv.items.buildInProgress
         or inv.items.identifyInProgress
@@ -1936,10 +2577,26 @@ function inv.items.setItem(objId, itemData, options)
 end
 
 function inv.items.removeItem(objId, options)
-    if inv.items.table then
+    if inv.items.table or inv.items.detached then
         local key = tostring(objId)
-        local previousItem = inv.items.table[key]
-        inv.items.table[key] = nil
+        local previousItem = inv.items.table and inv.items.table[key]
+        local detachedItem = inv.items.detached and inv.items.detached[key]
+        local pendingRemovedItem = inv.items.pendingRemoved and inv.items.pendingRemoved[key]
+        if inv.items.table then inv.items.table[key] = nil end
+        if inv.items.detached then inv.items.detached[key] = nil end
+        if inv.items.pendingRemoved then inv.items.pendingRemoved[key] = nil end
+        local skipDatabase = type(options) == "table" and options.skipDatabase == true
+        if not skipDatabase and not inv.items.suppressDatabaseWrites and DINV and DINV.database then
+            if previousItem and DINV.database.markDeleted then
+                DINV.database.markDeleted(key, inv.items.databaseBuildId and "build" or "active")
+            end
+            if detachedItem and DINV.database.deleteDetachedItem then
+                DINV.database.deleteDetachedItem(key)
+            end
+            if pendingRemovedItem and DINV.database.deletePendingRemovedItem then
+                DINV.database.deletePendingRemovedItem(key)
+            end
+        end
         local bulkWorkflow = inv.items.refreshInProgress
             or inv.items.buildInProgress
             or inv.items.identifyInProgress
@@ -1966,14 +2623,8 @@ function inv.items.removeItemFromCache(objId, item)
     inv.cache.remove("recent", key)
     inv.cache.remove("custom", key)
 
-    if item and inv.items.getFrequentCacheKeys then
-        local nameKeys = inv.items.getFrequentCacheKeys(item)
-        if nameKeys then
-            for _, nameKey in ipairs(nameKeys) do
-                inv.cache.remove("frequent", nameKey)
-            end
-        end
-    end
+    -- A consumed/dropped object must not delete a reusable full consumable
+    -- template shared by other objects of the same type and name.
 
     return DRL_RET_SUCCESS
 end
@@ -2001,7 +2652,7 @@ function inv.items.removeItemAndSaveNow(objId, source)
     end
 
     local key = tostring(objId)
-    local item = inv.items.getItem(key)
+    local item = inv.items.getItem(key) or inv.items.getDetachedItem(key)
     if item then
         inv.items.removeItemFromCache(key, item)
     end
@@ -2032,11 +2683,53 @@ function inv.items.applyCachedStats(item)
         return false
     end
 
+    local itemId = item.stats[invStatFieldId]
+    local dynamicFields = {
+        [invStatFieldId] = true,
+        [invStatFieldLocation] = true,
+        [invStatFieldContainer] = true,
+        [invStatFieldWorn] = true,
+        [invStatFieldLastStored] = true,
+        [invStatFieldKeepflag] = true,
+        [invStatFieldTimer] = true,
+    }
+
+    -- A resumed full build may reuse a full record for the exact same object ID.
+    -- This is staged build recovery, not a cross-object stat template.
+    local staged = itemId and inv.items.buildResumeItems
+        and inv.items.buildResumeItems[tostring(itemId)] or nil
+    if staged and staged.stats and staged.stats.identifyLevel == invIdLevelFull then
+        for key, value in pairs(staged.stats) do
+            if not dynamicFields[key] then
+                item.stats[key] = value
+            end
+        end
+        item.stats.identifyLevel = invIdLevelFull
+        return true
+    end
+
+    local itemType = item.stats[invStatFieldType]
+    if not inv.items.isFrequentCacheType(itemType) then
+        return false
+    end
+
+    if DINV and DINV.database and DINV.database.loadConsumableTemplate then
+        local template = DINV.database.loadConsumableTemplate(item)
+        if template and template.stats and template.stats.identifyLevel == invIdLevelFull then
+            for key, value in pairs(template.stats) do
+                if not dynamicFields[key] then
+                    item.stats[key] = value
+                end
+            end
+            item.stats.identifyLevel = invIdLevelFull
+            return true
+        end
+    end
+
     if not inv.cache or not inv.cache.get then
         return false
     end
 
-    local itemId = item.stats[invStatFieldId]
     if itemId then
         local cached = inv.cache.get("recent", tostring(itemId))
         if cached and cached.stats and cached.stats.identifyLevel == invIdLevelFull then
@@ -2045,11 +2738,7 @@ function inv.items.applyCachedStats(item)
                 if k ~= invStatFieldId then
                     if k == invStatFieldWearable and (v == "undefined" or v == "unknown") then
                         -- Keep existing wearable data when cache only has placeholder values.
-                    elseif k == invStatFieldLocation
-                        or k == invStatFieldContainer
-                        or k == invStatFieldWorn
-                        or k == invStatFieldLastStored
-                        or k == invStatFieldKeepflag then
+                    elseif dynamicFields[k] then
                         -- Never restore dynamic protocol state from cache.
                     else
                         item.stats[k] = v
@@ -2061,7 +2750,6 @@ function inv.items.applyCachedStats(item)
         end
     end
 
-    local itemType = item.stats[invStatFieldType]
     if inv.items.isFrequentCacheType(itemType) then
         local nameKeys = inv.items.getFrequentCacheKeys(item)
         if nameKeys then
@@ -2075,11 +2763,7 @@ function inv.items.applyCachedStats(item)
                             if k ~= invStatFieldId then
                                 if k == invStatFieldWearable and (v == "undefined" or v == "unknown") then
                                     -- Keep existing wearable data when cache only has placeholder values.
-                                elseif k == invStatFieldLocation
-                                    or k == invStatFieldContainer
-                                    or k == invStatFieldWorn
-                                    or k == invStatFieldLastStored
-                                    or k == invStatFieldKeepflag then
+                                elseif dynamicFields[k] then
                                     -- Never restore dynamic protocol state from cache.
                                 else
                                     item.stats[k] = v
@@ -2130,6 +2814,13 @@ function inv.items.getFrequentCacheKeys(item)
             table.insert(keys, tagTrimmed)
         end
     end
+    local typeName = tostring(item.stats[invStatFieldType] or ""):lower()
+    if typeName == "" then
+        return nil
+    end
+    for index, key in ipairs(keys) do
+        keys[index] = typeName .. "\31" .. key
+    end
     return keys
 end
 
@@ -2147,14 +2838,12 @@ function inv.items.isFrequentCacheType(itemType)
     end
 
     local typeName = tostring(itemType):lower()
-    local compactTypeName = typeName:gsub("%s+", "")
     return typeName == "potion"
         or typeName == "pill"
         or typeName == "food"
         or typeName == "wand"
         or typeName == "stave"
         or typeName == "scroll"
-        or compactTypeName:match("^rawmaterial") ~= nil
 end
 
 function inv.items.cacheIdentifiedItem(item)
@@ -2174,6 +2863,13 @@ function inv.items.cacheIdentifiedItem(item)
     local itemType = item.stats[invStatFieldType]
     local isFrequent = inv.items.isFrequentCacheType(itemType)
 
+    -- Cross-object reusable stats are safe only for consumables. Equipment,
+    -- keys, portals, raw materials, and other items can share names while
+    -- having different rarity or randomized stats.
+    if not isFrequent then
+        return
+    end
+
     if not inv.cache or not inv.cache.set then
         return
     end
@@ -2186,7 +2882,7 @@ function inv.items.cacheIdentifiedItem(item)
     end
     recent.stats = {}
     for k, v in pairs(item.stats) do
-        if k ~= invStatFieldKeepflag then
+        if k ~= invStatFieldKeepflag and k ~= invStatFieldTimer then
             recent.stats[k] = v
         end
     end
@@ -2197,7 +2893,13 @@ function inv.items.cacheIdentifiedItem(item)
         if nameKeys then
             local stored = { stats = {} }
             for k, v in pairs(item.stats) do
-                if k ~= invStatFieldId and k ~= invStatFieldKeepflag then
+                if k ~= invStatFieldId
+                    and k ~= invStatFieldKeepflag
+                    and k ~= invStatFieldTimer
+                    and k ~= invStatFieldLocation
+                    and k ~= invStatFieldContainer
+                    and k ~= invStatFieldWorn
+                    and k ~= invStatFieldLastStored then
                     stored.stats[k] = v
                 end
             end
@@ -2275,46 +2977,10 @@ function inv.items.markSoftIdentified(item)
 end
 
 function inv.items.cacheObservedItem(item)
-    if not item or not item.stats then
-        return
-    end
-
-    local itemId = item.stats[invStatFieldId]
-    if not itemId then
-        return
-    end
-
-    if not inv.cache or not inv.cache.get or not inv.cache.set then
-        return
-    end
-
-    local key = tostring(itemId)
-    local cached = inv.cache.get("frequent", key)
-    if cached and cached.stats then
-        cached.stats = cached.stats or {}
-        cached.stats[invStatFieldKeepflag] = nil
-        for k, v in pairs(item.stats) do
-            if k ~= "identifyLevel" and k ~= invStatFieldKeepflag then
-                cached.stats[k] = v
-            end
-        end
-        if item.stats.identifyLevel == invIdLevelFull then
-            cached.stats.identifyLevel = invIdLevelFull
-        end
-        inv.cache.set("frequent", key, cached)
-        return
-    end
-
-    local stored = { stats = {} }
-    for k, v in pairs(item.stats) do
-        if k ~= invStatFieldKeepflag then
-            stored.stats[k] = v
-        end
-    end
-    if stored.stats.identifyLevel ~= invIdLevelFull then
-        stored.stats.identifyLevel = invIdLevelSoft
-    end
-    inv.cache.set("frequent", key, stored)
+    -- Partial observations belong to the primary item record. They must never
+    -- become reusable templates. Full consumable templates are written only by
+    -- cacheIdentifiedItem / the SQLite repository.
+    return
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -2426,6 +3092,8 @@ function inv.items._parseDataLine(dataLine, source)
     local wearLocText = (wearLoc == -1 and "undefined") or inv.wearLoc[wearLoc] or "unknown"
 
     local item = inv.items.getItem(objId)
+        or inv.items.getDetachedItem(objId)
+        or inv.items.getPendingRemovedItem(objId)
     if item == nil then
         item = { stats = {} }
     end
@@ -2462,13 +3130,15 @@ function inv.items._parseDataLine(dataLine, source)
         if wearLocText ~= "undefined" and wearLocText ~= "unknown" then
             item.stats[invStatFieldWearable] = wearLocText
         end
-        item.stats[invStatFieldTimer] = timer
         if item.stats.identifyLevel ~= invIdLevelFull then
             item.stats.identifyLevel = invIdLevelPartial
         end
         item.flags = flags
         item.unique = unique
     end
+    -- Timer is dynamic. Refreshes must update it even when the item already
+    -- has full identify data; otherwise expiring keys keep a stale timer.
+    item.stats[invStatFieldTimer] = timer
 
     local wornValue = (wearLoc and wearLoc >= 0) and wearLocText or invItemWornNotWorn
 
@@ -2481,7 +3151,9 @@ function inv.items._parseDataLine(dataLine, source)
             inv.items.updateLocation(item, wearLocText)
         end
     else
-        item.stats[invStatFieldWorn] = wornValue
+        -- invdata's wear-loc describes where the item *can* be worn. It is
+        -- not evidence that an inventory/container item is currently worn.
+        item.stats[invStatFieldWorn] = invItemWornNotWorn
         -- Only trust container context while we are actively inside an invdata block.
         -- This guards against stale currentContainerId values leaking into standalone
         -- invdata/itemDataStats callbacks after refresh/build boundaries.
@@ -2498,26 +3170,13 @@ function inv.items._parseDataLine(dataLine, source)
         end
     end
 
-    -- Check cache for previously identified data
-    if inv.cache and inv.cache.get then
-        local cached = inv.cache.get("frequent", tostring(objId))
-        if cached and cached.stats and cached.stats.identifyLevel == invIdLevelFull then
-            for k, v in pairs(cached.stats) do
-                if k ~= invStatFieldKeepflag and item.stats[k] == nil then
-                    item.stats[k] = v
-                end
-            end
-            item.stats.identifyLevel = invIdLevelFull
-            dbot.debug("Restored full identify from cache for " .. objId, "inv.items")
-        end
-    end
-
     local cacheHit = inv.items.applyCachedStats(item)
     if cacheHit then
         dbot.debug("Cache hit: " .. itemName:sub(1, 30), "inv.items")
     end
 
     inv.items.markSoftIdentified(item)
+    inv.items.markLocationObserved(item, source)
 
     inv.items.setItem(objId, item)
     inv.items.cacheObservedItem(item)
@@ -2850,7 +3509,12 @@ function inv.items.pruneRefreshOrphans()
     end
 
     local unseen = 0
-    local prunedItems = {}
+    local removedSingletons = 0
+    local detachedItems = {}
+    local pendingSingletons = {}
+    local candidates = {}
+    local startEventSequence = tonumber(inv.items.refreshValidation
+        and inv.items.refreshValidation.startEventSequence) or 0
     for objId, item in pairs(inv.items.table or {}) do
         if not inv.items.refreshSeen[tostring(objId)] then
             local container = item and item.stats and item.stats[invStatFieldContainer] or ""
@@ -2862,31 +3526,102 @@ function inv.items.pruneRefreshOrphans()
                     inv.items.setItem(objId, item)
                     dbot.debug(string.format("Refresh kept keyring item objId=%s name=%s", tostring(objId), tostring(item.stats[invStatFieldName] or "unknown")), "inv.items")
                 else
-                    if item then
-                        inv.items.removeItemFromCache(objId, item)
+                    local lastEventSequence = tonumber(item and item.__dinvLastEventSeq) or 0
+                    if lastEventSequence > startEventSequence then
+                        dbot.debug("Refresh kept item changed after scan start: " .. tostring(objId), "inv.items")
+                    else
+                        candidates[tostring(objId)] = item
                     end
-                    table.insert(prunedItems, {
-                        objId = tostring(objId),
-                        name = tostring(item and item.stats and item.stats[invStatFieldName] or "unknown"),
-                        colorName = tostring(item and item.stats and item.stats[invStatFieldColorName] or ""),
-                    })
-                    inv.items.removeItem(objId)
-                    unseen = unseen + 1
                 end
             end
         end
     end
 
-    if unseen > 0 then
-        dbot.debug("Refresh pruned " .. unseen .. " unseen item(s) from persistence", "inv.items")
-        dbot.print("")
-        for _, pruned in ipairs(prunedItems) do
-            local displayName = pruned.colorName
-            if not displayName or displayName == "" then
-                displayName = pruned.name or "Unidentified"
+    local groups = {}
+    for objId, item in pairs(candidates) do
+        local rootId = objId
+        local visited = { [objId] = true }
+        local parentId = item and item.stats
+            and inv.items.normalizeContainerId(item.stats[invStatFieldContainer]) or nil
+        while parentId and candidates[parentId] and not visited[parentId] do
+            rootId = parentId
+            visited[parentId] = true
+            local parent = candidates[parentId]
+            parentId = parent and parent.stats
+                and inv.items.normalizeContainerId(parent.stats[invStatFieldContainer]) or nil
+        end
+        groups[rootId] = groups[rootId] or {}
+        groups[rootId][objId] = item
+    end
+
+    for rootId, group in pairs(groups) do
+        local groupSize = dbot.table.getNumEntries(group)
+        if groupSize == 1 then
+            local objId, item = next(group)
+            if inv.items.isFullyIdentified(item) then
+                table.insert(pendingSingletons, { objId = objId, item = item })
+            else
+                local finalized = inv.items.finalizeRemovedFromInventory(
+                    objId, nil, "refresh_confirmed_absent", 0)
+                if finalized then
+                    unseen = unseen + 1
+                    removedSingletons = removedSingletons + 1
+                    dbot.debug("Refresh reconciled confirmed-absent singleton " ..
+                        tostring(objId), "inv.items")
+                else
+                    dbot.warn("Refresh could not reconcile unseen singleton " ..
+                        tostring(objId) .. "; keeping it active")
+                end
             end
-            dbot.print("@C[DINV INFO]@W Removed orphan: \"" .. tostring(displayName) .. "@W\" (" .. tostring(pruned.objId) .. ")")
-            dbot.debug(string.format("Pruned item objId=%s name=%s", tostring(pruned.objId), tostring(pruned.name)), "inv.items")
+        else
+            local detached = DINV and DINV.database and DINV.database.detachItems
+                and DINV.database.detachItems(group, rootId)
+            if detached then
+                inv.items.detached = inv.items.detached or {}
+                for objId, item in pairs(group) do
+                    item.__dinvPresence = "detached"
+                    item.__dinvDetachedRoot = rootId
+                    inv.items.detached[objId] = item
+                    inv.items.table[objId] = nil
+                    table.insert(detachedItems, {
+                        objId = tostring(objId),
+                        name = tostring(item and item.stats and item.stats[invStatFieldName] or "unknown"),
+                        colorName = tostring(item and item.stats and item.stats[invStatFieldColorName] or ""),
+                    })
+                    unseen = unseen + 1
+                end
+            else
+                dbot.warn("Refresh could not detach unseen subtree rooted at " .. tostring(rootId) .. "; keeping it active")
+            end
+        end
+    end
+
+    if #pendingSingletons > 0 then
+        local moved, movedCount = inv.items.moveItemsToPendingRemoval(
+            pendingSingletons, "refresh_confirmed_absent", 0)
+        if moved then
+            unseen = unseen + movedCount
+            removedSingletons = removedSingletons + movedCount
+        else
+            dbot.warn("Refresh could not preserve " .. tostring(#pendingSingletons) ..
+                " fully identified unseen singleton(s); keeping them active")
+        end
+    end
+
+    if unseen > 0 then
+        dbot.debug(string.format(
+            "Refresh reconciled %d unseen item(s): detached=%d removed=%d",
+            unseen, #detachedItems, removedSingletons
+        ), "inv.items")
+        if #detachedItems > 0 then
+            dbot.print("")
+            for _, detached in ipairs(detachedItems) do
+                local displayName = detached.colorName
+                if not displayName or displayName == "" then
+                    displayName = detached.name or "Unidentified"
+                end
+                dbot.print("@C[DINV INFO]@W Detached unseen item: \"" .. tostring(displayName) .. "@W\" (" .. tostring(detached.objId) .. ")")
+            end
         end
         inv.items.pendingInvmonSave = true
     end
@@ -3118,6 +3853,24 @@ function inv.items.finishDiscovery()
         end
 
         local refreshOriginalTable = validation.originalTable
+        inv.items.suppressDatabaseWrites = validation.previousSuppressDatabaseWrites == true
+        if DINV and DINV.database and DINV.database.markReattached then
+            for objId, _ in pairs(validation.reattached or {}) do
+                local item = inv.items.table and inv.items.table[tostring(objId)] or nil
+                if item then
+                    DINV.database.markReattached(objId, item)
+                end
+            end
+        end
+        if DINV and DINV.database and DINV.database.markPendingReattached then
+            for objId, _ in pairs(validation.pendingReattached or {}) do
+                local item = inv.items.table and inv.items.table[tostring(objId)] or nil
+                if item then
+                    DINV.database.markPendingReattached(objId, item)
+                end
+            end
+        end
+        inv.items.applyWorkflowRemovalEvents("refresh_complete")
         local pruneStart = dbot.perfNow and dbot.perfNow() or nil
         inv.items.pruneRefreshOrphans()
         dbot.perf("refresh prune orphans", pruneStart)
@@ -3139,9 +3892,17 @@ function inv.items.finishDiscovery()
         -- so persist immediately when refresh completes.
         if inv.items.save then
             local saveStart = dbot.perfNow and dbot.perfNow() or nil
-            inv.items.save()
+            local saveRet, purgedPendingIds = inv.items.save({
+                pendingRemovalPurgeCutoff = os.time(),
+            })
             dbot.perf("refresh save items", saveStart)
-            dbot.debug("Refresh complete: persisted inventory state.", "inv.items")
+            if saveRet == DRL_RET_SUCCESS then
+                local purgedCount = inv.items.removePurgedPendingItems(purgedPendingIds)
+                dbot.debug("Refresh complete: persisted inventory state; purged pending=" ..
+                    tostring(purgedCount) .. ".", "inv.items")
+            else
+                dbot.warn("Refresh completed, but SQLite persistence failed; pending removals were not purged.")
+            end
         end
 
         if inv.items.pendingInvmonSave then
@@ -3182,6 +3943,11 @@ function inv.items.finishDiscovery()
 
     inv.items.discoveryComplete = true
     inv.state = invStateIdentify
+    -- Persist the complete discovery snapshot into build staging before the
+    -- one-item-per-second identify phase begins.
+    if inv.items.databaseBuildId and inv.items.save then
+        inv.items.save()
+    end
     inv.items.startIdentification()
 end
 
@@ -3412,7 +4178,13 @@ function inv.items.identifyNext()
     end
 
     local itemType = item.stats and item.stats[invStatFieldType]
-    local canUseCache = not inv.items.forceIdentify or inv.items.isFrequentCacheType(itemType)
+    local stagedResume = inv.items.buildResumeItems
+        and inv.items.buildResumeItems[tostring(objId)] or nil
+    local hasStagedFull = stagedResume and stagedResume.stats
+        and stagedResume.stats.identifyLevel == invIdLevelFull
+    local canUseCache = hasStagedFull
+        or not inv.items.forceIdentify
+        or inv.items.isFrequentCacheType(itemType)
     if canUseCache and inv.items.applyCachedStats(item) then
         item.stats.identifyLevel = invIdLevelFull
         inv.items.setItem(objId, item)
@@ -3701,6 +4473,14 @@ function inv.items.handleIdentifyFence(fallbackObjId)
         dbot.debug("handleIdentifyFence: Marked item as identified", "inv.items")
 
         inv.items.setItem(objId, item)
+        if inv.items.databaseBuildId then
+            inv.items.databaseBuildIdentifiedSinceFlush =
+                (tonumber(inv.items.databaseBuildIdentifiedSinceFlush) or 0) + 1
+            if inv.items.databaseBuildIdentifiedSinceFlush >=
+                (tonumber(inv.items.databaseBuildBatchSize) or 10) then
+                inv.items.save()
+            end
+        end
         if inv.items.identifyCreatedMissing then
             inv.items.identifyCreatedMissing[objId] = nil
         end
@@ -3779,6 +4559,60 @@ function inv.items.handleIdentifyFence(fallbackObjId)
     end)
 end
 
+function inv.items.restoreBuildOriginalState(reason)
+    local restored = inv.items.buildOriginalTable or {}
+    local restoredDetached = inv.items.buildOriginalDetached or {}
+    local restoredPendingRemoved = inv.items.buildOriginalPendingRemoved or {}
+    local current = inv.items.table or {}
+    local startEventSequence = tonumber(inv.items.buildStartEventSequence) or 0
+    local reattached = {}
+    local pendingReattached = {}
+
+    for objId, currentItem in pairs(current) do
+        if (tonumber(currentItem and currentItem.__dinvLastEventSeq) or 0) > startEventSequence then
+            local key = tostring(objId)
+            if restoredDetached[key] then reattached[key] = currentItem end
+            if restoredPendingRemoved[key] then pendingReattached[key] = currentItem end
+            restored[key] = currentItem
+            restoredDetached[key] = nil
+            restoredPendingRemoved[key] = nil
+        end
+    end
+    for objId, eventSeq in pairs(inv.items.eventTombstones or {}) do
+        if (tonumber(eventSeq) or 0) > startEventSequence then
+            restored[tostring(objId)] = nil
+            restoredDetached[tostring(objId)] = nil
+            restoredPendingRemoved[tostring(objId)] = nil
+        end
+    end
+
+    inv.items.table = restored
+    inv.items.detached = restoredDetached
+    inv.items.pendingRemoved = restoredPendingRemoved
+    if DINV and DINV.database and DINV.database.discardPending then
+        DINV.database.discardPending("active")
+    end
+    if DINV and DINV.database and DINV.database.markReattached then
+        for objId, item in pairs(reattached) do
+            DINV.database.markReattached(objId, item, "active")
+        end
+    end
+    if DINV and DINV.database and DINV.database.markPendingReattached then
+        for objId, item in pairs(pendingReattached) do
+            DINV.database.markPendingReattached(objId, item, "active")
+        end
+    end
+    inv.items.applyWorkflowRemovalEvents(tostring(reason or "build_restore"))
+    if inv.items.save then
+        inv.items.save()
+    end
+
+    inv.items.buildOriginalTable = nil
+    inv.items.buildOriginalDetached = nil
+    inv.items.buildOriginalPendingRemoved = nil
+    inv.items.buildStartEventSequence = nil
+end
+
 function inv.items.buildComplete()
     inv.items.finalizeInlineProgress()
     if inv.items.singleIdentifyMode then
@@ -3838,6 +4672,11 @@ function inv.items.buildComplete()
     if inv.organize and inv.organize.syncRulesFromConfig then
         inv.organize.syncRulesFromConfig({ warnMissing = false, saveItems = false })
     end
+    local retainBuildRemovalEvents = inv.items.databaseBuildId ~= nil
+    inv.items.applyWorkflowRemovalEvents(
+        "build_complete",
+        retainBuildRemovalEvents and { retainApplied = true } or nil
+    )
 
     -- Count results
     local totalItems = 0
@@ -3863,13 +4702,45 @@ function inv.items.buildComplete()
     local minutes = math.floor(elapsed / 60)
     local seconds = elapsed % 60
 
-    -- Save data
-    if inv.items.save then inv.items.save() end
+    -- Save data. A full build is staged and becomes primary only after this
+    -- final transaction; partial-identify runs update the active inventory.
+    local persistenceRet = inv.items.save and inv.items.save() or DRL_RET_INTERNAL_ERROR
+    if persistenceRet ~= DRL_RET_SUCCESS then
+        local failedBuildId = inv.items.databaseBuildId
+        if failedBuildId and DINV and DINV.database and DINV.database.interruptBuild then
+            DINV.database.interruptBuild(failedBuildId)
+        end
+        inv.items.databaseBuildId = nil
+        inv.items.databaseBuildIdentifiedSinceFlush = 0
+        dbot.deleteTimer(inv.items.timer.databaseBatchName)
+        inv.items.restoreBuildOriginalState("build_save_failure")
+        dbot.warn("Build activation was cancelled because the SQLite batch could not be committed; the active inventory was restored.")
+        return
+    end
+    if inv.items.databaseBuildId then
+        local buildId = inv.items.databaseBuildId
+        local finished, finishErr = DINV.database.finishBuild(buildId)
+        if not finished then
+            DINV.database.interruptBuild(buildId)
+            inv.items.databaseBuildId = nil
+            inv.items.databaseBuildIdentifiedSinceFlush = 0
+            dbot.deleteTimer(inv.items.timer.databaseBatchName)
+            inv.items.restoreBuildOriginalState("build_activation_failure")
+            dbot.warn("Build staging was preserved, activation failed, and the active inventory was restored: " .. tostring(finishErr))
+            return
+        end
+        inv.items.databaseBuildId = nil
+        inv.items.buildResumeItems = nil
+        dbot.deleteTimer(inv.items.timer.databaseBatchName)
+        if retainBuildRemovalEvents then
+            inv.items.workflowRemovalEvents = {}
+        end
+    end
     if not wasPartialIdentify then
-        if inv.config and inv.config.save then inv.config.save() end
         if inv.config and inv.config.table then
             inv.config.table.isBuildExecuted = true
         end
+        if inv.config and inv.config.save then inv.config.save() end
     end
 
     if wasPartialIdentify then
@@ -3908,6 +4779,9 @@ function inv.items.buildComplete()
     end
     local buildOriginalTable = inv.items.buildOriginalTable
     inv.items.buildOriginalTable = nil
+    inv.items.buildOriginalDetached = nil
+    inv.items.buildOriginalPendingRemoved = nil
+    inv.items.buildStartEventSequence = nil
     if DINV and DINV.api and DINV.api._onBuildComplete then
         pcall(DINV.api._onBuildComplete, buildOriginalTable)
     end
@@ -3915,11 +4789,14 @@ function inv.items.buildComplete()
     inv.items.scheduleDeferredIdentifyProcessing("buildComplete")
 end
 
-function inv.items.buildAbort()
-    if not inv.items.buildInProgress then
+function inv.items.buildAbort(options)
+    if not inv.items.buildInProgress and not inv.items.identifyInProgress then
         dbot.info("No build is currently in progress.")
         return DRL_RET_SUCCESS
     end
+    local quiet = options == true
+        or (type(options) == "table" and options.quiet == true)
+    local interrupt = type(options) == "table" and options.interrupt == true
 
     -- Stop everything
     inv.items.clearInlineProgress()
@@ -3944,7 +4821,30 @@ function inv.items.buildAbort()
     inv.items.identifyCreatedMissing = {}
     inv.items.identifySawOutput = {}
     inv.items.identifyHydratedFromInvdata = {}
-    inv.items.buildOriginalTable = nil
+    local hasBuildSnapshot = inv.items.buildOriginalTable ~= nil
+    if inv.items.databaseBuildId and DINV and DINV.database then
+        local persistenceOk, persistenceErr
+        if interrupt and DINV.database.interruptBuild then
+            persistenceOk, persistenceErr = DINV.database.interruptBuild(inv.items.databaseBuildId)
+        elseif DINV.database.abortBuild then
+            persistenceOk, persistenceErr = DINV.database.abortBuild(inv.items.databaseBuildId)
+        elseif DINV.database.interruptBuild then
+            persistenceOk, persistenceErr = DINV.database.interruptBuild(inv.items.databaseBuildId)
+        end
+        if persistenceOk == false then
+            dbot.warn("Unable to finalize SQLite build staging: " .. tostring(persistenceErr))
+        end
+    end
+    inv.items.databaseBuildId = nil
+    inv.items.buildResumeItems = nil
+    inv.items.databaseBuildIdentifiedSinceFlush = 0
+    dbot.deleteTimer(inv.items.timer.databaseBatchName)
+    if hasBuildSnapshot then
+        inv.items.restoreBuildOriginalState(interrupt and "build_interrupt" or "build_abort")
+    else
+        inv.items.applyWorkflowRemovalEvents("identify_abort")
+        if inv.items.save then inv.items.save() end
+    end
     inv.state = invStateIdle
     if DINV and DINV.setBuildPhase then
         DINV.setBuildPhase(0)
@@ -3956,7 +4856,9 @@ function inv.items.buildAbort()
         DINV.discovery.unregisterIdentifyTriggers()
     end
 
-    cecho("\n<yellow>[DINV] Build aborted by user.\n")
+    if not quiet then
+        cecho("\n<yellow>[DINV] Build aborted by user.\n")
+    end
 
     local endTag = inv.items.buildEndTag
     inv.items.buildEndTag = nil
@@ -3965,7 +4867,9 @@ function inv.items.buildAbort()
         inv.tags.stop(invTagsBuild, endTag, DRL_RET_HALTED)
     end
 
-    inv.items.maybeStartKeepFlagSync()
+    if not quiet then
+        inv.items.maybeStartKeepFlagSync()
+    end
     return DRL_RET_SUCCESS
 end
 
@@ -4004,6 +4908,7 @@ function inv.items.onInvmon(dataLine)
     objId = tostring(objId)
     containerId = tostring(containerId)
     wearLoc = tonumber(wearLoc)
+    local eventSeq = inv.items.nextEventSequence()
 
     if objId == "" then
         dbot.debug("onInvmon: objId is empty after parse", "inv.items")
@@ -4016,7 +4921,30 @@ function inv.items.onInvmon(dataLine)
     -- Check if we have a wait state for the identify process
     local waitState = inv.items.identifyWaitForInvmon
     local item = inv.items.getItem(objId)
+        or inv.items.getDetachedItem(objId)
+        or inv.items.getPendingRemovedItem(objId)
     local actionName = invmon and invmon.action and invmon.action[actionNum] or "Unknown"
+    local eventReason = actionNum == invmonActionConsumed
+        and "consumed_or_rotted" or tostring(actionName):lower()
+    if DINV and DINV.database then
+        if actionNum == invmonActionConsumed and DINV.database.recordTerminalRemoval then
+            local persisted, persistErr = DINV.database.recordTerminalRemoval(
+                eventSeq, objId, actionNum, eventReason, containerId, wearLoc
+            )
+            if not persisted then
+                dbot.warn("Unable to persist consumed/rotted removal immediately: " .. tostring(persistErr))
+                if DINV.database.recordInventoryEvent then
+                    DINV.database.recordInventoryEvent(
+                        eventSeq, objId, actionNum, eventReason, containerId, wearLoc
+                    )
+                end
+            end
+        elseif DINV.database.recordInventoryEvent then
+            DINV.database.recordInventoryEvent(
+                eventSeq, objId, actionNum, eventReason, containerId, wearLoc
+            )
+        end
+    end
     local preLocation = item and item.stats and item.stats[invStatFieldLocation] or "unknown"
     local preContainer = item and item.stats and item.stats[invStatFieldContainer] or ""
     local itemName = item
@@ -4111,11 +5039,15 @@ function inv.items.onInvmon(dataLine)
 
     -- Update item location in our tracking (both during build and after)
     local shouldSave = false
+    local forceImmediateSave = false
 
     -- Any action other than explicit consumption indicates the item still exists
     -- somewhere, so cancel delayed removal if one is pending.
     if actionNum ~= invmonActionConsumed then
         inv.items.cancelPendingRemoval(objId)
+        if inv.items.workflowRemovalEvents then
+            inv.items.workflowRemovalEvents[tostring(objId)] = nil
+        end
     end
 
     if item then
@@ -4156,11 +5088,27 @@ function inv.items.onInvmon(dataLine)
             if inv.items.eqdataSeen then
                 inv.items.eqdataSeen[tostring(objId)] = nil
             end
-            inv.items.removeItemFromCache(objId, item)
-            inv.items.removeItem(objId)
-            item = nil
-            dbot.debug("onInvmon: Item removed from inventory and pruned from persistence", "inv.items")
-            shouldSave = true
+            if inv.items.buildInProgress or inv.items.refreshInProgress or inv.items.identifyInProgress then
+                item.stats = item.stats or {}
+                item.stats[invStatFieldWorn] = invItemWornNotWorn
+                item.stats[invStatFieldContainer] = ""
+                inv.items.updateLocation(item, "unknown")
+                inv.items.recordWorkflowRemoval(objId, actionNum, eventSeq)
+                dbot.debug("onInvmon: Deferred action 3 removal during active workflow", "inv.items")
+                shouldSave = true
+            else
+                local finalized = inv.items.finalizeRemovedFromInventory(
+                    objId, eventSeq, "invmon_removed_from_inventory", actionNum
+                )
+                if finalized then
+                    item = nil
+                    dbot.debug("onInvmon: Item removed, pending, or subtree detached after action 3", "inv.items")
+                else
+                    dbot.warn("Unable to reconcile removed inventory object " .. tostring(objId) ..
+                        "; retaining its active record")
+                end
+                shouldSave = true
+            end
 
         elseif actionNum == invmonActionAddedToInv then
             -- Item was added to inventory
@@ -4172,6 +5120,10 @@ function inv.items.onInvmon(dataLine)
                 inv.items.eqdataSeen[tostring(objId)] = nil
             end
             dbot.debug("onInvmon: Item added to inventory", "inv.items")
+            -- An invitem message can arrive before action 4 and reactivate the
+            -- root by itself. Always reconcile descendants by this exact
+            -- detached-root ID so that ordering cannot strand the subtree.
+            forceImmediateSave = inv.items.reattachDetachedSubtree(objId, eventSeq) > 0
             shouldSave = true
 
         elseif actionNum == invmonActionTakenOutOfContainer then
@@ -4206,6 +5158,35 @@ function inv.items.onInvmon(dataLine)
             dbot.debug("onInvmon: Item put into container " .. tostring(containerId), "inv.items")
             shouldSave = true
 
+        elseif actionNum == invmonActionPutIntoVault then
+            item.stats = item.stats or {}
+            item.stats[invStatFieldLocation] = "vault"
+            item.stats[invStatFieldContainer] = "vault"
+            item.stats[invStatFieldWorn] = invItemWornNotWorn
+            item.__dinvLastEventSeq = eventSeq
+            local workflowActive = inv.items.buildInProgress or inv.items.refreshInProgress
+                or inv.items.identifyInProgress
+            if not workflowActive and inv.items.table[tostring(objId)] then
+                inv.items.detachSubtree(objId, "invmon_put_into_vault")
+                item = nil
+            elseif workflowActive then
+                inv.items.recordWorkflowRemoval(objId, actionNum, eventSeq)
+            end
+            dbot.debug("onInvmon: Item put into vault", "inv.items")
+            shouldSave = true
+
+        elseif actionNum == invmonActionRemovedFromVault then
+            item.stats = item.stats or {}
+            item.stats[invStatFieldLocation] = invItemLocInventory
+            item.stats[invStatFieldContainer] = nil
+            item.stats[invStatFieldWorn] = invItemWornNotWorn
+            dbot.debug("onInvmon: Item removed from vault", "inv.items")
+            -- Vault retrieval has the same possible invitem-before-invmon
+            -- ordering as a normal get. The root-scoped lookup is a no-op
+            -- when this object has no detached subtree.
+            forceImmediateSave = inv.items.reattachDetachedSubtree(objId, eventSeq) > 0
+            shouldSave = true
+
         elseif actionNum == invmonActionPutIntoKeyring then
             -- Item was put into keyring (action 11)
             item.stats = item.stats or {}
@@ -4236,8 +5217,10 @@ function inv.items.onInvmon(dataLine)
             if inv.items.eqdataSeen then
                 inv.items.eqdataSeen[tostring(objId)] = nil
             end
-            inv.items.removeItemAndSaveNow(objId, "invmon_consumed")
-            dbot.debug("onInvmon: Item consumed: " .. tostring(objId), "inv.items")
+            inv.items.eventTombstones[tostring(objId)] = eventSeq
+            inv.items.removeItemAndSaveNow(objId, "invmon_consumed_or_rotted")
+            item = nil
+            dbot.debug("onInvmon: Item consumed or rotted: " .. tostring(objId), "inv.items")
             shouldSave = false
         end
     elseif actionNum == invmonActionAddedToInv then
@@ -4245,14 +5228,15 @@ function inv.items.onInvmon(dataLine)
         if inv.items.eqdataSeen then
             inv.items.eqdataSeen[tostring(objId)] = nil
         end
-        if inv.items.add then
-            inv.items.add(objId)
-            local newItem = inv.items.getItem(objId)
-            if newItem then
-                newItem.stats = newItem.stats or {}
-                newItem.stats[invStatFieldLocation] = "inventory"
-            end
-        end
+        local newItem = { stats = {
+            [invStatFieldId] = tostring(objId),
+            [invStatFieldLocation] = "inventory",
+            [invStatFieldWorn] = invItemWornNotWorn,
+            identifyLevel = invIdLevelNone,
+        } }
+        inv.items.markLocationObserved(newItem, "invmon", eventSeq)
+        inv.items.setItem(objId, newItem)
+        item = newItem
         dbot.debug("onInvmon: New item added to inventory: " .. tostring(objId), "inv.items")
         shouldSave = true
     else
@@ -4268,6 +5252,8 @@ function inv.items.onInvmon(dataLine)
     end
 
     if item then
+        inv.items.markLocationObserved(item, "invmon", eventSeq)
+        inv.items.setItem(objId, item)
         local postLocation = item.stats and item.stats[invStatFieldLocation] or "unknown"
         local postContainer = item.stats and item.stats[invStatFieldContainer] or ""
         local postWorn = item.stats and item.stats[invStatFieldWorn] or ""
@@ -4283,8 +5269,15 @@ function inv.items.onInvmon(dataLine)
         )
     end
 
-    if shouldSave then
+    if forceImmediateSave and not inv.items.buildInProgress
+        and not inv.items.refreshInProgress and not inv.items.identifyInProgress then
+        inv.items.save()
+    elseif shouldSave or actionNum ~= invmonActionConsumed then
         inv.items.scheduleSaveFromInvmon()
+    end
+
+    if inv.operations and inv.operations.observe then
+        inv.operations.observe(actionNum, objId, containerId, wearLoc)
     end
 
     if DINV and DINV.api and DINV.api._onInventoryAction then
@@ -4411,6 +5404,7 @@ function inv.items.setStatField(objId, field, value)
         item.stats = {}
     end
     item.stats[field] = value
+    inv.items.setItem(objId, item)
     return DRL_RET_SUCCESS
 end
 
@@ -4602,26 +5596,45 @@ function inv.items.matchesQuery(objId, query)
     return inv.items.matchesParsedQuery(objId, inv.items.parseQuery(query or ""))
 end
 
-function inv.items.search(query, displayMode)
+function inv.items.search(query, displayMode, options)
     displayMode = displayMode or "basic"
+    options = options or {}
 
     if inv.items.table == nil or dbot.table.getNumEntries(inv.items.table) == 0 then
         dbot.info("Your inventory table is empty. Run '@Gdinv build confirm@W' to populate it.")
         return {}, DRL_RET_SUCCESS
     end
 
-    local results = {}
     local clauses = inv.items.parseQuery(query or "")
-
-    for objId, _ in pairs(inv.items.table) do
-        if inv.items.matchesParsedQuery(objId, clauses) then
-            local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
-            if container ~= "" and inv.config.isIgnored(container) then
-                -- Skip ignored containers.
-            else
-                table.insert(results, objId)
+    local results = nil
+    if DINV and DINV.database and DINV.database.searchParsed then
+        local searchError
+        results, searchError = DINV.database.searchParsed(
+            clauses,
+            inv.items.databaseBuildId and "build" or "active"
+        )
+        if not results then
+            dbot.warn("SQLite search failed: " .. tostring(searchError))
+            return {}, DRL_RET_INTERNAL_ERROR
+        end
+    else
+        results = {}
+        for objId, _ in pairs(inv.items.table) do
+            if inv.items.matchesParsedQuery(objId, clauses) then
+                table.insert(results, tostring(objId))
             end
         end
+    end
+
+    if not options.includeIgnored then
+        local visible = {}
+        for _, objId in ipairs(results) do
+            local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
+            if container == "" or not inv.config.isIgnored(container) then
+                table.insert(visible, objId)
+            end
+        end
+        results = visible
     end
 
     -- Handle relative matches like "3.sword" by applying ordinal filtering.
@@ -4702,7 +5715,11 @@ function inv.items.sort(itemIds, sortCriteria)
                 end
             end
         end
-        return false
+        local numericId1, numericId2 = tonumber(id1), tonumber(id2)
+        if numericId1 and numericId2 and numericId1 ~= numericId2 then
+            return numericId1 < numericId2
+        end
+        return tostring(id1) < tostring(id2)
     end)
 end
 

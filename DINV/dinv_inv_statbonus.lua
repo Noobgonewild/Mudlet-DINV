@@ -37,12 +37,13 @@ function inv.statBonus.save()
     if inv.statBonus.table == nil then
         return inv.statBonus.reset()
     end
-    return dbot.storage.saveTable(dbot.backup.getCurrentDir() .. inv.statBonus.stateName,
-                                   "inv.statBonus.table", inv.statBonus.table, true)
+    return DINV.database.saveModuleTable("statbonus", inv.statBonus.table)
 end
 
 function inv.statBonus.load()
-    return dbot.storage.loadTable(dbot.backup.getCurrentDir() .. inv.statBonus.stateName, inv.statBonus.reset)
+    local value, retval = DINV.database.loadModuleTable("statbonus", inv.statBonus.reset)
+    if value then inv.statBonus.table = value end
+    return retval
 end
 
 local function ensureStatBonusTableShape()
@@ -213,7 +214,7 @@ function inv.statBonus.set()
     end
 
     table.insert(inv.statBonus.table.levelHistory[tostring(level)], snapshot)
-    return DRL_RET_SUCCESS
+    return inv.statBonus.save()
 end
 
 function inv.statBonus.getSpellBonus(stat, level)

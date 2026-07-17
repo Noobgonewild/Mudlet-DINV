@@ -31,12 +31,13 @@ function inv.snapshot.save()
     if inv.snapshot.table == nil then
         return inv.snapshot.reset()
     end
-    return dbot.storage.saveTable(dbot.backup.getCurrentDir() .. inv.snapshot.stateName,
-                                   "inv.snapshot.table", inv.snapshot.table, true)
+    return DINV.database.saveModuleTable("snapshot", inv.snapshot.table)
 end
 
 function inv.snapshot.load()
-    return dbot.storage.loadTable(dbot.backup.getCurrentDir() .. inv.snapshot.stateName, inv.snapshot.reset)
+    local value, retval = DINV.database.loadModuleTable("snapshot", inv.snapshot.reset)
+    if value then inv.snapshot.table = value end
+    return retval
 end
 
 function inv.snapshot.reset()
@@ -64,11 +65,17 @@ function inv.snapshot.create(name, endTag)
         end
     end
 
+    local previous = inv.snapshot.table[name]
     inv.snapshot.table[name] = {
         created = os.time(),
         equipment = equipment
     }
 
+    local saveRet = inv.snapshot.save()
+    if saveRet ~= DRL_RET_SUCCESS then
+        inv.snapshot.table[name] = previous
+        return inv.tags.stop(invTagsSnapshot, endTag, saveRet)
+    end
     dbot.info("Snapshot '" .. name .. "' saved with " .. dbot.table.getNumEntries(equipment) .. " item(s)")
     return inv.tags.stop(invTagsSnapshot, endTag, DRL_RET_SUCCESS)
 end
@@ -82,7 +89,13 @@ function inv.snapshot.delete(name, endTag)
         dbot.warn("Snapshot '" .. name .. "' does not exist")
         return DRL_RET_MISSING_ENTRY
     end
+    local previous = inv.snapshot.table[name]
     inv.snapshot.table[name] = nil
+    local saveRet = inv.snapshot.save()
+    if saveRet ~= DRL_RET_SUCCESS then
+        inv.snapshot.table[name] = previous
+        return saveRet
+    end
     dbot.info("Deleted snapshot '" .. name .. "'")
     return DRL_RET_SUCCESS
 end

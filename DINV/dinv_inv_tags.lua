@@ -67,12 +67,12 @@ function inv.tags.save()
     if inv.tags.table == nil then
         return inv.tags.reset()
     end
-    return dbot.storage.saveTable(dbot.backup.getCurrentDir() .. inv.tags.stateName,
-                                   "inv.tags.table", inv.tags.table, true)
+    return DINV.database.saveModuleTable("tags", inv.tags.table)
 end
 
 function inv.tags.load()
-    local retval = dbot.storage.loadTable(dbot.backup.getCurrentDir() .. inv.tags.stateName, inv.tags.reset)
+    local value, retval = DINV.database.loadModuleTable("tags", inv.tags.reset)
+    if value then inv.tags.table = value end
     if retval ~= DRL_RET_SUCCESS then
         dbot.warn("inv.tags.load: Failed to load tags table: " .. dbot.retval.getString(retval))
         return retval

@@ -35,12 +35,13 @@ function inv.analyze.save()
     if inv.analyze.table == nil then
         return inv.analyze.reset()
     end
-    return dbot.storage.saveTable(dbot.backup.getCurrentDir() .. inv.analyze.stateName,
-        "inv.analyze.table", inv.analyze.table, true)
+    return DINV.database.saveModuleTable("analyze", inv.analyze.table)
 end
 
 function inv.analyze.load()
-    return dbot.storage.loadTable(dbot.backup.getCurrentDir() .. inv.analyze.stateName, inv.analyze.reset)
+    local value, retval = DINV.database.loadModuleTable("analyze", inv.analyze.reset)
+    if value then inv.analyze.table = value end
+    return retval
 end
 
 function inv.analyze.reset()

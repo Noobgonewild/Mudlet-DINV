@@ -238,12 +238,13 @@ function inv.priority.save()
     if inv.priority.table == nil then
         return inv.priority.reset()
     end
-    return dbot.storage.saveTable(dbot.backup.getCurrentDir() .. inv.priority.stateName,
-                                   "inv.priority.table", inv.priority.table, true)
+    return DINV.database.saveModuleTable("priority", inv.priority.table)
 end
 
 function inv.priority.load()
-    return dbot.storage.loadTable(dbot.backup.getCurrentDir() .. inv.priority.stateName, inv.priority.reset)
+    local value, retval = DINV.database.loadModuleTable("priority", inv.priority.reset)
+    if value then inv.priority.table = value end
+    return retval
 end
 
 function inv.priority.reset()

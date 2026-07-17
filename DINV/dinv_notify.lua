@@ -56,16 +56,13 @@ function dbot.notify.save()
     if dbot.notify.table == nil then
         return dbot.notify.reset()
     end
-    return dbot.storage.saveTable(
-        dbot.backup.getCurrentDir() .. dbot.notify.name,
-        "dbot.notify.table",
-        dbot.notify.table,
-        true
-    )
+    return DINV.database.saveModuleTable("notify", dbot.notify.table)
 end
 
 function dbot.notify.load()
-    return dbot.storage.loadTable(dbot.backup.getCurrentDir() .. dbot.notify.name, dbot.notify.reset)
+    local value, retval = DINV.database.loadModuleTable("notify", dbot.notify.reset)
+    if value then dbot.notify.table = value end
+    return retval
 end
 
 function dbot.notify.init.atInstall()

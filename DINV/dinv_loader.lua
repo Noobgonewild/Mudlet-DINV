@@ -10,7 +10,7 @@
 ----------------------------------------------------------------------------------------------------
 
 DINV = DINV or {}
-DINV.version = "2.0057"
+DINV.version = "2.0062"
 DINV.name = "Durel's Inventory Manager"
 
 -- Determine the path to the DINV directory
@@ -33,14 +33,17 @@ pluginStatePath = getMudletHomeDir() .. "/dinv-" .. pluginId .. "/"
 DINV.modules = {
     -- Core utilities (DBOT) - MUST be loaded first
     "dinv_dbot",
+    "dinv_notify",
     
     -- INV Core and Configuration
     "dinv_inv_core",
+    "dinv_database",
     "dinv_debug",
     "dinv_inv_config",
     
     -- Inventory Management
     "dinv_inv_items",
+    "dinv_operations",
     "dinv_discovery",
     "dinv_inv_cache",
     
@@ -53,6 +56,7 @@ DINV.modules = {
     
     -- Analysis
     "dinv_inv_analyze",
+    "dinv_levelup",
     "dinv_inv_usage",
     "dinv_inv_compare",
     "dinv_inv_statbonus",
@@ -65,6 +69,7 @@ DINV.modules = {
     "dinv_inv_regen",
     "dinv_inv_organize",
     "dinv_inv_keyword",
+    "dinv_inv_tags",
     
     -- Custom/Extended Modules
     "dinv_inv_unused",

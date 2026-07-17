@@ -851,6 +851,10 @@ function api.search(query, options)
         local items = {}
         local scanned = 0
 
+        -- The public source contract is stronger than the internal default
+        -- search target: live, active persistence, and build staging can be
+        -- different tables during a workflow. Match the selected source
+        -- directly so returned IDs and returned records always agree.
         for objId, item in pairs(source) do
             scanned = scanned + 1
             local ignored = false
@@ -858,7 +862,8 @@ function api.search(query, options)
                 local container = tostring(getRawField(item, "container") or "")
                 ignored = container ~= "" and inv.config.isIgnored(container)
             end
-            if shouldExposeItem(item, options) and not ignored and matchesCriteria(objId, item, clauses) then
+            if shouldExposeItem(item, options) and not ignored
+                and matchesCriteria(objId, item, clauses) then
                 table.insert(items, normalizeItem(objId, item, options))
             end
         end

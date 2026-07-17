@@ -16,11 +16,52 @@
 ----------------------------------------------------------------------------------------------------
 
 DINV = DINV or {}
-DINV.version = { major = 2, minor = 57 }
+DINV.version = { major = 2, minor = 62 }
 
 -- Get the Mudlet profile directory for module loading
 local profilePath = getMudletHomeDir()
 DINV.modulePath = profilePath .. "/DINV/"
+
+-- Every required module must exist in the exact DINV folder before any are loaded.
+DINV.modules = {
+    "dinv_dbot", "dinv_notify", "dinv_inv_core", "dinv_database", "dinv_debug",
+    "dinv_inv_config", "dinv_inv_items", "dinv_operations", "dinv_discovery", "dinv_inv_cache",
+    "dinv_inv_priority", "dinv_inv_score", "dinv_inv_set", "dinv_inv_weapon",
+    "dinv_inv_snapshot", "dinv_inv_analyze", "dinv_levelup", "dinv_inv_usage",
+    "dinv_inv_compare", "dinv_inv_statbonus", "dinv_inv_consume", "dinv_inv_portal",
+    "dinv_inv_pass", "dinv_inv_regen", "dinv_inv_organize", "dinv_inv_keyword",
+    "dinv_inv_tags", "dinv_inv_unused", "dinv_inv_discover", "dinv_inv_report",
+    "dinv_rid", "dinv_api", "dinv_cli", "dinv_triggers", "dinv_aliases",
+}
+
+function DINV.setTriggerGroupEnabled(enabled)
+    local setter = enabled and enableTrigger or disableTrigger
+    if type(setter) == "function" then pcall(setter, "DINV_Triggers") end
+end
+
+function DINV.preflight()
+    local missing = {}
+    for _, module in ipairs(DINV.modules) do
+        local file = io.open(DINV.modulePath .. module .. ".lua", "rb")
+        if file then
+            file:close()
+        else
+            table.insert(missing, module .. ".lua")
+        end
+    end
+    return #missing == 0, missing
+end
+
+function DINV.printInstallationWarning(missing)
+    if DINV.installWarningShown then return end
+    cecho("&lt;orange_red&gt;[DINV INSTALLATION WARNING]&lt;reset&gt; DINV was not loaded.\n")
+    cecho("&lt;yellow&gt;Required folder name:&lt;reset&gt; DINV\n")
+    cecho("&lt;yellow&gt;Required folder location:&lt;reset&gt; " .. profilePath .. "/DINV\n")
+    cecho("&lt;yellow&gt;Missing required files:&lt;reset&gt; " .. table.concat(missing or {}, ", ") .. "\n")
+    cecho("Move the complete addon folder into the active profile and name it exactly &lt;cyan&gt;DINV&lt;reset&gt; (not &lt;red&gt;dinv&lt;reset&gt;).\n")
+    cecho("No DINV modules were loaded, and DINV triggers were disabled to prevent follow-on errors.\n")
+    DINV.installWarningShown = true
+end
 
 ----------------------------------------------------------------------------------------------------
 -- Module Loader
@@ -53,59 +94,33 @@ end
 ----------------------------------------------------------------------------------------------------
 
 function DINV.initialize()
-    cecho("\n&lt;cyan&gt;[DINV] Initializing Durel's Inventory Manager v" .. 
-          DINV.version.major .. "." .. DINV.version.minor .. "\n")
-    
-    -- Load modules in order
-    local modules = {
-        "dinv_dbot",        -- Core utilities
-        "dinv_notify",      -- Notification channel controls
-        "dinv_inv_core",    -- Inventory core
-        "dinv_debug",       -- Debug utilities
-        "dinv_inv_config",  -- Configuration
-        "dinv_inv_items",   -- Item management
-        "dinv_discovery",   -- Inventory discovery triggers
-        "dinv_inv_cache",   -- Item cache
-        "dinv_inv_priority",-- Stat priorities
-        "dinv_inv_score",   -- Item scoring
-        "dinv_inv_set",     -- Equipment sets
-        "dinv_inv_weapon",  -- Weapon sets
-        "dinv_inv_snapshot",-- Snapshots
-        "dinv_inv_analyze", -- Analysis
-        "dinv_levelup",     -- Level-up notification mode/settings
-        "dinv_inv_usage",   -- Usage tracking
-        "dinv_inv_compare", -- Item comparison
-        "dinv_inv_statbonus",-- Stat bonuses
-        "dinv_inv_consume", -- Consumables
-        "dinv_inv_portal",  -- Portals
-        "dinv_inv_pass",    -- Area passes
-        "dinv_inv_regen",   -- Regen ring
-        "dinv_inv_organize",-- Organization
-        "dinv_inv_keyword", -- Keywords
-        "dinv_inv_tags",    -- Command tags
-        "dinv_inv_unused",  -- Unused items
-        "dinv_inv_discover",-- Discover command helpers
-        "dinv_inv_report",  -- Report output
-        "dinv_rid",         -- Rid test reporting
-        "dinv_api",         -- Public addon integration API
-        "dinv_cli",         -- CLI routing
-        "dinv_triggers",    -- Mudlet triggers
-        "dinv_aliases",     -- Mudlet aliases
-    }
+    cecho("\n&lt;cyan&gt;[DINV] Initializing Durel's Inventory Manager v" ..
+          string.format("%d.%04d", DINV.version.major, DINV.version.minor) .. "\n")
+
+    DINV.setTriggerGroupEnabled(false)
+    local installationReady, missing = DINV.preflight()
+    if not installationReady then
+        DINV.printInstallationWarning(missing)
+        return false
+    end
+    DINV.installWarningShown = nil
     
     local loaded = 0
     local failedModules = {}
-    for _, module in ipairs(modules) do
+    for _, module in ipairs(DINV.modules) do
         if DINV.loadModule(module) then
             loaded = loaded + 1
         else
             table.insert(failedModules, module)
+            break
         end
     end
 
     cecho("&lt;cyan&gt;[DINV] Loaded " .. loaded .. " modules\n")
     if #failedModules &gt; 0 then
-        cecho("&lt;yellow&gt;[DINV] Failed to load " .. #failedModules .. " modules (" .. table.concat(failedModules, ", ") .. ")\n")
+        cecho("&lt;red&gt;[DINV MODULE ERROR]&lt;reset&gt; Failed while loading " .. table.concat(failedModules, ", ") .. ".\n")
+        cecho("DINV triggers remain disabled to prevent follow-on errors.\n")
+        return false
     end
     
     -- Initialize if critical modules loaded
@@ -135,6 +150,7 @@ function DINV.initialize()
 
         -- Register GMCP handlers (base/status)
         DINV.registerGMCPHandlers()
+        DINV.setTriggerGroupEnabled(true)
         
         cecho("&lt;green&gt;[DINV] Initialization complete!\n\n")
         return true
@@ -156,6 +172,21 @@ end
 function DINV.onGMCPCharBase()
     if dbot and dbot.gmcp then
         dbot.gmcp.isInitialized = true
+        local incomingName = dbot.gmcp.getName and tostring(dbot.gmcp.getName() or "") or ""
+        local databaseName = DINV.database and tostring(DINV.database.character or "") or ""
+        if DINV.database and DINV.database.isOpen
+            and incomingName ~= "" and databaseName ~= ""
+            and incomingName:lower() ~= databaseName:lower() then
+            dbot.info("Switching DINV persistence from " .. databaseName .. " to " .. incomingName .. ".")
+            if inv and inv.operations and inv.operations.cancelAll then
+                inv.operations.cancelAll()
+            end
+            if inv and inv.fini then inv.fini(true) end
+            if dbot.fini then dbot.fini(true) end
+            DINV.database.close()
+            if DINV.database.resetRuntimeState then DINV.database.resetRuntimeState() end
+            dbot.gmcp.isInitialized = true
+        end
         if inv and inv.init and inv.init.atActive and not inv.init.initializedActive then
             inv.init.atActive()
         end
@@ -175,15 +206,12 @@ end
 -- Auto-start check
 ----------------------------------------------------------------------------------------------------
 
-local checkPath = DINV.modulePath .. "dinv_dbot.lua"
-local checkFile = io.open(checkPath, "r")
-if checkFile then
-    checkFile:close()
+local installationReady, missing = DINV.preflight()
+if installationReady then
     tempTimer(1, function() DINV.initialize() end)
 else
-    cecho("\n&lt;orange&gt;DINV: Module files not found at: " .. DINV.modulePath .. "\n")
-    cecho("&lt;cyan&gt;DINV: Please copy DINV module files to that directory, then run:\n")
-    cecho("&lt;yellow&gt;       lua DINV.initialize()\n\n")
+    DINV.setTriggerGroupEnabled(false)
+    DINV.printInstallationWarning(missing)
 end
 </script>
         <eventHandlerList/>

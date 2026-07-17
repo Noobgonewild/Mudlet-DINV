@@ -170,7 +170,7 @@ invmon.action = {
     [4]  = "AddedToInv",
     [5]  = "TakenOutOfContainer",
     [6]  = "PutIntoContainer",
-    [7]  = "Consumed",
+    [7]  = "ConsumedOrRotted",
     [9]  = "PutIntoVault",
     [10] = "RemovedFromVault",
     [11] = "PutIntoKeyring",
@@ -226,7 +226,8 @@ invItemTypePotion    = "Potion"
 invItemTypePill      = "Pill"
 invItemTypeScroll    = "Scroll"
 invItemTypeWand      = "Wand"
-invItemTypeStaff     = "Staff"
+invItemTypeStave     = "Stave"
+invItemTypeStaff     = invItemTypeStave -- compatibility alias; Aardwolf calls this type Stave
 invItemTypePortal    = "Portal"
 invItemTypeFood      = "Food"
 invItemTypeDrink     = "Drink Container"
@@ -528,7 +529,7 @@ inv.state = invStateIdle
 
 inv.version = {}
 inv.version.pluginMajor = 2
-inv.version.pluginMinor = 56
+inv.version.pluginMinor = 62
 inv.version.full = inv.version.pluginMajor + (inv.version.pluginMinor / 10000)
 
 inv.version.table = {
@@ -655,6 +656,20 @@ function inv.init.atActiveDirect()
     if dbot.gmcp.isInitialized == false then
         dbot.warn("inv.init.atActiveDirect: GMCP is not initialized when we are active!")
         return DRL_RET_INTERNAL_ERROR
+    end
+
+    -- SQLite must be available before any dbot/inventory module loads its
+    -- persisted state. This also performs each legacy-file migration once.
+    if DINV and DINV.database and DINV.database.initialize then
+        local databaseOk, databaseErr = DINV.database.initialize()
+        if not databaseOk then
+            dbot.warn("inv.init.atActiveDirect: Failed to initialize SQLite persistence: " ..
+                tostring(databaseErr))
+            return DRL_RET_INTERNAL_ERROR
+        end
+    end
+    if DINV and DINV.debug and DINV.debug.load then
+        DINV.debug.load()
     end
     
     -- Initialize dbot "at active" modules

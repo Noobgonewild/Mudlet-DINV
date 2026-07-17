@@ -38,12 +38,13 @@ function inv.set.save()
     if inv.set.table == nil then
         return inv.set.reset()
     end
-    return dbot.storage.saveTable(dbot.backup.getCurrentDir() .. inv.set.stateName,
-                                   "inv.set.table", inv.set.table, true)
+    return DINV.database.saveModuleTable("set", inv.set.table)
 end
 
 function inv.set.load()
-    return dbot.storage.loadTable(dbot.backup.getCurrentDir() .. inv.set.stateName, inv.set.reset)
+    local value, retval = DINV.database.loadModuleTable("set", inv.set.reset)
+    if value then inv.set.table = value end
+    return retval
 end
 
 function inv.set.reset()
@@ -1177,19 +1178,16 @@ function inv.set.wear(priorityName, level, endTag)
     end
 
     local function markItemInventory(objId)
-        inv.items.setStatField(objId, invStatFieldWorn, invItemWornNotWorn)
-        inv.items.setStatField(objId, invStatFieldLocation, invItemLocInventory)
+        -- Invmon is authoritative; do not persist an expected state before the
+        -- server confirms the command batch.
     end
 
     local function markItemStored(objId, containerId)
-        inv.items.setStatField(objId, invStatFieldWorn, invItemWornNotWorn)
-        inv.items.setStatField(objId, invStatFieldLocation, tostring(containerId))
-        inv.items.setStatField(objId, invStatFieldLastStored, tostring(containerId))
+        -- Invmon action 6 will update location/container.
     end
 
     local function markItemWorn(objId, wearLoc)
-        inv.items.setStatField(objId, invStatFieldWorn, wearLoc)
-        inv.items.setStatField(objId, invStatFieldLocation, wearLoc)
+        -- Invmon action 2 will update the exact observed wear slot.
     end
 
     local function queueStoreRemovedItem(objId, alreadyRemoved)
@@ -1246,7 +1244,6 @@ function inv.set.wear(priorityName, level, endTag)
         end
     end
 
-    local processedDesiredIds = {}
     for _, loc in ipairs(inv.set.wearableLocations) do
         local desiredObjId = setData.equipment[loc]
         if desiredObjId then
@@ -1318,6 +1315,13 @@ function inv.set.wear(priorityName, level, endTag)
     end
 
     if #commands > 0 then
+        if inv.operations and inv.operations.startBatchFromCommands then
+            inv.operations.startBatchFromCommands(
+                "Equipment set '" .. tostring(priorityName) .. "'",
+                commands,
+                { timeout = math.max(8, #commands * 0.2 + 4) }
+            )
+        end
         if inv.items and inv.items.sendActionCommands then
             inv.items.sendActionCommands(commands)
         elseif dbot.execute and dbot.execute.safe and dbot.execute.safe.commands then
@@ -1333,11 +1337,11 @@ function inv.set.wear(priorityName, level, endTag)
         end
     end
 
-    if inv.items and inv.items.save then
-        inv.items.save()
+    if #commands > 0 then
+        dbot.debug("Equipment set commands sent; waiting for final invmon observations.", "inv.set")
+    else
+        dbot.info("Equipment set already matches the observed worn state.")
     end
-
-    dbot.info("Equipment set applied!")
 
     if endTag then
         return inv.tags.stop(invTagsSet, endTag, DRL_RET_SUCCESS)

@@ -97,12 +97,13 @@ function inv.config.save()
         return inv.config.reset()
     end
     
-    return dbot.storage.saveTable(dbot.backup.getCurrentDir() .. inv.config.stateName,
-                                   "inv.config.table", inv.config.table, true)
+    return DINV.database.saveModuleTable("config", inv.config.table)
 end
 
 function inv.config.load()
-    return dbot.storage.loadTable(dbot.backup.getCurrentDir() .. inv.config.stateName, inv.config.reset)
+    local value, retval = DINV.database.loadModuleTable("config", inv.config.reset)
+    if value then inv.config.table = value end
+    return retval
 end
 
 function inv.config.reset()
