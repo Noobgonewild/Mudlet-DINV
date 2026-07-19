@@ -68,8 +68,15 @@ local function sendToChannel(reportChannel, message)
         return true
     end
 
+    if type(expandAlias) == "function" then
+        -- Custom report targets are aliases by definition and are invoked only
+        -- when a report is explicitly requested.
+        expandAlias(cmd, false)
+        return true
+    end
+
     dbot.warn("Report channel '" .. tostring(reportChannel) ..
-        "' is not a direct Aardwolf channel; displaying the report locally instead.")
+        "' requires alias expansion, but expandAlias is unavailable; displaying locally instead.")
     if dbot and dbot.convertColors then
         cecho(dbot.convertColors(tostring(message or "")) .. "\n")
     else

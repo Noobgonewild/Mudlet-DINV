@@ -894,15 +894,21 @@ function inv.consume.buyCR()
         pkg.startTime = os.time()
         dbot.debug("Running to \"" .. pkg.room .. "\" to buy \"" .. pkg.numItems ..
             "\" of \"" .. pkg.itemName .. "\"", "inv.consume")
-        if type(gotoRoom) == "function" then
-            local travelOk, travelErr = pcall(gotoRoom, room)
-            if not travelOk then
-                dbot.warn("inv.consume.buyCR: direct mapper travel failed: " .. tostring(travelErr))
+        if snd and snd.mapper and type(snd.mapper.xrt) == "function" then
+            local travelOk, travelResult = pcall(snd.mapper.xrt, tostring(room))
+            if not travelOk or travelResult == false then
+                dbot.warn("inv.consume.buyCR: mapper travel failed: " ..
+                    tostring(not travelOk and travelResult or "route was not started"))
                 inv.consume.buyPkg = nil
                 return DRL_RET_INTERNAL_ERROR
             end
+        elseif type(expandAlias) == "function" then
+            -- Compatibility fallback for mapper packages that expose xrt only
+            -- as an alias. This is one expansion per buy request, not one per
+            -- generated inventory action.
+            expandAlias("xrt " .. tostring(room), false)
         else
-            dbot.warn("inv.consume.buyCR: Mudlet gotoRoom API is unavailable; cannot travel to the shop")
+            dbot.warn("inv.consume.buyCR: Aardwolf mapper xrt is unavailable; cannot travel to the shop")
             inv.consume.buyPkg = nil
             return DRL_RET_UNSUPPORTED
         end
