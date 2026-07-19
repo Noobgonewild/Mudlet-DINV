@@ -157,6 +157,167 @@ end
 -- omitted from the normal command list.
 inv.cli.developer = {}
 
+local developerItemCategories = {
+    ["detached"] = {
+        label = "detached",
+        loader = "loadDetachedItems",
+    },
+    ["pending-removal"] = {
+        label = "pending-removal",
+        loader = "loadPendingRemovedItems",
+    },
+    ["staged"] = {
+        label = "staged",
+        loader = "loadStagedItems",
+    },
+}
+
+local function developerItemField(item, field)
+    if item and item.stats and item.stats[field] ~= nil then
+        return item.stats[field]
+    end
+    return item and item[field] or nil
+end
+
+local function developerItemIds(items)
+    local ids = {}
+    for objId in pairs(items or {}) do
+        table.insert(ids, tostring(objId))
+    end
+    table.sort(ids, function(left, right)
+        local leftNumber = tonumber(left)
+        local rightNumber = tonumber(right)
+        if leftNumber and rightNumber and leftNumber ~= rightNumber then
+            return leftNumber < rightNumber
+        end
+        return left < right
+    end)
+    return ids
+end
+
+function inv.cli.developer.showItems(category)
+    local normalized = tostring(category or ""):lower()
+    local definition = developerItemCategories[normalized]
+    if not definition then
+        dbot.warn("Unknown developer item category: '" .. tostring(category) .. "'")
+        return DRL_RET_INVALID_PARAM
+    end
+
+    local database = DINV and DINV.database or nil
+    local loader = database and database[definition.loader] or nil
+    if type(loader) ~= "function" then
+        dbot.warn("SQLite database is not initialized.")
+        return DRL_RET_UNINITIALIZED
+    end
+
+    local items, err = loader()
+    if not items then
+        dbot.warn("Unable to load " .. definition.label .. " items: " .. tostring(err))
+        return DRL_RET_INTERNAL_ERROR
+    end
+
+    local ids = developerItemIds(items)
+    dbot.print(string.format("@YDeveloper items: @C%s@W (%d)", definition.label, #ids))
+    if #ids == 0 then
+        dbot.print("  @WNo items found.@w")
+        return DRL_RET_SUCCESS
+    end
+
+    for _, objId in ipairs(ids) do
+        local item = items[objId]
+        local name = developerItemField(item, "colorname")
+            or developerItemField(item, "colorName")
+            or developerItemField(item, "name")
+            or "Unknown"
+        local level = developerItemField(item, "level") or "-"
+        local itemType = developerItemField(item, "type") or "unknown"
+        local location = developerItemField(item, "location") or "unknown"
+        local details = {
+            tostring(itemType),
+            "location=" .. tostring(location),
+        }
+
+        local container = developerItemField(item, "container")
+        if container ~= nil and tostring(container) ~= "" then
+            table.insert(details, "container=" .. tostring(container))
+        end
+        if normalized == "detached" and item.__dinvDetachedRoot then
+            table.insert(details, "root=" .. tostring(item.__dinvDetachedRoot))
+        elseif normalized == "pending-removal" then
+            if item.__dinvRemovalReason and tostring(item.__dinvRemovalReason) ~= "" then
+                table.insert(details, "reason=" .. tostring(item.__dinvRemovalReason))
+            end
+            if tonumber(item.__dinvPurgeAfter) then
+                table.insert(details, "purge=" .. os.date("%Y-%m-%d %H:%M:%S", tonumber(item.__dinvPurgeAfter)))
+            end
+        elseif normalized == "staged" then
+            local identifyLevel = developerItemField(item, "identifyLevel")
+            if identifyLevel ~= nil and tostring(identifyLevel) ~= "" then
+                table.insert(details, "identify=" .. tostring(identifyLevel))
+            end
+        end
+
+        dbot.print(string.format(
+            "  @Y%11s@W  @CL%-3s@W %s @D[%s]@w",
+            objId,
+            tostring(level),
+            tostring(name),
+            table.concat(details, "; ")
+        ))
+    end
+
+    return DRL_RET_SUCCESS
+end
+
+local function printDeveloperItemCounts(status)
+    local activeCount = tonumber(status.activeItems) or 0
+    local detachedCount = tonumber(status.detachedItems) or 0
+    local pendingCount = tonumber(status.pendingRemovedItems) or 0
+    local stagedCount = tonumber(status.stagedItems) or 0
+    local consumableCount = tonumber(status.consumableTemplates) or 0
+    local moduleCount = tonumber(status.moduleNamespaces) or 0
+
+    if cecho and cechoLink then
+        cecho(dbot.convertColors(string.format("  @CItems:@W active=%d ", activeCount)))
+        cechoLink(
+            string.format("<cyan>detached<white>=%d<reset>", detachedCount),
+            "inv.cli.developer.showItems(\"detached\")",
+            "Show detached items",
+            true
+        )
+        cecho(" ")
+        cechoLink(
+            string.format("<cyan>pending-removal<white>=%d<reset>", pendingCount),
+            "inv.cli.developer.showItems(\"pending-removal\")",
+            "Show pending-removal items",
+            true
+        )
+        cecho(" ")
+        cechoLink(
+            string.format("<cyan>staged<white>=%d<reset>", stagedCount),
+            "inv.cli.developer.showItems(\"staged\")",
+            "Show staged items",
+            true
+        )
+        cecho(dbot.convertColors(string.format(
+            "@W consumable-templates=%d module-stores=%d@w\n",
+            consumableCount,
+            moduleCount
+        )))
+        return
+    end
+
+    dbot.print(string.format(
+        "  @CItems:@W active=%d detached=%d pending-removal=%d staged=%d consumable-templates=%d module-stores=%d",
+        activeCount,
+        detachedCount,
+        pendingCount,
+        stagedCount,
+        consumableCount,
+        moduleCount
+    ))
+end
+
 function inv.cli.developer.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s",
         pluginNameCmd .. " help developer", "SQLite and operation diagnostics"))
@@ -168,15 +329,7 @@ function inv.cli.developer.examples()
         local status = DINV.database.getStatus()
         dbot.print("  @CDatabase:@W " .. tostring(status.file or "unavailable"))
         dbot.print("  @CCharacter:@W " .. tostring(status.character or "unknown"))
-        dbot.print(string.format(
-            "  @CItems:@W active=%d detached=%d pending-removal=%d staged=%d consumable-templates=%d module-stores=%d",
-            tonumber(status.activeItems) or 0,
-            tonumber(status.detachedItems) or 0,
-            tonumber(status.pendingRemovedItems) or 0,
-            tonumber(status.stagedItems) or 0,
-            tonumber(status.consumableTemplates) or 0,
-            tonumber(status.moduleNamespaces) or 0
-        ))
+        printDeveloperItemCounts(status)
         local healthy, detail = DINV.database.quickCheck()
         dbot.print("  @CSQLite quick_check:@W " .. (healthy and "@Gok@W" or ("@R" .. tostring(detail) .. "@W")))
     else
@@ -540,12 +693,12 @@ end
 
 inv.cli.search = {}
 
-local function extractSearchDisplayMode(tokens)
+local function extractSearchDisplayMode(tokens, allowStat)
     local displayMode = "objid"
     local explicitMode = false
     local mode = tostring(tokens[1] or ""):lower()
 
-    if mode == "basic" or mode == "objid" or mode == "full" then
+    if mode == "basic" or mode == "objid" or mode == "full" or (allowStat and mode == "stat") then
         displayMode = mode
         explicitMode = true
         table.remove(tokens, 1)
@@ -556,19 +709,39 @@ end
 
 function inv.cli.search.fn(name, line, wildcards)
     local tokens = wildcards or {}
-    local displayMode, explicitMode = extractSearchDisplayMode(tokens)
+    local displayMode, explicitMode = extractSearchDisplayMode(tokens, true)
 
     local query = table.concat(tokens, " ")
     local endTag = inv.tags.new(line)
 
-    local itemIds, retval = inv.items.search(query)
-    if retval == DRL_RET_SUCCESS then
-        inv.items.sort(itemIds)
-        local trimmed = tostring(query or ""):gsub("^%s*(.-)%s*$", "%1")
-        if (not explicitMode) and trimmed:match("^%d+$") then
-            displayMode = "itemid"
+    local itemIds
+    local retval
+    local statSpec
+    if displayMode == "stat" then
+        local statError
+        statSpec, statError = inv.items.parseStatSearchQuery(query)
+        if not statSpec then
+            dbot.warn("Invalid stat search: " .. tostring(statError))
+            dbot.info("Use '@Gdinv help search@W' for stat-search syntax and allowed fields.")
+            return inv.tags.stop(invTagsSearch, endTag, DRL_RET_INVALID_PARAM)
         end
-        inv.items.displayResults(itemIds, displayMode)
+        itemIds, retval = inv.items.searchStats(statSpec)
+    else
+        itemIds, retval = inv.items.search(query)
+    end
+
+    if retval == DRL_RET_SUCCESS then
+        if displayMode == "stat" then
+            inv.items.sortStatSearchResults(itemIds, statSpec)
+            inv.items.displayStatSearchResults(itemIds, statSpec)
+        else
+            inv.items.sort(itemIds)
+            local trimmed = tostring(query or ""):gsub("^%s*(.-)%s*$", "%1")
+            if (not explicitMode) and trimmed:match("^%d+$") then
+                displayMode = "itemid"
+            end
+            inv.items.displayResults(itemIds, displayMode)
+        end
     end
     
     return inv.tags.stop(invTagsSearch, endTag, retval)
@@ -576,7 +749,7 @@ end
 
 function inv.cli.search.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s", 
-               pluginNameCmd .. " search @G[basic|objid|full] <query>", "Search inventory (default: objid)"))
+               pluginNameCmd .. " search @G[basic|objid|full|stat] <query>", "Search inventory (default: objid)"))
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -1855,11 +2028,28 @@ its name.  Also, queries will accept "key" instead of "keywords", "loc" instead 
 and "rloc" instead of "rlocation".  Yeah, I'm lazy sometimes...
 
 Performing a search will display relevant information about the items whose characteristics match
-the query.  There are three search modes: "basic", "objid", and "full".  Searches use "objid" by
+the query.  There are four search modes: "basic", "objid", "full", and "stat".  Searches use "objid" by
 default.  A basic search omits object IDs, hit points, mana, moves, and the illuminated/resonated/
 solidified flags.  An objid search shows the standard output with object IDs, hit points, mana,
 moves, and the illuminated/resonated/solidified flags.  A full search adds stored key/value data
-for every item.
+for every item.  Stat mode displays only object ID, item name, and requested stat values.  It accepts
+only real item stats, sorts descending by the first requested stat, and keeps missing sort values last.
+
+Stat mode syntax:
+  @Gdinv search stat <stat> [value|comparison] [<stat> ...] [|| <stat> ...]@W
+
+Use "stat" only once, immediately after "search".  A bare numeric stat matches present, non-zero
+values.  Comparisons support =, <, <=, >, and >= and require a valid number.  Enchant selectors for
+illuminate, resonate, and solidify must be quoted.  An optional comparison checks the signed number
+in the matching enchant component, for example @Gsolidify "hit roll" < 8@W.  A quoted selector belongs
+only to its preceding enchant: @Gilluminate "wis"@W matches Wisdom within Illuminate and displays the
+complete Illuminate value, while @Gwis@W by itself searches and displays the normal wisdom stat.
+
+Allowed stat fields:
+  str, int, wis, dex, con, luck, hp, mana, moves, hitroll, damroll, saves, avedam,
+  allphys, allmagic, bash, pierce, slash, acid, cold, energy, holy, electric,
+  negative, shadow, magic, air, earth, fire, light, mental, sonic, water,
+  disease, poison, illuminate, resonate, solidify.
 
 Examples:
   1) Show basic info for all weapons between the levels of 1 to 40
@@ -1914,6 +2104,18 @@ Cosmic Calling           lv150   0str  0int  0wis  0dex  0con  0luc   0hr   0dr
 
   8) Find items made of metal
      "@Gdinv search material metal@W"
+
+  9) Show Solidify hit-roll values, highest first
+     "@Gdinv search stat solidify "hit roll"@W"
+
+ 10) Show items with strength or dexterity bonuses, sorted by strength
+     "@Gdinv search stat str || dex@W"
+
+ 11) Require two stat conditions and display both values
+     "@Gdinv search stat str < 9 solidify "hit roll" < 8@W"
+
+ 12) Show average weapon damage at or above 600
+     "@Gdinv search stat avedam >= 600@W"
 
 ]])
 end

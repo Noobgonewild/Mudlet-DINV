@@ -301,10 +301,8 @@ end
 ----------------------------------------------------------------------------------------------------
 
 function sendSilent(cmd)
-    if expandAlias then
-        expandAlias(cmd, false)
-    elseif send then
-        send(cmd)
+    if send then
+        send(cmd, false)
     end
 end
 
@@ -314,13 +312,11 @@ function inv.items.runReportFromLink(objId)
         return
     end
 
-    local cmd = "dinv report " .. itemId
-    if expandAlias then
-        expandAlias(cmd, false)
-    elseif send then
-        send(cmd)
+    if inv.report and inv.report.reportItemIds then
+        return inv.report.reportItemIds({ itemId })
     else
-        dbot.warn("inv.items.runReportFromLink: unable to execute '" .. cmd .. "'")
+        dbot.warn("inv.items.runReportFromLink: report module is unavailable")
+        return DRL_RET_UNINITIALIZED
     end
 end
 
@@ -599,7 +595,14 @@ function inv.items.save(options)
     end
     local target = inv.items.databaseBuildId and "build" or "active"
     local identifiedBatchCount = tonumber(inv.items.databaseBuildIdentifiedSinceFlush) or 0
+    local databaseTimingWall, databaseTimingCpu = nil, nil
+    if DINV.debug and DINV.debug.beginWearTimingSample then
+        databaseTimingWall, databaseTimingCpu = DINV.debug.beginWearTimingSample()
+    end
     local ok, result, purgedPendingIds = DINV.database.syncItems(inv.items.table, target, options)
+    if DINV.debug and DINV.debug.recordWearTimingDatabase then
+        DINV.debug.recordWearTimingDatabase(databaseTimingWall, databaseTimingCpu)
+    end
     if not ok then
         dbot.warn("inv.items.save: SQLite batch failed: " .. tostring(result))
         return DRL_RET_INTERNAL_ERROR
@@ -2510,6 +2513,333 @@ function inv.items.parseQuery(query)
     end
 
     return clauses
+end
+
+----------------------------------------------------------------------------------------------------
+-- Stat Search Query Functions
+----------------------------------------------------------------------------------------------------
+
+inv.items.statSearchFieldKinds = {
+    [invStatFieldStr] = "numeric",
+    [invStatFieldInt] = "numeric",
+    [invStatFieldWis] = "numeric",
+    [invStatFieldDex] = "numeric",
+    [invStatFieldCon] = "numeric",
+    [invStatFieldLuck] = "numeric",
+    [invStatFieldHp] = "numeric",
+    [invStatFieldMana] = "numeric",
+    [invStatFieldMoves] = "numeric",
+    [invStatFieldHitroll] = "numeric",
+    [invStatFieldDamroll] = "numeric",
+    [invStatFieldSaves] = "numeric",
+    [invStatFieldAllPhys] = "numeric",
+    [invStatFieldAllMagic] = "numeric",
+    [invStatFieldBash] = "numeric",
+    [invStatFieldPierce] = "numeric",
+    [invStatFieldSlash] = "numeric",
+    [invStatFieldAcid] = "numeric",
+    [invStatFieldCold] = "numeric",
+    [invStatFieldEnergy] = "numeric",
+    [invStatFieldHoly] = "numeric",
+    [invStatFieldElectric] = "numeric",
+    [invStatFieldNegative] = "numeric",
+    [invStatFieldShadow] = "numeric",
+    [invStatFieldMagic] = "numeric",
+    [invStatFieldAir] = "numeric",
+    [invStatFieldEarth] = "numeric",
+    [invStatFieldFire] = "numeric",
+    [invStatFieldLight] = "numeric",
+    [invStatFieldMental] = "numeric",
+    [invStatFieldSonic] = "numeric",
+    [invStatFieldWater] = "numeric",
+    [invStatFieldDisease] = "numeric",
+    [invStatFieldPoison] = "numeric",
+    [invStatFieldAveDam] = "numeric",
+    [invStatFieldIlluminate] = "enchant",
+    [invStatFieldResonate] = "enchant",
+    [invStatFieldSolidify] = "enchant",
+}
+
+local function trimStatSearchText(value)
+    return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function tokenizeStatSearchSegment(segment)
+    local tokens = {}
+    local text = tostring(segment or "")
+    local index = 1
+
+    while index <= #text do
+        while index <= #text and text:sub(index, index):match("%s") do
+            index = index + 1
+        end
+        if index > #text then
+            break
+        end
+
+        local quote = text:sub(index, index)
+        if quote == "\"" or quote == "'" then
+            index = index + 1
+            local value = {}
+            local closed = false
+            while index <= #text do
+                local character = text:sub(index, index)
+                if character == quote then
+                    closed = true
+                    index = index + 1
+                    break
+                elseif character == "\\" and index < #text then
+                    index = index + 1
+                    table.insert(value, text:sub(index, index))
+                else
+                    table.insert(value, character)
+                end
+                index = index + 1
+            end
+            if not closed then
+                return nil, "Unclosed quote in stat search."
+            end
+            table.insert(tokens, { value = table.concat(value), quoted = true })
+        else
+            local startIndex = index
+            while index <= #text and not text:sub(index, index):match("%s") do
+                index = index + 1
+            end
+            table.insert(tokens, {
+                value = text:sub(startIndex, index - 1),
+                quoted = false,
+            })
+        end
+    end
+
+    return tokens
+end
+
+local function parseStatSearchNumber(value)
+    local text = trimStatSearchText(value)
+    local isDecimal = text:match("^[%+%-]?%d+%.?%d*$") ~= nil
+        or text:match("^[%+%-]?%d*%.%d+$") ~= nil
+    if not isDecimal then
+        return nil
+    end
+
+    local number = tonumber(text)
+    if number == nil or number ~= number or number == math.huge or number == -math.huge then
+        return nil
+    end
+    return number
+end
+
+local statSearchComparisonOperators = { ">=", "<=", ">", "<", "=" }
+
+local function splitStatSearchComparison(value)
+    local text = trimStatSearchText(value)
+    for _, operator in ipairs(statSearchComparisonOperators) do
+        if text:sub(1, #operator) == operator then
+            return operator, trimStatSearchText(text:sub(#operator + 1))
+        end
+    end
+    return nil, nil
+end
+
+local function consumeStatSearchComparison(tokens, index, field)
+    local token = tokens[index]
+    if not token then
+        return nil, index, nil, false
+    end
+
+    local operator, operand = splitStatSearchComparison(token.value)
+    if not operator then
+        return nil, index, nil, false
+    end
+
+    local nextIndex = index + 1
+    if operand == "" then
+        local operandToken = tokens[nextIndex]
+        if not operandToken then
+            return nil, index,
+                "Missing numeric value after '" .. tostring(field) .. " " .. operator .. "'.", true
+        end
+        operand = operandToken.value
+        nextIndex = nextIndex + 1
+    end
+
+    local number = parseStatSearchNumber(operand)
+    if number == nil then
+        return nil, index,
+            "Invalid numeric value '" .. tostring(operand) .. "' for stat '" .. tostring(field) .. "'.", true
+    end
+
+    return { operator = operator, number = number }, nextIndex, nil, true
+end
+
+local function splitStatSearchClauses(query)
+    local raw = trimStatSearchText(query)
+    if raw == "" then
+        return nil, "Stat search requires at least one stat field."
+    end
+
+    local clauses = {}
+    local cursor = 1
+    while cursor <= #raw + 1 do
+        local startIndex, endIndex = raw:find("||", cursor, true)
+        local segment
+        if startIndex then
+            segment = raw:sub(cursor, startIndex - 1)
+            cursor = endIndex + 1
+        else
+            segment = raw:sub(cursor)
+            cursor = #raw + 2
+        end
+
+        segment = trimStatSearchText(segment)
+        if segment == "" then
+            return nil, "Each side of '||' must contain a stat expression."
+        end
+        if segment:find("|", 1, true) then
+            return nil, "Use '||' (two pipes) between stat-search clauses."
+        end
+        table.insert(clauses, segment)
+    end
+
+    return clauses
+end
+
+function inv.items.getStatSearchFieldNames()
+    local fields = {}
+    for field in pairs(inv.items.statSearchFieldKinds or {}) do
+        table.insert(fields, tostring(field))
+    end
+    table.sort(fields)
+    return fields
+end
+
+function inv.items.parseStatSearchQuery(query)
+    local segments, splitError = splitStatSearchClauses(query)
+    if not segments then
+        return nil, splitError
+    end
+
+    local spec = {
+        clauses = {},
+        fields = {},
+        primary = nil,
+    }
+    local seenFields = {}
+
+    for _, segment in ipairs(segments) do
+        local tokens, tokenError = tokenizeStatSearchSegment(segment)
+        if not tokens then
+            return nil, tokenError
+        end
+
+        local predicates = {}
+        local index = 1
+        while index <= #tokens do
+            local keyToken = tokens[index]
+            local key = tostring(keyToken.value or ""):lower()
+            if key == "stat" then
+                return nil, "'stat' is the search mode and should appear only once, immediately after 'dinv search'."
+            end
+            if key:sub(1, 1) == "~" then
+                return nil, "Negation is not supported in stat mode; use an explicit comparison instead."
+            end
+
+            local kind = inv.items.statSearchFieldKinds[key]
+            if not kind then
+                return nil, "'" .. tostring(keyToken.value) .. "' is not a searchable stat in stat mode."
+            end
+
+            local predicate = { field = key, kind = kind }
+            index = index + 1
+
+            if kind == "numeric" then
+                local nextToken = tokens[index]
+                if nextToken then
+                    local nextKey = tostring(nextToken.value or ""):lower()
+                    if inv.items.statSearchFieldKinds[nextKey] then
+                        -- A following stat key starts another bare predicate.
+                    elseif nextKey == "stat" then
+                        return nil, "'stat' is the search mode and should not be repeated inside the query."
+                    else
+                        local comparison, nextIndex, comparisonError, comparisonSeen =
+                            consumeStatSearchComparison(tokens, index, key)
+                        if comparisonError then
+                            return nil, comparisonError
+                        elseif comparisonSeen then
+                            predicate.comparison = comparison
+                            index = nextIndex
+                        else
+                            local number = parseStatSearchNumber(nextToken.value)
+                            if number == nil then
+                                return nil, "Invalid numeric value '" .. tostring(nextToken.value) ..
+                                    "' for stat '" .. key .. "'."
+                            end
+                            predicate.comparison = { operator = "=", number = number }
+                            index = index + 1
+                        end
+                    end
+                end
+            else
+                local nextToken = tokens[index]
+                if nextToken then
+                    local nextKey = tostring(nextToken.value or ""):lower()
+                    if nextToken.quoted then
+                        predicate.selector = trimStatSearchText(nextToken.value):lower()
+                        if predicate.selector == "" then
+                            return nil, "The text selector for stat '" .. key .. "' cannot be empty."
+                        end
+                        index = index + 1
+
+                        local comparison, nextIndex, comparisonError, comparisonSeen =
+                            consumeStatSearchComparison(tokens, index, key)
+                        if comparisonError then
+                            return nil, comparisonError
+                        elseif comparisonSeen then
+                            predicate.comparison = comparison
+                            index = nextIndex
+                        elseif tokens[index]
+                            and not inv.items.statSearchFieldKinds[tostring(tokens[index].value or ""):lower()] then
+                            return nil, "Unexpected value '" .. tostring(tokens[index].value) ..
+                                "' after selector for stat '" .. key .. "'."
+                        end
+                    elseif inv.items.statSearchFieldKinds[nextKey] then
+                        -- An unquoted following stat key starts another bare predicate.
+                    elseif nextKey == "stat" then
+                        return nil, "'stat' is the search mode and should not be repeated inside the query."
+                    else
+                        local comparison, nextIndex, comparisonError, comparisonSeen =
+                            consumeStatSearchComparison(tokens, index, key)
+                        if comparisonError then
+                            return nil, comparisonError
+                        elseif comparisonSeen then
+                            predicate.comparison = comparison
+                            index = nextIndex
+                        else
+                            return nil, "Text selectors for stat '" .. key ..
+                                "' must be quoted, for example: " .. key .. " \"hit roll\"."
+                        end
+                    end
+                end
+            end
+
+            table.insert(predicates, predicate)
+            if not spec.primary then
+                spec.primary = predicate
+            end
+            if not seenFields[key] then
+                seenFields[key] = true
+                table.insert(spec.fields, key)
+            end
+        end
+
+        if #predicates == 0 then
+            return nil, "Each stat-search clause must contain at least one stat field."
+        end
+        table.insert(spec.clauses, predicates)
+    end
+
+    return spec
 end
 
 function inv.items.setItem(objId, itemData, options)
@@ -4874,6 +5204,11 @@ function inv.items.buildAbort(options)
 end
 
 function inv.items.onInvmon(dataLine)
+    local wearInvmonTimingWall, wearInvmonTimingCpu = nil, nil
+    if DINV and DINV.debug and DINV.debug.beginWearTimingSample then
+        wearInvmonTimingWall, wearInvmonTimingCpu = DINV.debug.beginWearTimingSample()
+    end
+
     -- Normalize and de-duplicate payloads because some environments can
     -- fire both package and temporary discovery triggers for {invmon}.
     local normalizedDataLine = tostring(dataLine or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -5290,6 +5625,12 @@ function inv.items.onInvmon(dataLine)
         })
     end
 
+    if DINV and DINV.debug and DINV.debug.recordWearTimingInvmon then
+        DINV.debug.recordWearTimingInvmon(
+            objId, actionNum, wearInvmonTimingWall, wearInvmonTimingCpu
+        )
+    end
+
     return DRL_RET_SUCCESS
 end
 
@@ -5679,6 +6020,121 @@ function inv.items.search(query, displayMode, options)
     return results, DRL_RET_SUCCESS
 end
 
+local function compareStatSearchNumbers(left, operator, right)
+    if operator == ">=" then
+        return left >= right
+    elseif operator == "<=" then
+        return left <= right
+    elseif operator == ">" then
+        return left > right
+    elseif operator == "<" then
+        return left < right
+    elseif operator == "=" then
+        return left == right
+    end
+    return false
+end
+
+local function statSearchEnchantComponents(rawValue, selector)
+    local matches = {}
+    local normalizedSelector = trimStatSearchText(selector):lower()
+    for component in tostring(rawValue or ""):gmatch("[^,]+") do
+        local trimmedComponent = trimStatSearchText(component)
+        if normalizedSelector == ""
+            or trimmedComponent:lower():find(normalizedSelector, 1, true) then
+            table.insert(matches, trimmedComponent)
+        end
+    end
+    return matches
+end
+
+local function statSearchComponentNumber(component)
+    local text = tostring(component or "")
+    local value = text:match("([%+%-]?%d+%.?%d*)")
+    if value == nil then
+        value = text:match("([%+%-]?%d*%.%d+)")
+    end
+    return parseStatSearchNumber(value)
+end
+
+local function statSearchPredicateMatches(objId, predicate)
+    local rawValue = inv.items.getStatField(objId, predicate.field)
+    if rawValue == nil then
+        return false
+    end
+
+    if predicate.kind == "numeric" then
+        local number = tonumber(rawValue)
+        if number == nil then
+            return false
+        end
+        if predicate.comparison then
+            return compareStatSearchNumbers(
+                number,
+                predicate.comparison.operator,
+                predicate.comparison.number
+            )
+        end
+        return number ~= 0
+    end
+
+    local text = trimStatSearchText(rawValue)
+    if text == "" then
+        return false
+    end
+
+    local components = statSearchEnchantComponents(text, predicate.selector)
+    if #components == 0 then
+        return false
+    end
+    if not predicate.comparison then
+        return true
+    end
+
+    for _, component in ipairs(components) do
+        local number = statSearchComponentNumber(component)
+        if number ~= nil and compareStatSearchNumbers(
+            number,
+            predicate.comparison.operator,
+            predicate.comparison.number
+        ) then
+            return true
+        end
+    end
+    return false
+end
+
+function inv.items.matchesStatSearch(objId, spec)
+    for _, clause in ipairs((spec and spec.clauses) or {}) do
+        local matchedAll = true
+        for _, predicate in ipairs(clause) do
+            if not statSearchPredicateMatches(objId, predicate) then
+                matchedAll = false
+                break
+            end
+        end
+        if matchedAll then
+            return true
+        end
+    end
+    return false
+end
+
+function inv.items.searchStats(spec, options)
+    local candidates, retval = inv.items.search("", nil, options)
+    if retval ~= DRL_RET_SUCCESS then
+        return {}, retval
+    end
+
+    local results = {}
+    for _, objId in ipairs(candidates or {}) do
+        if inv.items.matchesStatSearch(objId, spec) then
+            table.insert(results, tostring(objId))
+        end
+    end
+    return results, DRL_RET_SUCCESS
+end
+
 ----------------------------------------------------------------------------------------------------
 -- Sort Functions
 ----------------------------------------------------------------------------------------------------
@@ -5720,6 +6176,71 @@ function inv.items.sort(itemIds, sortCriteria)
             return numericId1 < numericId2
         end
         return tostring(id1) < tostring(id2)
+    end)
+end
+
+local function statSearchSortValue(objId, predicate)
+    if not predicate then
+        return nil, nil
+    end
+
+    local rawValue = inv.items.getStatField(objId, predicate.field)
+    if rawValue == nil or trimStatSearchText(rawValue) == "" then
+        return nil, nil
+    end
+
+    if predicate.kind == "numeric" then
+        local number = tonumber(rawValue)
+        return number ~= nil and "number" or nil, number
+    end
+
+    local components = statSearchEnchantComponents(rawValue, predicate.selector)
+    if #components == 0 then
+        return nil, nil
+    end
+    local number = statSearchComponentNumber(components[1])
+    if number ~= nil then
+        return "number", number
+    end
+    return "text", components[1]:lower()
+end
+
+function inv.items.sortStatSearchResults(itemIds, spec)
+    if itemIds == nil or #itemIds == 0 then
+        return
+    end
+
+    table.sort(itemIds, function(leftId, rightId)
+        local leftKind, leftValue = statSearchSortValue(leftId, spec and spec.primary)
+        local rightKind, rightValue = statSearchSortValue(rightId, spec and spec.primary)
+
+        if leftKind == nil and rightKind ~= nil then
+            return false
+        elseif leftKind ~= nil and rightKind == nil then
+            return true
+        elseif leftKind ~= nil and rightKind ~= nil then
+            if leftKind ~= rightKind then
+                return leftKind == "number"
+            elseif leftValue ~= rightValue then
+                if leftKind == "number" then
+                    return leftValue > rightValue
+                end
+                return leftValue < rightValue
+            end
+        end
+
+        local leftName = tostring(inv.items.getStatField(leftId, invStatFieldName) or ""):lower()
+        local rightName = tostring(inv.items.getStatField(rightId, invStatFieldName) or ""):lower()
+        if leftName ~= rightName then
+            return leftName < rightName
+        end
+
+        local leftNumber = tonumber(leftId)
+        local rightNumber = tonumber(rightId)
+        if leftNumber and rightNumber and leftNumber ~= rightNumber then
+            return leftNumber < rightNumber
+        end
+        return tostring(leftId) < tostring(rightId)
     end)
 end
 
@@ -6344,6 +6865,136 @@ function inv.items.displayResults(itemIds, displayMode, options)
     local countLine = dbot.convertColors(string.format("@Y%d@W item(s) found.", #itemIds))
     cecho(countLine .. "\n")
 
+    return DRL_RET_SUCCESS
+end
+
+local function formatStatSearchDisplayValue(rawValue, kind)
+    if rawValue == nil or trimStatSearchText(rawValue) == "" then
+        return "@D-@w"
+    end
+
+    if kind == "numeric" then
+        local number = tonumber(rawValue)
+        if number == nil then
+            return "@D-@w"
+        end
+        local text
+        if number == math.floor(number) then
+            text = string.format("%d", number)
+        else
+            text = tostring(number)
+        end
+        if number < 0 then
+            return "@R" .. text .. "@w"
+        elseif number > 0 then
+            return "@G" .. text .. "@w"
+        end
+        return "@D" .. text .. "@w"
+    end
+
+    local text = dbot.stripColors(tostring(rawValue or ""))
+    text = text:gsub("[\r\n]", " ")
+    return "@W" .. text .. "@w"
+end
+
+local function truncateStatSearchColorName(value, width)
+    local raw = tostring(value or "")
+    local limit = tonumber(width) or 0
+    if limit <= 0 or #dbot.stripColors(raw) <= limit then
+        return raw
+    end
+
+    local suffix = "..."
+    local keep = math.max(0, limit - #suffix)
+    local out = {}
+    local visible = 0
+    local index = 1
+
+    while index <= #raw and visible < keep do
+        local character = raw:sub(index, index)
+        if character == "@" then
+            local escapedAt = raw:sub(index, index + 1) == "@@"
+            local xcode = raw:match("^@x%d+", index)
+            if escapedAt then
+                table.insert(out, "@@")
+                index = index + 2
+                visible = visible + 1
+            elseif xcode then
+                table.insert(out, xcode)
+                index = index + #xcode
+            elseif index < #raw then
+                table.insert(out, raw:sub(index, index + 1))
+                index = index + 2
+            else
+                table.insert(out, character)
+                index = index + 1
+                visible = visible + 1
+            end
+        else
+            table.insert(out, character)
+            index = index + 1
+            visible = visible + 1
+        end
+    end
+
+    return table.concat(out, "") .. suffix .. "@w"
+end
+
+function inv.items.displayStatSearchResults(itemIds, spec)
+    if itemIds == nil or #itemIds == 0 then
+        dbot.print("@WNo items found.@w")
+        return DRL_RET_SUCCESS
+    end
+
+    local nameWidth = 24
+    local displayNames = {}
+    for _, objId in ipairs(itemIds) do
+        local rawName = tostring(inv.items.getStatField(objId, invStatFieldColorName)
+            or inv.items.getStatField(objId, invStatFieldName)
+            or "Unknown")
+        rawName = rawName:gsub("[\r\n]", " ")
+        rawName = rawName:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%).*", "")
+        rawName = truncateStatSearchColorName(rawName, 40)
+        local visibleWidth = #dbot.stripColors(rawName)
+        displayNames[tostring(objId)] = {
+            raw = rawName,
+            width = visibleWidth,
+        }
+        nameWidth = math.max(nameWidth, visibleWidth)
+    end
+
+    cecho(dbot.convertColors(string.format(
+        "@C%-11s %-" .. tostring(nameWidth) .. "s  Stat value(s)@w\n",
+        "Object ID",
+        "Item name"
+    )))
+
+    for _, objId in ipairs(itemIds) do
+        local normalizedId = tostring(objId)
+        local formattedId = string.format("%11s", normalizedId)
+        local pairsText = {}
+        for _, field in ipairs((spec and spec.fields) or {}) do
+            local kind = inv.items.statSearchFieldKinds[field]
+            local rawValue = inv.items.getStatField(normalizedId, field)
+            table.insert(pairsText, "@C" .. tostring(field) .. "@w " ..
+                formatStatSearchDisplayValue(rawValue, kind))
+        end
+
+        if cechoLink then
+            local linkCommand = string.format("inv.items.runReportFromLink(%q)", normalizedId)
+            local tooltip = "Run: dinv report " .. normalizedId
+            cechoLink("<yellow>" .. formattedId .. "<reset>", linkCommand, tooltip, true)
+        else
+            cecho("<yellow>" .. formattedId .. "<reset>")
+        end
+        local displayName = displayNames[normalizedId]
+        local namePadding = string.rep(" ", math.max(0, nameWidth - displayName.width))
+        local rowText = displayName.raw .. "@w" .. namePadding ..
+            "  " .. table.concat(pairsText, " @D|@w ")
+        cecho(" " .. dbot.convertColors(rowText) .. "\n")
+    end
+
+    cecho(dbot.convertColors(string.format("@Y%d@W item(s) found.@w\n", #itemIds)))
     return DRL_RET_SUCCESS
 end
 

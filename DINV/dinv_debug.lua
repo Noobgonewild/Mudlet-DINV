@@ -45,9 +45,222 @@ DINV.debug.descriptions = DINV.debug.descriptions or {
     ["inv.weapon"] = "Weapon swapping and priority rules.",
     levelup = "Level-up trigger diagnostics line (independent of module debug toggles).",
     loader = "Module loader and initialization hooks.",
+    ["wear-timing"] = "Aggregate set-wear build, dispatch, invmon, and database timings.",
     -- rid = "RID identify reporting (debug output per identify line).", -- RID disabled
     triggers = "Mudlet trigger registration.",
 }
+
+-- Runtime-only aggregate timing state. Individual inventory events are never
+-- printed; one compact report is emitted after a tracked set-wear operation.
+local priorWearTimingId = DINV.debug.wearTiming and DINV.debug.wearTiming.nextId or 0
+DINV.debug.wearTiming = {
+    nextId = priorWearTimingId,
+    active = {},
+}
+
+local function wearTimingWallNow()
+    if type(getEpoch) == "function" then
+        local ok, value = pcall(getEpoch)
+        if ok and tonumber(value) then
+            return tonumber(value)
+        end
+    end
+    return os.clock()
+end
+
+local function wearTimingNow()
+    return wearTimingWallNow(), os.clock()
+end
+
+local function wearTimingElapsedMs(startValue, endValue)
+    return math.max(0, ((tonumber(endValue) or 0) - (tonumber(startValue) or 0)) * 1000)
+end
+
+local function wearTimingAddAggregate(aggregate, wallMs, cpuMs)
+    aggregate.count = (aggregate.count or 0) + 1
+    aggregate.wallMs = (aggregate.wallMs or 0) + wallMs
+    aggregate.cpuMs = (aggregate.cpuMs or 0) + cpuMs
+    aggregate.maxWallMs = math.max(aggregate.maxWallMs or 0, wallMs)
+    aggregate.maxCpuMs = math.max(aggregate.maxCpuMs or 0, cpuMs)
+end
+
+local function wearTimingFormatPhase(phase)
+    phase = phase or {}
+    return string.format("%.1f/%.1f", tonumber(phase.wallMs) or 0, tonumber(phase.cpuMs) or 0)
+end
+
+local function wearTimingLatestMatching(objId)
+    local objectKey = tostring(objId or "")
+    local selected = nil
+    for _, timing in pairs(DINV.debug.wearTiming.active or {}) do
+        if not timing.finished
+            and (objectKey == "" or (timing.objIds and timing.objIds[objectKey]))
+            and (not selected or timing.id > selected.id) then
+            selected = timing
+        end
+    end
+    return selected
+end
+
+function DINV.debug.hasActiveWearTiming()
+    return next(DINV.debug.wearTiming.active or {}) ~= nil
+end
+
+function DINV.debug.beginWearTimingSample()
+    if not DINV.debug.hasActiveWearTiming() then
+        return nil, nil
+    end
+    return wearTimingNow()
+end
+
+function DINV.debug.startWearTiming(priorityName, level)
+    if not DINV.debug.isEnabled("wear-timing") then
+        return nil
+    end
+
+    DINV.debug.wearTiming.nextId = DINV.debug.wearTiming.nextId + 1
+    local timingId = DINV.debug.wearTiming.nextId
+    local wallNow, cpuNow = wearTimingNow()
+    DINV.debug.wearTiming.active[timingId] = {
+        id = timingId,
+        priority = tostring(priorityName or ""),
+        level = tostring(level or ""),
+        startWall = wallNow,
+        startCpu = cpuNow,
+        phases = {},
+        invmon = {},
+        database = {},
+        commandCount = 0,
+        objIds = {},
+        finished = false,
+    }
+    return timingId
+end
+
+function DINV.debug.recordWearTimingPhase(timingId, phaseName, startWall, startCpu)
+    local timing = DINV.debug.wearTiming.active[tonumber(timingId)]
+    if not timing or timing.finished or not startWall or not startCpu then
+        return
+    end
+    local wallNow, cpuNow = wearTimingNow()
+    timing.phases[tostring(phaseName)] = {
+        wallMs = wearTimingElapsedMs(startWall, wallNow),
+        cpuMs = wearTimingElapsedMs(startCpu, cpuNow),
+    }
+end
+
+function DINV.debug.setWearTimingCommands(timingId, commands)
+    local timing = DINV.debug.wearTiming.active[tonumber(timingId)]
+    if not timing or timing.finished then
+        return
+    end
+    timing.commandCount = #(commands or {})
+    timing.objIds = {}
+    for _, command in ipairs(commands or {}) do
+        local objId = tostring(command or ""):match("^%S+%s+(%d+)")
+        if objId then
+            timing.objIds[objId] = true
+        end
+    end
+end
+
+function DINV.debug.recordWearTimingInvmon(objId, action, startWall, startCpu)
+    if not startWall or not startCpu then
+        return
+    end
+    local timing = wearTimingLatestMatching(objId)
+    if not timing then
+        return
+    end
+    local wallNow, cpuNow = wearTimingNow()
+    wearTimingAddAggregate(
+        timing.invmon,
+        wearTimingElapsedMs(startWall, wallNow),
+        wearTimingElapsedMs(startCpu, cpuNow)
+    )
+    local actionKey = tostring(action or "unknown")
+    timing.invmon.actions = timing.invmon.actions or {}
+    timing.invmon.actions[actionKey] = (timing.invmon.actions[actionKey] or 0) + 1
+end
+
+function DINV.debug.recordWearTimingDatabase(startWall, startCpu)
+    if not startWall or not startCpu then
+        return
+    end
+    local timing = wearTimingLatestMatching("")
+    if not timing then
+        return
+    end
+    local wallNow, cpuNow = wearTimingNow()
+    wearTimingAddAggregate(
+        timing.database,
+        wearTimingElapsedMs(startWall, wallNow),
+        wearTimingElapsedMs(startCpu, cpuNow)
+    )
+end
+
+function DINV.debug.finishWearTiming(timingId, result)
+    local numericId = tonumber(timingId)
+    local timing = DINV.debug.wearTiming.active[numericId]
+    if not timing or timing.finished then
+        return
+    end
+    timing.finished = true
+    local wallNow = wearTimingWallNow()
+    local elapsedMs = wearTimingElapsedMs(timing.startWall, wallNow)
+    local status = "complete"
+    if type(result) == "table" then
+        if result.status then
+            status = tostring(result.status)
+        elseif result.timedOut then
+            status = "timed out"
+        elseif result.failures and #result.failures > 0 then
+            status = tostring(#result.failures) .. " unconfirmed"
+        end
+    elseif result ~= nil then
+        status = tostring(result)
+    end
+
+    local phases = timing.phases or {}
+    local invmonTiming = timing.invmon or {}
+    local databaseTiming = timing.database or {}
+    dbot.printRaw(string.format(
+        "@D[DINV WEAR TIMING] @W%s level %s@w | commands=%d | elapsed=%.1fms | %s",
+        timing.priority, timing.level, timing.commandCount or 0, elapsedMs, status
+    ))
+    dbot.printRaw(string.format(
+        "@D  wall/cpu ms:@w cache=%s plan=%s dispatch=%s | invmon=%d calls %.1f/%.1f max %.1f | database=%d saves %.1f/%.1f max %.1f",
+        wearTimingFormatPhase(phases.cache),
+        wearTimingFormatPhase(phases.plan),
+        wearTimingFormatPhase(phases.dispatch),
+        invmonTiming.count or 0,
+        invmonTiming.wallMs or 0,
+        invmonTiming.cpuMs or 0,
+        invmonTiming.maxWallMs or 0,
+        databaseTiming.count or 0,
+        databaseTiming.wallMs or 0,
+        databaseTiming.cpuMs or 0,
+        databaseTiming.maxWallMs or 0
+    ))
+    DINV.debug.wearTiming.active[numericId] = nil
+end
+
+function DINV.debug.requestWearTimingFinish(timingId, result)
+    local timing = DINV.debug.wearTiming.active[tonumber(timingId)]
+    if not timing or timing.finished or timing.finishRequested then
+        return
+    end
+    timing.finishRequested = true
+    if type(tempTimer) == "function" then
+        -- Invmon persistence is debounced by 0.5 seconds. Waiting slightly
+        -- longer includes the final save in the aggregate report.
+        tempTimer(0.75, function()
+            DINV.debug.finishWearTiming(timingId, result)
+        end)
+    else
+        DINV.debug.finishWearTiming(timingId, result)
+    end
+end
 
 function DINV.debug.reset()
     DINV.debug.table = {
@@ -302,6 +515,10 @@ Examples:
   6) Enable or disable a specific module
      "@Gdinv debug inv.items on@W"
      "@Gdinv debug inv.items off@W"
+
+  7) Print one aggregate timing report after each equipment-set wear
+     "@Gdinv debug wear-timing on@W"
+     "@Gdinv debug wear-timing off@W"
 ]])
 end
 

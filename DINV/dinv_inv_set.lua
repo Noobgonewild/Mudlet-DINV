@@ -1109,6 +1109,23 @@ function inv.set.wear(priorityName, level, endTag)
     end
 
     local targetLevel = tostring(tonumber(level) or (dbot.gmcp.getWearableLevel and dbot.gmcp.getWearableLevel()) or (dbot.gmcp.getLevel and dbot.gmcp.getLevel()) or 1)
+    local wearTimingId = DINV and DINV.debug and DINV.debug.startWearTiming
+        and DINV.debug.startWearTiming(priorityName, targetLevel) or nil
+    local cacheTimingWall, cacheTimingCpu = nil, nil
+    if wearTimingId and DINV.debug.beginWearTimingSample then
+        cacheTimingWall, cacheTimingCpu = DINV.debug.beginWearTimingSample()
+    end
+
+    local function finishWearTiming(result, delayed)
+        if not wearTimingId or not DINV or not DINV.debug then
+            return
+        end
+        if delayed and DINV.debug.requestWearTimingFinish then
+            DINV.debug.requestWearTimingFinish(wearTimingId, result)
+        elseif DINV.debug.finishWearTiming then
+            DINV.debug.finishWearTiming(wearTimingId, result)
+        end
+    end
 
     local staleReason = inv.set.getStaleReason(priorityName, targetLevel)
     if staleReason then
@@ -1119,6 +1136,7 @@ function inv.set.wear(priorityName, level, endTag)
         dbot.info("Creating set before wearing...")
         local retval = inv.set.create(priorityName, tonumber(targetLevel))
         if retval ~= DRL_RET_SUCCESS then
+            finishWearTiming({ status = "set creation failed" })
             if endTag then
                 return inv.tags.stop(invTagsSet, endTag, retval)
             end
@@ -1128,11 +1146,20 @@ function inv.set.wear(priorityName, level, endTag)
 
     local setData = inv.set.table[priorityName][targetLevel]
     if setData == nil or setData.equipment == nil then
+        finishWearTiming({ status = "set unavailable" })
         dbot.warn("No set found for priority '" .. priorityName .. "' at level " .. targetLevel)
         if endTag then
             return inv.tags.stop(invTagsSet, endTag, DRL_RET_MISSING_ENTRY)
         end
         return DRL_RET_MISSING_ENTRY
+    end
+
+    if wearTimingId and DINV.debug.recordWearTimingPhase then
+        DINV.debug.recordWearTimingPhase(wearTimingId, "cache", cacheTimingWall, cacheTimingCpu)
+    end
+    local planTimingWall, planTimingCpu = nil, nil
+    if wearTimingId and DINV.debug.beginWearTimingSample then
+        planTimingWall, planTimingCpu = DINV.debug.beginWearTimingSample()
     end
 
     dbot.info("Wearing equipment set for priority '" .. priorityName .. "' at level " .. targetLevel)
@@ -1314,12 +1341,31 @@ function inv.set.wear(priorityName, level, endTag)
         end
     end
 
+    if wearTimingId and DINV.debug.recordWearTimingPhase then
+        DINV.debug.recordWearTimingPhase(wearTimingId, "plan", planTimingWall, planTimingCpu)
+    end
+    if wearTimingId and DINV.debug.setWearTimingCommands then
+        DINV.debug.setWearTimingCommands(wearTimingId, commands)
+    end
+
+    local operationId = nil
+    local dispatchTimingWall, dispatchTimingCpu = nil, nil
+    if wearTimingId and DINV.debug.beginWearTimingSample then
+        dispatchTimingWall, dispatchTimingCpu = DINV.debug.beginWearTimingSample()
+    end
+
     if #commands > 0 then
         if inv.operations and inv.operations.startBatchFromCommands then
-            inv.operations.startBatchFromCommands(
+            local operationOptions = { timeout = math.max(8, #commands * 0.2 + 4) }
+            if wearTimingId then
+                operationOptions.onFinish = function(result)
+                    finishWearTiming(result, true)
+                end
+            end
+            operationId = inv.operations.startBatchFromCommands(
                 "Equipment set '" .. tostring(priorityName) .. "'",
                 commands,
-                { timeout = math.max(8, #commands * 0.2 + 4) }
+                operationOptions
             )
         end
         if inv.items and inv.items.sendActionCommands then
@@ -1335,6 +1381,13 @@ function inv.set.wear(priorityName, level, endTag)
                 end
             end
         end
+    end
+
+    if wearTimingId and DINV.debug.recordWearTimingPhase then
+        DINV.debug.recordWearTimingPhase(wearTimingId, "dispatch", dispatchTimingWall, dispatchTimingCpu)
+    end
+    if wearTimingId and (#commands == 0 or operationId == nil) then
+        finishWearTiming({ status = #commands == 0 and "already matched" or "untracked" }, #commands > 0)
     end
 
     if #commands > 0 then

@@ -16,7 +16,7 @@ function DINV.aliases.register()
     
     -- Main dinv alias - routes all commands through CLI
     DINV.aliases.ids.dinv = tempAlias(
-        "^dinv(.*)$",
+        "^dinv(?:\\s+(.*))?$",
         function()
             if not (inv and inv.cli and inv.cli.main) then
                 cecho("<red>DINV: Not initialized. Run: lua DINV.initialize()\n")

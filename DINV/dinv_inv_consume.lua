@@ -894,10 +894,15 @@ function inv.consume.buyCR()
         pkg.startTime = os.time()
         dbot.debug("Running to \"" .. pkg.room .. "\" to buy \"" .. pkg.numItems ..
             "\" of \"" .. pkg.itemName .. "\"", "inv.consume")
-        if expandAlias then
-            expandAlias("xrt " .. pkg.room)
+        if type(gotoRoom) == "function" then
+            local travelOk, travelErr = pcall(gotoRoom, room)
+            if not travelOk then
+                dbot.warn("inv.consume.buyCR: direct mapper travel failed: " .. tostring(travelErr))
+                inv.consume.buyPkg = nil
+                return DRL_RET_INTERNAL_ERROR
+            end
         else
-            dbot.warn("inv.consume.buyCR: expandAlias is unavailable; cannot run xrt")
+            dbot.warn("inv.consume.buyCR: Mudlet gotoRoom API is unavailable; cannot travel to the shop")
             inv.consume.buyPkg = nil
             return DRL_RET_UNSUPPORTED
         end

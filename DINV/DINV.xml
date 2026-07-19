@@ -352,7 +352,11 @@ if inv and inv.levelup and inv.levelup.getDebug and inv.levelup.getDebug() then
         tostring(defaultPriority), tostring(mode)))
 end
 
-expandAlias("dinv set test " .. tostring(defaultPriority) .. " " .. tostring(mode), false)</script>
+if inv and inv.set and inv.set.test then
+    inv.set.test(defaultPriority, mode)
+else
+    dbot.warn("DINV level-up test could not run because the set module is unavailable.")
+end</script>
         <triggerType>0</triggerType>
         <conditonLineDelta>0</conditonLineDelta>
         <mStayOpen>0</mStayOpen>

@@ -64,15 +64,18 @@ local function sendToChannel(reportChannel, message)
     local cmd = tostring(reportChannel or ""):gsub("^%s+", ""):gsub("%s+$", "") .. " " .. tostring(message or "")
     local channelLower = tostring(reportChannel or ""):lower()
     if mudChannels[channelLower] then
-        send(cmd)
-        return
+        send(cmd, false)
+        return true
     end
 
-    if expandAlias then
-        expandAlias(cmd, false)
+    dbot.warn("Report channel '" .. tostring(reportChannel) ..
+        "' is not a direct Aardwolf channel; displaying the report locally instead.")
+    if dbot and dbot.convertColors then
+        cecho(dbot.convertColors(tostring(message or "")) .. "\n")
     else
-        send(cmd)
+        cecho(tostring(message or "") .. "\n")
     end
+    return false
 end
 
 local function reportLine(line, channel)

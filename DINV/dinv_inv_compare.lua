@@ -27,13 +27,14 @@ function inv.compare.onDeltaClick(deltaLine)
         if dbot and dbot.print then dbot.print(lineToReport) end
         return DRL_RET_SUCCESS
     end
+    if inv.report and inv.report.sendLine then
+        return inv.report.sendLine(lineToReport, channel)
+    end
     local cmd = tostring(channel) .. " " .. lineToReport
-    if mudChannels[tostring(channel):lower()] then
+    if mudChannels[tostring(channel):lower()] and send then
         send(cmd, false)
-    elseif expandAlias then
-        expandAlias(cmd, false)
     else
-        send(cmd, false)
+        dbot.warn("inv.compare: report module is unavailable and the configured channel is not a direct Aardwolf channel")
     end
     return DRL_RET_SUCCESS
 end
