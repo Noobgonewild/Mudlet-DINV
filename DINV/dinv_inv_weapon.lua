@@ -178,9 +178,9 @@ local function ensureItemAvailable(objId)
     local location = (inv.items.getStatField(objId, invStatFieldLocation) or ""):lower()
 
     if containerId ~= nil then
-        inv.items.sendActionCommand("dinv get " .. tostring(objId))
+        inv.items.get("id " .. tostring(objId))
     elseif location ~= "" and location ~= "inventory" then
-        inv.items.sendActionCommand("dinv get " .. tostring(objId))
+        inv.items.get("id " .. tostring(objId))
     end
 end
 

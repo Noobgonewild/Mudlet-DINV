@@ -166,7 +166,7 @@ function inv.snapshot.wear(name, endTag)
         if currentlyWorn ~= wearLoc then
             local location = inv.items.getStatField(objIdStr, invStatFieldLocation) or ""
             if not inv.items.isWorn(objIdStr) and location ~= "" and location ~= "inventory" then
-                inv.items.sendActionCommand("dinv get id " .. objIdStr)
+                inv.items.get("id " .. objIdStr)
             end
             inv.items.wearItem(objIdStr, wearLoc)
         end

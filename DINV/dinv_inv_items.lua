@@ -7291,12 +7291,25 @@ function inv.items.sendActionCommand(command)
     if not command or command == "" then
         return DRL_RET_INVALID_PARAM
     end
-    if sendSilent then
-        sendSilent(command)
-    else
-        send(command)
+
+    local normalizedCommand = tostring(command):match("^%s*(.-)%s*$")
+    local commandName, commandArgs = normalizedCommand:match("^(%S+)%s*(.*)$")
+    if commandName and commandName:lower() == "dinv" then
+        if inv.cli and type(inv.cli.main) == "function" then
+            -- DINV commands are local API calls. They must never be forwarded
+            -- to Aardwolf as network text.
+            return inv.cli.main(commandArgs or "")
+        end
+        dbot.warn("Unable to run internal DINV command because the CLI router is unavailable: " .. normalizedCommand)
+        return DRL_RET_UNINITIALIZED
     end
-    inv.items.logActionCommand(command)
+
+    if sendSilent then
+        sendSilent(normalizedCommand)
+    else
+        send(normalizedCommand, false)
+    end
+    inv.items.logActionCommand(normalizedCommand)
     return DRL_RET_SUCCESS
 end
 
