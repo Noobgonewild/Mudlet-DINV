@@ -665,10 +665,48 @@ function dbot.gmcp.statePreventsActions()
 end
 
 function dbot.gmcp.getName()
-    if gmcp and gmcp.char and gmcp.char.base then
-        return gmcp.char.base.name or "Unknown"
+    -- Aardwolf defines the character name in char.base.  Do not infer it
+    -- from other GMCP modules: char.status, for example, has no name field.
+    if gmcp and gmcp.char and gmcp.char.base and gmcp.char.base.name then
+        return tostring(gmcp.char.base.name)
     end
     return "Unknown"
+end
+
+local function formatGMCPDebugValue(value, seen)
+    local valueType = type(value)
+    if valueType == "string" then
+        return string.format("%q", value)
+    end
+    if valueType == "number" or valueType == "boolean" or valueType == "nil" then
+        return tostring(value)
+    end
+    if valueType ~= "table" then
+        return string.format("%q", tostring(value))
+    end
+
+    seen = seen or {}
+    if seen[value] then
+        return '"<cycle>"'
+    end
+    seen[value] = true
+
+    local entries = {}
+    for key, nestedValue in pairs(value) do
+        table.insert(entries,
+            "[" .. formatGMCPDebugValue(key, seen) .. "]=" ..
+            formatGMCPDebugValue(nestedValue, seen))
+    end
+    table.sort(entries)
+    seen[value] = nil
+    return "{" .. table.concat(entries, ", ") .. "}"
+end
+
+function dbot.gmcp.debugCharBase(moduleName)
+    local base = gmcp and gmcp.char and gmcp.char.base or nil
+    dbot.debug("gmcp.char.base = " .. formatGMCPDebugValue(base), moduleName or "inv.priority")
+    dbot.debug("Resolved character name = " ..
+        formatGMCPDebugValue(dbot.gmcp.getName()), moduleName or "inv.priority")
 end
 
 dbot.gmcp.charName = "unknown"
@@ -923,15 +961,9 @@ function dbot.storage.init.atInstall()
 end
 
 function dbot.storage.init.atActive()
-    -- Ensure directories exist
-    dbot.ensureDirectory(pluginStatePath)
-    
-    local baseDir = dbot.backup.getBaseDir()
-    dbot.ensureDirectory(baseDir)
-    
-    local currentDir = dbot.backup.getCurrentDir()
-    dbot.ensureDirectory(currentDir)
-    
+    -- Current persistence is owned by DINV.database.  The old plugin-state
+    -- paths remain readable by the one-time SQLite migration code, but must
+    -- never be recreated as active storage.
     return DRL_RET_SUCCESS
 end
 

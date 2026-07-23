@@ -23,6 +23,9 @@ function inv.statBonus.init.atActive()
     if retval ~= DRL_RET_SUCCESS then
         dbot.debug("inv.statBonus.init.atActive: Using fresh statbonus table", "inv.statBonus")
     end
+    if inv.statBonus.refreshCurrent then
+        inv.statBonus.refreshCurrent()
+    end
     return DRL_RET_SUCCESS
 end
 
@@ -60,6 +63,63 @@ function inv.statBonus.reset()
         levelHistory = {}
     }
     inv.statBonus.equipBonus = {}
+    return DRL_RET_SUCCESS
+end
+
+local trackedStats = {
+    invStatFieldStr, invStatFieldInt, invStatFieldWis, invStatFieldDex,
+    invStatFieldCon, invStatFieldLuck, invStatFieldHp, invStatFieldMana,
+    invStatFieldMoves, invStatFieldHitroll, invStatFieldDamroll
+}
+
+function inv.statBonus.refreshCurrent()
+    -- Keep the live GMCP snapshot in memory. This deliberately does not append
+    -- history or write the database because char.stats can fire for every buff
+    -- and equipment change on Mudlet's UI thread.
+    if not (gmcp and gmcp.char and gmcp.char.stats) then
+        return DRL_RET_UNINITIALIZED
+    end
+
+    ensureStatBonusTableShape()
+
+    for _, stat in ipairs(trackedStats) do
+        local statKey = tostring(stat)
+        local modKey = statKey .. "_mod"
+        local spellKey = statKey .. "_spell"
+        local base = gmcp.char.base and gmcp.char.base[statKey] or nil
+        local current = gmcp.char.stats[statKey] or nil
+        local bonus = gmcp.char.stats[modKey]
+        if bonus == nil and current ~= nil and base ~= nil then
+            bonus = tonumber(current) - tonumber(base)
+        end
+        inv.statBonus.table.equipBonuses[statKey] = tonumber(bonus) or 0
+
+        if gmcp.char.stats[spellKey] ~= nil then
+            inv.statBonus.table.spellBonuses[statKey] = tonumber(gmcp.char.stats[spellKey]) or 0
+        end
+    end
+
+    -- Force score/set consumers to derive the current level's equipment caps
+    -- again from this fresh spell-bonus snapshot.
+    local currentLevels = {}
+    if dbot and dbot.gmcp then
+        if dbot.gmcp.getLevel then
+            local currentLevel = tonumber(dbot.gmcp.getLevel())
+            if currentLevel ~= nil then
+                currentLevels[currentLevel] = true
+            end
+        end
+        if dbot.gmcp.getWearableLevel then
+            local wearableLevel = tonumber(dbot.gmcp.getWearableLevel())
+            if wearableLevel ~= nil then
+                currentLevels[wearableLevel] = true
+            end
+        end
+    end
+    for currentLevel in pairs(currentLevels) do
+        inv.statBonus.equipBonus[currentLevel] = nil
+    end
+
     return DRL_RET_SUCCESS
 end
 
@@ -145,13 +205,14 @@ function inv.statBonus.get(level, bonusType)
 
     local spellBonus = nil
     if bonusType == invStatBonusTypeCurrent then
+        inv.statBonus.refreshCurrent()
         spellBonus = {
-            str = inv.statBonus.getSpellBonus("str", level),
-            int = inv.statBonus.getSpellBonus("int", level),
-            wis = inv.statBonus.getSpellBonus("wis", level),
-            dex = inv.statBonus.getSpellBonus("dex", level),
-            con = inv.statBonus.getSpellBonus("con", level),
-            luck = inv.statBonus.getSpellBonus("luck", level)
+            str = tonumber(inv.statBonus.table.spellBonuses.str) or 0,
+            int = tonumber(inv.statBonus.table.spellBonuses.int) or 0,
+            wis = tonumber(inv.statBonus.table.spellBonuses.wis) or 0,
+            dex = tonumber(inv.statBonus.table.spellBonuses.dex) or 0,
+            con = tonumber(inv.statBonus.table.spellBonuses.con) or 0,
+            luck = tonumber(inv.statBonus.table.spellBonuses.luck) or 0
         }
     elseif bonusType == invStatBonusTypeMax then
         spellBonus = invStatBonusGetMax(level)
@@ -176,41 +237,24 @@ function inv.statBonus.get(level, bonusType)
 end
 
 function inv.statBonus.set()
-    -- Called periodically to sample current stat bonuses
-    if not (gmcp and gmcp.char and gmcp.char.stats) then
-        return DRL_RET_UNINITIALIZED
+    -- Explicit historical sample. Live char.stats updates use refreshCurrent()
+    -- so they never append history or synchronously rewrite the database.
+    local retval = inv.statBonus.refreshCurrent()
+    if retval ~= DRL_RET_SUCCESS then
+        return retval
     end
 
-    ensureStatBonusTableShape()
-
     local level = dbot.gmcp.getLevel()
-    local stats = {
-        invStatFieldStr, invStatFieldInt, invStatFieldWis, invStatFieldDex,
-        invStatFieldCon, invStatFieldLuck, invStatFieldHp, invStatFieldMana,
-        invStatFieldMoves, invStatFieldHitroll, invStatFieldDamroll
-    }
-
     inv.statBonus.table.levelHistory[tostring(level)] = inv.statBonus.table.levelHistory[tostring(level)] or {}
     local snapshot = { timestamp = os.time(), bonuses = {}, spellBonuses = {} }
 
-    for _, stat in ipairs(stats) do
+    for _, stat in ipairs(trackedStats) do
         local statKey = tostring(stat)
-        local modKey = statKey .. "_mod"
         local spellKey = statKey .. "_spell"
-        local base = gmcp.char.base and gmcp.char.base[statKey] or nil
-        local current = gmcp.char.stats[statKey] or nil
-        local bonus = gmcp.char.stats[modKey]
-        if bonus == nil and current ~= nil and base ~= nil then
-            bonus = tonumber(current) - tonumber(base)
-        end
-        bonus = tonumber(bonus) or 0
-        inv.statBonus.table.equipBonuses[statKey] = bonus
+        snapshot.bonuses[statKey] = tonumber(inv.statBonus.table.equipBonuses[statKey]) or 0
         if gmcp.char.stats[spellKey] ~= nil then
-            local spellBonus = tonumber(gmcp.char.stats[spellKey]) or 0
-            inv.statBonus.table.spellBonuses[statKey] = spellBonus
-            snapshot.spellBonuses[statKey] = spellBonus
+            snapshot.spellBonuses[statKey] = tonumber(inv.statBonus.table.spellBonuses[statKey]) or 0
         end
-        snapshot.bonuses[statKey] = bonus
     end
 
     table.insert(inv.statBonus.table.levelHistory[tostring(level)], snapshot)

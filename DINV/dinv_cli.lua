@@ -1204,15 +1204,74 @@ end
 ----------------------------------------------------------------------------------------------------
 
 inv.cli.set = {}
+
+local function resolveSetWearArgs(wildcards)
+    local cursor = 2
+    local useCache = tostring(wildcards and wildcards[cursor] or ""):lower() == "cache"
+    if useCache then
+        cursor = cursor + 1
+    end
+
+    local first = wildcards and wildcards[cursor] or nil
+    local second = wildcards and wildcards[cursor + 1] or nil
+    local extra = wildcards and wildcards[cursor + 2] or nil
+    if extra ~= nil then
+        return nil, nil, useCache, "usage"
+    end
+
+    local priority = nil
+    local level = nil
+    if first ~= nil and first ~= "" then
+        if tonumber(first) ~= nil then
+            if second ~= nil then
+                return nil, nil, useCache, "usage"
+            end
+            level = tonumber(first)
+        else
+            priority = first
+            if second ~= nil and second ~= "" then
+                level = tonumber(second)
+                if level == nil then
+                    return nil, nil, useCache, "usage"
+                end
+            end
+        end
+    end
+
+    if priority == nil or priority == "" then
+        priority = inv.priority and inv.priority.getDefault and inv.priority.getDefault() or nil
+        if priority == nil or priority == "" then
+            return nil, level, useCache, "default"
+        end
+    end
+
+    return priority, level, useCache, nil
+end
+
 function inv.cli.set.fn(name, line, wildcards)
-    local action = wildcards and wildcards[1] or ""
+    local action = tostring(wildcards and wildcards[1] or ""):lower()
     local priority = wildcards and wildcards[2] or ""
     local arg3 = wildcards and wildcards[3] or ""
     local level = tonumber(arg3)
     local endTag = inv.tags.new(line)
     
     if action == "wear" then
-        return inv.set.wear(priority, level, endTag)
+        local wearPriority, wearLevel, useCache, parseError = resolveSetWearArgs(wildcards)
+        if parseError == "default" then
+            dbot.warn("No default priority is configured.")
+            dbot.info("Set one with @Gdinv priority default <name>@W or include a priority in this command.")
+            return inv.tags.stop(invTagsSet, endTag, DRL_RET_MISSING_ENTRY)
+        elseif parseError ~= nil then
+            dbot.warn("Usage: dinv set wear [cache] [priority] [level]")
+            return inv.tags.stop(invTagsSet, endTag, DRL_RET_INVALID_PARAM)
+        end
+
+        if useCache then
+            return inv.set.wearCached(wearPriority, wearLevel, endTag)
+        end
+
+        -- Live wear always rebuilds from current inventory and spell bonuses.
+        return inv.set.createAndWear(wearPriority, wearLevel, nil, endTag)
     elseif action == "test" then
         return inv.set.test(priority, arg3, endTag)
     elseif action == "display" then
@@ -1224,13 +1283,16 @@ function inv.cli.set.fn(name, line, wildcards)
         end
         return inv.tags.stop(invTagsSet, endTag, retval)
     else
-        dbot.warn("Usage: dinv set [wear | test <cache|live> | display | clear] <priority> [level]")
+        dbot.warn("Usage: dinv set wear [cache] [priority] [level]")
+        dbot.warn("       dinv set [test <cache|live> | display | clear] <priority> [level]")
         return inv.tags.stop(invTagsSet, endTag, DRL_RET_INVALID_PARAM)
     end
 end
 function inv.cli.set.usage()
-    dbot.printRaw(string.format("@W    %-50s @w- %s", 
-               pluginNameCmd .. " set @G[wear | test <cache|live> | display | clear] <priority> [level]", "Equipment sets"))
+    dbot.printRaw(string.format("@W    %-50s @w- %s",
+               pluginNameCmd .. " set wear @G[cache] [priority] [level]", "Calculate or wear a cached equipment set"))
+    dbot.printRaw(string.format("@W    %-50s @w- %s",
+               pluginNameCmd .. " set @G[test <cache|live> | display | clear] <priority> [level]", "Inspect and manage equipment sets"))
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -2153,13 +2215,10 @@ equipment set while having a normal spellup and a second equipment set after get
 superhero spellup, chances are high that there would be different equipment in both sets.
 However, if you create a set for a level that is either higher or lower than your current
 level, then the plugin must make some estimates since it can't know how many stats you would
-have due to spells at that level.  It starts by guessing what an "average" spellup should
-look like at a specific level.  The plugin also periodically samples your stats as you
-play the game and keeps a running weighted average of spell bonuses for each level.  If
-you play a style that involves always maintaining an SH spellup, then over time the plugin
-will learn to use high estimates for your spell bonuses when it creates a set.  Similarly,
-if you don't bother to use spellups, then over time the plugin will learn to use lower
-spell bonuses that more accurately reflect your playing style.
+have due to spells at that level. For your current wearable level, set creation reads the
+live spell bonuses already present
+in GMCP. For other levels, DINV uses its saved historical estimates. Live GMCP stat changes
+are kept in memory and do not write a new history record for every buff transition.
 
 The set creation algorithm is smart enough to detect if you have the ability to dual wield
 either from aard gloves or naturally via the skill and will base the set accordingly.  It
@@ -2170,8 +2229,11 @@ The key point is that we care about maximizing the total *usable* stats in an eq
 set.  Finding pieces that are complementary without wasting points on overmaxed stats is
 a process that is well-suited for a plugin -- hence this plugin :)
 
-The "@Cset@W" mode creates the specified set and then either wears the equipment or displays
-the results depending on if the "@Cwear@W" or the "@Cdisplay@W" option is specified.
+The "@Cset wear@W" command calculates a live set and then wears it. Add "@Ccache@W"
+to prefer a previously calculated set. If that cache entry is missing, DINV explains that
+it is calculating the set now. A cached set containing missing items is not worn; DINV lists
+the missing items and leaves your equipment unchanged.
+If no priority is supplied, set wear uses the global default priority.
 The "@Ctest@W" option controls how set creation is evaluated:
   - "@Ctest cache@W" uses cached set data only (faster, no rebuild)
   - "@Ctest live@W" rebuilds data from current inventory state
@@ -2237,6 +2299,13 @@ Examples:
      containers.  It then pulls the new items from wherever they are stored and wears
      them.  Easy peasy.
      "@Gdinv set wear enchanter@W"
+
+  4) Wear the cached navi set for my current wearable level. If it has not been
+     calculated yet, DINV calculates and caches it first.
+     "@Gdinv set wear cache navi@W"
+
+  5) Wear the cached navi set for equipment level 120.
+     "@Gdinv set wear cache navi 120@W"
 ]])
 end
 

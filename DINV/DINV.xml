@@ -151,6 +151,22 @@ function DINV.initialize()
         -- Register GMCP handlers (base/status)
         DINV.registerGMCPHandlers()
         DINV.setTriggerGroupEnabled(true)
+
+        -- When the package is reloaded while already connected, Mudlet may
+        -- have emitted gmcp.char.base before these handlers were registered.
+        -- Bootstrap from the GMCP data already in memory so SQLite-backed
+        -- modules and per-character file migrations still initialize now.
+        local currentCharacter = dbot.gmcp and dbot.gmcp.getName
+            and tostring(dbot.gmcp.getName() or "") or ""
+        if currentCharacter ~= "" and currentCharacter:lower() ~= "unknown"
+            and DINV.onGMCPCharBase then
+            DINV.onGMCPCharBase()
+        elseif sendGMCP then
+            -- inv.init.atInstall may have requested this before the handlers
+            -- above were registered. Request it again now so gmcp.char.base
+            -- reliably drives active initialization and file migration.
+            sendGMCP("request char")
+        end
         
         cecho("&lt;green&gt;[DINV] Initialization complete!\n\n")
         return true
@@ -171,6 +187,9 @@ end
 
 function DINV.onGMCPCharBase()
     if dbot and dbot.gmcp then
+        if dbot.gmcp.debugCharBase then
+            dbot.gmcp.debugCharBase("inv.priority")
+        end
         dbot.gmcp.isInitialized = true
         local incomingName = dbot.gmcp.getName and tostring(dbot.gmcp.getName() or "") or ""
         local databaseName = DINV.database and tostring(DINV.database.character or "") or ""
@@ -189,6 +208,9 @@ function DINV.onGMCPCharBase()
         end
         if inv and inv.init and inv.init.atActive and not inv.init.initializedActive then
             inv.init.atActive()
+        end
+        if inv and inv.priority and inv.priority.startFileMigration then
+            inv.priority.startFileMigration()
         end
         if DINV.api and DINV.api._onReady and inv and inv.init and inv.init.initializedActive then
             pcall(DINV.api._onReady)

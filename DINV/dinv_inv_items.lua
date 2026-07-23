@@ -19,6 +19,87 @@ inv.items.keepSync = inv.items.keepSync or {
 }
 
 ----------------------------------------------------------------------------------------------------
+-- Shared Item Effect Detection
+----------------------------------------------------------------------------------------------------
+
+-- Some Aardwolf quest items do not expose their special capability in the
+-- ordinary affects/flags fields.  Keep the name fallback in one place so
+-- scoring and set reporting always agree.
+inv.items.questEffectRegistry = {
+    ["aardwolf gloves of dexterity"] = { "dualwield" },
+    ["aardwolf bracers of iron grip"] = { "irongrip" },
+    ["wings of aardwolf"] = { "flying" },
+    ["aardwolf boots of speed"] = { "haste" },
+    ["aardwolf aura of sanctuary"] = { "sanctuary" },
+    ["aardwolf ring of invisibility"] = { "invis" },
+    ["aardwolf ring of regeneration"] = { "regeneration" },
+    ["aardwolf helm of true sight"] = {
+        "detectgood", "detectevil", "detecthidden", "detectinvis", "detectmagic",
+    },
+}
+
+local function normalizeEffectItemName(value)
+    local name = dbot.stripColors(tostring(value or "")):lower()
+    return (name:gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " "))
+end
+
+local function normalizeEffectText(value)
+    local text = tostring(value or ""):lower()
+    text = text:gsub("dual%s+wield", "dualwield")
+    text = text:gsub("iron%s+grip", "irongrip")
+    text = text:gsub("detect%s+invisible", "detectinvis")
+    text = text:gsub("detect%s+invis", "detectinvis")
+    text = text:gsub("detect%s+hidden", "detecthidden")
+    text = text:gsub("detect%s+evil", "detectevil")
+    text = text:gsub("detect%s+good", "detectgood")
+    text = text:gsub("detect%s+magic", "detectmagic")
+    text = text:gsub("invisibility", "invis")
+    text = text:gsub("invisible", "invis")
+    return text
+end
+
+function inv.items.getEffectTextFromStats(itemStats)
+    local stats = itemStats or {}
+    local parts = {
+        tostring(stats[invStatFieldAffects] or stats.affects or ""),
+        tostring(stats[invStatFieldAffectMods] or stats.affectMods or ""),
+        tostring(stats[invStatFieldSpells] or stats.spells or ""),
+        tostring(stats[invStatFieldFlags] or stats.flags or ""),
+    }
+
+    local itemName = normalizeEffectItemName(
+        stats[invStatFieldName] or stats.name or stats[invStatFieldColorName] or stats.colorname or "")
+    local questEffects = inv.items.questEffectRegistry[itemName]
+    if questEffects then
+        table.insert(parts, table.concat(questEffects, " "))
+    end
+
+    return normalizeEffectText(table.concat(parts, " "))
+end
+
+
+function inv.items.effectTextHas(effectText, effectName)
+    local wanted = normalizeEffectText(effectName):gsub("%s+", "")
+    if wanted == "" then return false end
+    for token in normalizeEffectText(effectText):gmatch("[%w_]+") do
+        if token == wanted then return true end
+    end
+    return false
+end
+
+
+function inv.items.getEffectText(objId)
+    local item = inv.items.getItem and inv.items.getItem(objId) or nil
+    if not item then return "" end
+    return inv.items.getEffectTextFromStats(item.stats or item)
+end
+
+
+function inv.items.hasEffect(objId, effectName)
+    return inv.items.effectTextHas(inv.items.getEffectText(objId), effectName)
+end
+
+----------------------------------------------------------------------------------------------------
 -- Timer Configuration
 ----------------------------------------------------------------------------------------------------
 

@@ -80,39 +80,8 @@ inv.set.wearLocMap = {
     hold = "hold", float = "float", above = "above", portal = "portal", sleeping = "sleeping",
 }
 
-local invSetQuestEffectMap = {
-    ["aardwolf gloves of dexterity"] = { "dualwield" },
-    ["bracers of iron grip"] = { "irongrip" },
-    ["wings of aardwolf"] = { "flying" },
-    ["boots of speed"] = { "haste" },
-    ["aura of sanctuary"] = { "sanctuary" },
-    ["ring of invisibility"] = { "invis" },
-    ["ring of regeneration"] = { "regeneration" },
-    ["helm of true sight"] = { "detectgood", "detectevil", "detecthidden", "detectinvis", "detectmagic" },
-}
-
-local function getItemEffectText(objId)
-    local affects = tostring(inv.items.getStatField(objId, invStatFieldAffects) or "")
-    local spells = tostring(inv.items.getStatField(objId, invStatFieldSpells) or "")
-    local flags = tostring(inv.items.getStatField(objId, invStatFieldFlags) or "")
-    local combined = string.lower(affects .. " " .. spells .. " " .. flags)
-
-    local itemName = string.lower(dbot.stripColors(inv.items.getStatField(objId, invStatFieldName) or ""))
-
-    local questEffects = invSetQuestEffectMap[itemName]
-    if questEffects then
-        combined = combined .. " " .. table.concat(questEffects, " ")
-    end
-
-    combined = combined:gsub("dual wield", "dualwield")
-    combined = combined:gsub("detect invis", "detectinvis")
-
-    return combined
-end
-
 local function itemHasEffect(objId, effectName)
-    local combined = getItemEffectText(objId)
-    return combined:find(string.lower(effectName), 1, true) ~= nil
+    return inv.items.hasEffect and inv.items.hasEffect(objId, effectName) or false
 end
 
 local function itemIsHeroOnly(objId)
@@ -133,6 +102,13 @@ end
 -- Properly implements weapon weight rules and dual wield vs single weapon + shield + hold comparison
 ----------------------------------------------------------------------------------------------------
 
+local function invSetResolveTargetLevel(level)
+    return tonumber(level)
+        or (dbot.gmcp.getWearableLevel and tonumber(dbot.gmcp.getWearableLevel()))
+        or (dbot.gmcp.getLevel and tonumber(dbot.gmcp.getLevel()))
+        or 1
+end
+
 function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, baseLevelOverride)
     if priorityName == nil or priorityName == "" then
         dbot.warn("inv.set.create: Missing priority name")
@@ -144,7 +120,7 @@ function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, ba
         return DRL_RET_MISSING_ENTRY
     end
 
-    local targetLevel = tonumber(level) or (dbot.gmcp.getLevel and dbot.gmcp.getLevel()) or 1
+    local targetLevel = invSetResolveTargetLevel(level)
 
     if inv.score and inv.score.getFlyingSkipReason then
         local flyingSkipReason = inv.score.getFlyingSkipReason(targetLevel)
@@ -185,7 +161,7 @@ function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, ba
     end
 
     local bonusType = invStatBonusTypeAve
-    if targetLevel == (dbot.gmcp.getLevel and dbot.gmcp.getLevel() or targetLevel) then
+    if targetLevel == invSetResolveTargetLevel(nil) then
         bonusType = invStatBonusTypeCurrent
     end
 
@@ -250,8 +226,18 @@ function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, ba
     -- PHASE 8: Save the set
     ---------------------------------------------------------------------------
 
+    local itemNames = {}
+    for loc, objId in pairs(equipment) do
+        local itemName = inv.items and inv.items.getStatField
+            and inv.items.getStatField(objId, invStatFieldName) or nil
+        if itemName ~= nil and tostring(itemName) ~= "" then
+            itemNames[loc] = tostring(itemName)
+        end
+    end
+
     inv.set.table[priorityName][tostring(targetLevel)] = {
         equipment = equipment,
+        itemNames = itemNames,
         score = totalScore,
         level = targetLevel,
         created = os.time(),
@@ -1099,7 +1085,8 @@ end
 -- Wear Equipment Set
 ----------------------------------------------------------------------------------------------------
 
-function inv.set.wear(priorityName, level, endTag)
+function inv.set.wear(priorityName, level, endTag, options)
+    options = options or {}
     if priorityName == nil or priorityName == "" then
         dbot.warn("Usage: dinv set wear <priority> [level]")
         if endTag then
@@ -1108,7 +1095,9 @@ function inv.set.wear(priorityName, level, endTag)
         return DRL_RET_INVALID_PARAM
     end
 
-    local targetLevel = tostring(tonumber(level) or (dbot.gmcp.getWearableLevel and dbot.gmcp.getWearableLevel()) or (dbot.gmcp.getLevel and dbot.gmcp.getLevel()) or 1)
+    local targetLevel = tostring(invSetResolveTargetLevel(level))
+    local setLabel = (options.cached and "Cached set" or "Equipment set") ..
+        " '" .. tostring(priorityName) .. "' at level " .. targetLevel
     local wearTimingId = DINV and DINV.debug and DINV.debug.startWearTiming
         and DINV.debug.startWearTiming(priorityName, targetLevel) or nil
     local cacheTimingWall, cacheTimingCpu = nil, nil
@@ -1125,11 +1114,6 @@ function inv.set.wear(priorityName, level, endTag)
         elseif DINV.debug.finishWearTiming then
             DINV.debug.finishWearTiming(wearTimingId, result)
         end
-    end
-
-    local staleReason = inv.set.getStaleReason(priorityName, targetLevel)
-    if staleReason then
-        dbot.warn("Cached set for '" .. priorityName .. "' is stale: " .. staleReason .. ". Wearing the cached set.")
     end
 
     if inv.set.table[priorityName] == nil or inv.set.table[priorityName][targetLevel] == nil then
@@ -1356,14 +1340,24 @@ function inv.set.wear(priorityName, level, endTag)
 
     if #commands > 0 then
         if inv.operations and inv.operations.startBatchFromCommands then
-            local operationOptions = { timeout = math.max(8, #commands * 0.2 + 4) }
-            if wearTimingId then
-                operationOptions.onFinish = function(result)
-                    finishWearTiming(result, true)
+            local operationOptions = {
+                timeout = math.max(8, #commands * 0.2 + 4),
+                onFinish = function(result)
+                    if wearTimingId then
+                        finishWearTiming(result, true)
+                    end
+                    if result and #(result.failures or {}) == 0 then
+                        dbot.info(setLabel .. " equipped.")
+                    else
+                        dbot.warn(setLabel .. " was not fully equipped.")
+                    end
+                    if type(options.onFinish) == "function" then
+                        pcall(options.onFinish, result)
+                    end
                 end
-            end
+            }
             operationId = inv.operations.startBatchFromCommands(
-                "Equipment set '" .. tostring(priorityName) .. "'",
+                setLabel,
                 commands,
                 operationOptions
             )
@@ -1392,14 +1386,79 @@ function inv.set.wear(priorityName, level, endTag)
 
     if #commands > 0 then
         dbot.debug("Equipment set commands sent; waiting for final invmon observations.", "inv.set")
+        if operationId == nil then
+            dbot.warn(setLabel .. " commands were sent, but completion tracking was unavailable.")
+        end
     else
-        dbot.info("Equipment set already matches the observed worn state.")
+        dbot.info(setLabel .. " is already equipped.")
+        if type(options.onFinish) == "function" then
+            pcall(options.onFinish, { total = 0, confirmed = 0, failures = {}, timedOut = false })
+        end
     end
 
     if endTag then
         return inv.tags.stop(invTagsSet, endTag, DRL_RET_SUCCESS)
     end
     return DRL_RET_SUCCESS
+end
+
+local function invSetGetMissingCachedItems(setData)
+    local missing = {}
+    local equipment = setData and setData.equipment or {}
+    local itemNames = setData and setData.itemNames or {}
+
+    for _, loc in ipairs(inv.set.wearableLocations or {}) do
+        local objId = equipment[loc]
+        if objId ~= nil and not (inv.items and inv.items.getItem and inv.items.getItem(objId)) then
+            local itemName = itemNames and itemNames[loc] or nil
+            if itemName == nil or tostring(itemName) == "" then
+                itemName = "(name not recorded)"
+            end
+            table.insert(missing, {
+                loc = tostring(loc),
+                objId = tostring(objId),
+                name = tostring(itemName),
+            })
+        end
+    end
+
+    return missing
+end
+
+function inv.set.wearCached(priorityName, level, endTag)
+    if priorityName == nil or priorityName == "" then
+        dbot.warn("Usage: dinv set wear cache [priority] [level]")
+        if endTag then
+            return inv.tags.stop(invTagsSet, endTag, DRL_RET_INVALID_PARAM)
+        end
+        return DRL_RET_INVALID_PARAM
+    end
+
+    local targetLevel = tostring(invSetResolveTargetLevel(level))
+    local setData = inv.set.table[priorityName] and inv.set.table[priorityName][targetLevel] or nil
+    if setData == nil or setData.equipment == nil then
+        dbot.info("No cached set for priority @Y'" .. priorityName .. "'@W at level @G" ..
+            targetLevel .. "@W; calculating it now.")
+        return inv.set.createAndWear(priorityName, tonumber(targetLevel), nil, endTag)
+    end
+
+    local missing = invSetGetMissingCachedItems(setData)
+    if #missing > 0 then
+        dbot.warn("Cached set '" .. priorityName .. "' at level " .. targetLevel .. " cannot be worn.")
+        dbot.warn("Missing cached items:")
+        for _, entry in ipairs(missing) do
+            dbot.warn(string.format("  %-10s %s [%s]", entry.loc .. ":", entry.name, entry.objId))
+        end
+        dbot.warn("No equipment was changed.")
+        dbot.info("Run @Gdinv set wear " .. priorityName .. " " .. targetLevel ..
+            "@W to calculate and wear a current set.")
+        if endTag then
+            return inv.tags.stop(invTagsSet, endTag, DRL_RET_MISSING_ENTRY)
+        end
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    return inv.set.wear(priorityName, tonumber(targetLevel), endTag, { cached = true })
 end
 
 function inv.set.test(priorityName, mode, endTag)
@@ -1524,7 +1583,7 @@ end
 -- Create and Wear
 ----------------------------------------------------------------------------------------------------
 
-function inv.set.createAndWear(priorityName, level, intensity, endTag)
+function inv.set.createAndWear(priorityName, level, intensity, endTag, wearOptions)
     local retval = inv.set.create(priorityName, level, nil, intensity)
     if retval ~= DRL_RET_SUCCESS then
         if endTag then
@@ -1533,7 +1592,7 @@ function inv.set.createAndWear(priorityName, level, intensity, endTag)
         return retval
     end
 
-    return inv.set.wear(priorityName, level, endTag)
+    return inv.set.wear(priorityName, level, endTag, wearOptions)
 end
 
 ----------------------------------------------------------------------------------------------------

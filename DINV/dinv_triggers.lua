@@ -935,9 +935,10 @@ function DINV.onGMCPCharVitals()
 end
 
 function DINV.onGMCPCharStats()
-    -- Handle stats updates
-    if inv and inv.statBonus and inv.statBonus.set then
-        inv.statBonus.set()
+    -- Refresh the live in-memory snapshot only. Historical sampling and database
+    -- persistence must not run for every buff/equipment stat transition.
+    if inv and inv.statBonus and inv.statBonus.refreshCurrent then
+        inv.statBonus.refreshCurrent()
     end
 end
 

@@ -185,10 +185,6 @@ function DINV.finishInitialization()
 end
 
 function DINV.initialize()
-    -- Create state directory
-    local lfs = require("lfs")
-    lfs.mkdir(pluginStatePath)
-    
     -- Load all modules IMMEDIATELY (don't wait for GMCP)
     cecho("<cyan>DINV: Loading modules...\n")
     local success = DINV.loadAllModules()
@@ -252,6 +248,9 @@ end
 function DINV.onGMCPCharBase()
     -- Mark GMCP as initialized
     if dbot and dbot.gmcp then
+        if dbot.gmcp.debugCharBase then
+            dbot.gmcp.debugCharBase("inv.priority")
+        end
         if not dbot.gmcp.isInitialized then
             dbot.gmcp.isInitialized = true
             dbot.debug("GMCP char.base received: GMCP is initialized!", "loader")
@@ -341,7 +340,9 @@ end
 
 function DINV.forceInit()
     -- Check if GMCP data is already available (we're already connected)
-    if gmcp and gmcp.char and gmcp.char.base and gmcp.char.base.name then
+    local characterName = dbot and dbot.gmcp and dbot.gmcp.getName
+        and tostring(dbot.gmcp.getName() or "") or ""
+    if characterName ~= "" and characterName:lower() ~= "unknown" then
         cecho("<cyan>DINV: GMCP data detected, forcing active initialization...\n")
         
         -- Mark GMCP as initialized

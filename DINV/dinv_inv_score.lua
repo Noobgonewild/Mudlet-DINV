@@ -273,27 +273,7 @@ function inv.score.extended(itemStats, priorityName, handicap, level, isOffhand)
 
     -- Score effects from priority.effects
     if priority.effects then
-        local affects = tostring(itemStats[invStatFieldAffects] or itemStats.affects or "")
-        local spells = tostring(itemStats[invStatFieldSpells] or itemStats.spells or "")
-        local flags = tostring(itemStats[invStatFieldFlags] or itemStats.flags or "")
-        local combined = string.lower(affects .. " " .. spells .. " " .. flags)
-        local itemName = string.lower(dbot.stripColors(itemStats[invStatFieldName] or itemStats.name or ""))
-
-        local questEffectMap = {
-            ["aardwolf gloves of dexterity"] = { "dualwield" },
-            ["bracers of iron grip"] = { "irongrip" },
-            ["wings of aardwolf"] = { "flying" },
-            ["boots of speed"] = { "haste" },
-            ["aura of sanctuary"] = { "sanctuary" },
-            ["ring of invisibility"] = { "invis" },
-            ["ring of regeneration"] = { "regeneration" },
-            ["helm of true sight"] = { "detectgood", "detectevil", "detecthidden", "detectinvis", "detectmagic" },
-        }
-
-        local questEffects = questEffectMap[itemName]
-        if questEffects then
-            combined = combined .. " " .. table.concat(questEffects, " ")
-        end
+        local combined = inv.items.getEffectTextFromStats(itemStats)
 
         for effectName, effectData in pairs(priority.effects) do
             local weight = 0
@@ -303,7 +283,7 @@ function inv.score.extended(itemStats, priorityName, handicap, level, isOffhand)
                 weight = tonumber(effectData) or 0
             end
 
-            if weight > 0 and combined:find(string.lower(effectName), 1, true) then
+            if weight > 0 and inv.items.effectTextHas(combined, effectName) then
                 local shouldApplyEffect = true
                 local normalizedEffectName = tostring(effectName or ""):lower()
                 if normalizedEffectName == "flying" then

@@ -8,22 +8,219 @@ inv.priority.init  = {}
 inv.priority.table = {}
 inv.priority.stateName = "inv-priority.state"
 inv.priority.lastImported = nil
+inv.priority.migrationRetry = {
+    timerId = nil,
+    attempts = 0,
+    maxAttempts = 30,
+    delaySeconds = 1,
+}
 
 -- Clipboard for copy/paste
 inv.priority.clipboard = nil
 
--- Priority file directory
-inv.priority.fileDir = getMudletHomeDir() .. "/DINV/priorities/"
+-- Priority text files are editable imports/exports.  The SQLite priority
+-- namespace remains authoritative; these files live beside the owning
+-- character's database instead of in the package's code directory.
+inv.priority.legacyFileDir = getMudletHomeDir() .. "/DINV/priorities/"
+
+local function normalizeDirectoryPath(path)
+    local normalized = tostring(path or ""):gsub("\\", "/"):gsub("/+$", "")
+    if normalized == "" then return nil end
+    return normalized
+end
+
+function inv.priority.getFileDir()
+    local database = DINV and DINV.database or nil
+    if not database or type(database.getCharacterDirectory) ~= "function" then
+        return nil
+    end
+
+    -- The filesystem path only needs the active character name; opening the
+    -- SQLite database here made a simple file copy depend on unrelated
+    -- database initialization. Prefer the live char.base name, with the
+    -- already-open database character as a fallback.
+    local character = dbot and dbot.gmcp and dbot.gmcp.getName
+        and tostring(dbot.gmcp.getName() or "") or ""
+    if character == "" or character:lower() == "unknown" then
+        character = tostring(database.character or "")
+    end
+    if character == "" or character:lower() == "unknown" then
+        return nil
+    end
+    return database.getCharacterDirectory(character) .. "priorities/"
+end
 
 function inv.priority.ensureDir()
-    local lfs = require("lfs")
-    local parentDir = getMudletHomeDir() .. "/DINV"
-    lfs.mkdir(parentDir)
-    lfs.mkdir(inv.priority.fileDir)
+    local fileDir = inv.priority.getFileDir()
+    if not fileDir then
+        return nil
+    end
+    local normalizedDir = normalizeDirectoryPath(fileDir)
+    if not normalizedDir then return nil end
+
+    local okLfs, lfsModule = pcall(require, "lfs")
+    if not okLfs then return nil end
+    if not lfs then lfs = lfsModule end
+
+    if dbot and dbot.ensureDirectory then
+        dbot.ensureDirectory(normalizedDir)
+    else
+        lfsModule.mkdir(normalizedDir)
+    end
+
+    local mode, attributesError = lfsModule.attributes(normalizedDir, "mode")
+    if mode ~= "directory" then
+        dbot.debug("Priority export directory check failed: path=" .. normalizedDir ..
+            ", mode=" .. tostring(mode) .. ", error=" .. tostring(attributesError), "inv.priority")
+        return nil
+    end
+    return normalizedDir .. "/"
 end
 
 function inv.priority.getFilePath(priorityName)
-    return inv.priority.fileDir .. priorityName .. ".txt"
+    local fileDir = inv.priority.getFileDir()
+    if not fileDir then return nil end
+    return fileDir .. tostring(priorityName or "") .. ".txt"
+end
+
+local function copyPriorityFileVerbatim(sourcePath, destinationPath)
+    local source = io.open(sourcePath, "rb")
+    if not source then return false end
+    local content = source:read("*a")
+    source:close()
+
+    local destination = io.open(destinationPath, "wb")
+    if not destination then return false end
+    destination:write(content)
+    destination:close()
+    return true
+end
+
+local function priorityFileExists(filePath)
+    local file = io.open(filePath, "rb")
+    if not file then return false end
+    file:close()
+    return true
+end
+
+function inv.priority.migrateLegacyFiles()
+    local destinationDir = inv.priority.ensureDir()
+    if not destinationDir then
+        return DRL_RET_UNINITIALIZED
+    end
+
+    local okLfs, lfsModule = pcall(require, "lfs")
+    local legacyDir = normalizeDirectoryPath(inv.priority.legacyFileDir)
+    if not okLfs or not legacyDir then
+        dbot.debug("Legacy priority export directory could not be resolved", "inv.priority")
+        return DRL_RET_SUCCESS
+    end
+    local legacyMode, legacyAttributesError = lfsModule.attributes(legacyDir, "mode")
+    if legacyMode ~= "directory" then
+        dbot.debug("Legacy priority export directory is unavailable: path=" .. legacyDir ..
+            ", mode=" .. tostring(legacyMode) ..
+            ", error=" .. tostring(legacyAttributesError), "inv.priority")
+        return DRL_RET_SUCCESS
+    end
+
+    local fileNames = {}
+    local seenFileNames = {}
+    local function addFileName(fileName)
+        local normalized = tostring(fileName or "")
+        local key = normalized:lower()
+        if normalized ~= "" and not seenFileNames[key] then
+            seenFileNames[key] = true
+            table.insert(fileNames, normalized)
+        end
+    end
+
+    for entry in lfsModule.dir(legacyDir) do
+        if entry ~= "." and entry ~= ".." and entry:lower():match("%.txt$") then
+            local sourcePath = legacyDir .. "/" .. entry
+            if lfsModule.attributes(sourcePath, "mode") == "file" then
+                addFileName(entry)
+            end
+        end
+    end
+
+    -- A package reload can occur after Mudlet has already emitted the GMCP
+    -- event that normally drives atActive initialization.  Use the live
+    -- SQLite priority names as direct candidates as well, so migration does
+    -- not depend exclusively on directory enumeration behavior.
+    for priorityName in pairs(inv.priority.table or {}) do
+        local fileName = tostring(priorityName) .. ".txt"
+        if priorityFileExists(legacyDir .. "/" .. fileName) then
+            addFileName(fileName)
+        end
+    end
+    table.sort(fileNames)
+
+    local copied = 0
+    for _, fileName in ipairs(fileNames) do
+        local sourcePath = legacyDir .. "/" .. fileName
+        local destinationPath = destinationDir .. fileName
+        if not priorityFileExists(destinationPath) then
+            if not copyPriorityFileVerbatim(sourcePath, destinationPath) then
+                dbot.warn("Unable to copy legacy priority export to: " .. destinationPath)
+                return DRL_RET_INTERNAL_ERROR
+            end
+            copied = copied + 1
+        end
+    end
+
+    if copied > 0 then
+        dbot.info(string.format("Copied %d priority export file(s) to: %s", copied, destinationDir))
+    end
+    return DRL_RET_SUCCESS
+end
+
+function inv.priority.cancelMigrationRetry()
+    local retry = inv.priority.migrationRetry
+    if retry and retry.timerId and killTimer then
+        pcall(killTimer, retry.timerId)
+    end
+    if retry then retry.timerId = nil end
+end
+
+function inv.priority.scheduleMigrationRetry()
+    local retry = inv.priority.migrationRetry
+    if not retry or retry.timerId then return end
+    if not tempTimer then
+        dbot.warn("Priority export migration could not wait for character data: timers are unavailable")
+        return
+    end
+    if retry.attempts >= retry.maxAttempts then
+        dbot.warn("Priority export migration could not access its directories after " ..
+            tostring(retry.maxAttempts) .. " attempts")
+        return
+    end
+
+    retry.timerId = tempTimer(retry.delaySeconds, function()
+        local currentRetry = inv and inv.priority and inv.priority.migrationRetry or nil
+        if not currentRetry then return end
+        currentRetry.timerId = nil
+        currentRetry.attempts = currentRetry.attempts + 1
+
+        local retval = inv.priority.migrateLegacyFiles()
+        if retval == DRL_RET_SUCCESS then
+            currentRetry.attempts = 0
+            return
+        end
+        inv.priority.scheduleMigrationRetry()
+    end)
+end
+
+function inv.priority.startFileMigration()
+    inv.priority.cancelMigrationRetry()
+    local retry = inv.priority.migrationRetry
+    if retry then retry.attempts = 0 end
+
+    local retval = inv.priority.migrateLegacyFiles()
+    if retval ~= DRL_RET_SUCCESS then
+        dbot.debug("Priority export migration is waiting for its per-character directory", "inv.priority")
+        inv.priority.scheduleMigrationRetry()
+    end
+    return retval
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -220,10 +417,12 @@ function inv.priority.init.atActive()
     if retval ~= DRL_RET_SUCCESS then
         dbot.debug("inv.priority.init.atActive: Using fresh priority table", "inv.priority")
     end
+    inv.priority.startFileMigration()
     return DRL_RET_SUCCESS
 end
 
 function inv.priority.fini(doSaveState)
+    inv.priority.cancelMigrationRetry()
     if doSaveState then
         inv.priority.save()
     end
@@ -286,6 +485,10 @@ function inv.priority.create(priorityName, endTag)
 
     -- Export to file for editing
     local retval = inv.priority.exportToFile(priorityName)
+    if retval ~= DRL_RET_SUCCESS then
+        if endTag then return inv.tags.stop(invTagsPriority, endTag, retval) end
+        return retval
+    end
     local filePath = inv.priority.getFilePath(priorityName)
 
     -- *** FIX: Show confirmation message like the original MUSHclient version ***
@@ -810,10 +1013,16 @@ function inv.priority.exportToFile(priorityName)
         return DRL_RET_INVALID_PARAM
     end
 
-    inv.priority.ensureDir()
+    if not inv.priority.ensureDir() then
+        dbot.warn("Priority export directory is unavailable until the character database is open")
+        return DRL_RET_UNINITIALIZED
+    end
     local priority = inv.priority.table[priorityName]
     local levelRanges = inv.priority.getLevelRanges(priority)
     local filePath = inv.priority.getFilePath(priorityName)
+    if not filePath then
+        return DRL_RET_UNINITIALIZED
+    end
 
     local file = io.open(filePath, "w")
     if file == nil then
@@ -851,6 +1060,11 @@ function inv.priority.importFromFile(priorityName, endTag)
         return DRL_RET_INVALID_PARAM
     end
 
+    if not inv.priority.ensureDir() then
+        dbot.warn("Priority import directory is unavailable until the character database is open")
+        if endTag then return inv.tags.stop(invTagsPriority, endTag, DRL_RET_UNINITIALIZED) end
+        return DRL_RET_UNINITIALIZED
+    end
     local filePath = inv.priority.getFilePath(priorityName)
     local file = io.open(filePath, "r")
     if file == nil then
@@ -1048,7 +1262,11 @@ function inv.priority.edit(priorityName, useAllFields, isQuiet, endTag)
         return DRL_RET_MISSING_ENTRY
     end
 
-    inv.priority.exportToFile(priorityName)
+    local retval = inv.priority.exportToFile(priorityName)
+    if retval ~= DRL_RET_SUCCESS then
+        if endTag then return inv.tags.stop(invTagsPriority, endTag, retval) end
+        return retval
+    end
     local filePath = inv.priority.getFilePath(priorityName)
 
     dbot.print("@Y================================================================================@W")
@@ -1103,5 +1321,4 @@ end
 -- End of inv priority module
 ----------------------------------------------------------------------------------------------------
 
-inv.priority.ensureDir()
 dbot.debug("inv.priority module loaded", "inv.priority")
