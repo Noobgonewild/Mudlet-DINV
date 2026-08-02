@@ -947,7 +947,9 @@ function DINV.onGMCPCharWorth()
 end
 
 function DINV.onGMCPRoomInfo()
-    -- Handle room info updates
+    if inv and inv.consumeWindow and inv.consumeWindow.onRoomChanged then
+        inv.consumeWindow.onRoomChanged()
+    end
 end
 
 function DINV.onGMCPCommChannel()

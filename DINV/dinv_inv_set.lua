@@ -300,7 +300,9 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
             local filteredNames = {}
 
             for objId, item in pairs(inv.items.table or {}) do
-                if not usedItems[objId] then
+                local isKeyringItem = inv.items.isKeyringItem
+                    and inv.items.isKeyringItem(item)
+                if not usedItems[objId] and not isKeyringItem then
                     local itemName = inv.items.getStatField(objId, invStatFieldName) or "Unknown"
                     local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
                     local canWear = inv.set.canWearAt(wearable, loc)
@@ -382,7 +384,9 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
     for objId, item in pairs(inv.items.table or {}) do
         local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
         local isIgnored = container ~= "" and inv.config.isIgnored(container)
-        if not isIgnored then
+        local isKeyringItem = inv.items.isKeyringItem
+            and inv.items.isKeyringItem(item)
+        if not isIgnored and not isKeyringItem then
             local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
             local itemLevel = tonumber(inv.items.getStatField(objId, invStatFieldLevel)) or 0
             local typeNum = tonumber(inv.items.getStatField(objId, invStatFieldTypeNum)) or 0

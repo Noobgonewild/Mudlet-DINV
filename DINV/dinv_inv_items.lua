@@ -491,6 +491,7 @@ inv.items.discoveryContainers = {}
 inv.items.containerIndex = 0
 inv.items.inEqdata = false
 inv.items.inInvdata = false
+inv.items.inKeyring = false
 inv.items.eqdataSeen = {}
 
 inv.items.identifyAdditiveFields = {
@@ -642,6 +643,10 @@ function inv.items.fini(doSaveState)
     inv.items.databaseBuildIdentifiedSinceFlush = 0
     inv.items.refreshValidation = nil
     inv.items.refreshSeen = nil
+    inv.items.inEqdata = false
+    inv.items.inInvdata = false
+    inv.items.inKeyring = false
+    inv.items.keyringScanStarted = nil
     inv.items.buildOriginalTable = nil
     inv.items.buildOriginalDetached = nil
     inv.items.buildOriginalPendingRemoved = nil
@@ -885,6 +890,7 @@ function inv.items.isKeepFlagSyncBusy()
         or inv.items.identifyHydrateInProgress
         or inv.items.inEqdata
         or inv.items.inInvdata
+        or inv.items.inKeyring
         or (inv.organize and inv.organize.runPkg ~= nil)
 end
 
@@ -1136,6 +1142,9 @@ local function refreshScopeKey(kind, containerId)
     if kind == "eqdata" then
         return "worn"
     end
+    if kind == "keyring" then
+        return "keyring"
+    end
     local normalizedContainerId = inv.items.normalizeContainerId
         and inv.items.normalizeContainerId(containerId)
         or nil
@@ -1331,13 +1340,15 @@ function inv.items.abortInvalidRefresh(options)
     local reason = table.concat(validation.errors or {}, "; ")
     inv.items.refreshValidation = nil
     inv.items.refreshSeen = nil
+    inv.items.inEqdata = false
+    inv.items.inInvdata = false
+    inv.items.inKeyring = false
+    inv.items.keyringScanStarted = nil
     inv.items.refreshRecheckQueue = nil
     inv.items.refreshRecheckIndex = nil
     inv.items.refreshInProgress = false
     inv.items.refreshIdentifyPartials = false
     inv.items.discoveryStage = 0
-    inv.items.inEqdata = false
-    inv.items.inInvdata = false
     inv.items.currentContainerId = nil
     inv.items.expectedInvdataContainerId = nil
     inv.items.awaitingInvdataContainerId = nil
@@ -1526,6 +1537,7 @@ function inv.items.refresh(delay, refreshLoc, endTag, callback)
     inv.items.refreshRecheckIndex = nil
     inv.items.eqdataSeen = {}
     inv.items.expectedInvdataContainerId = nil
+    inv.items.keyringScanStarted = false
 
     -- Ensure discovery triggers are registered for refresh scans
     if DINV.discovery and DINV.discovery.register then
@@ -1638,6 +1650,8 @@ function inv.items.build(endTag)
     inv.items.expectedInvdataContainerId = nil
     inv.items.inEqdata = false
     inv.items.inInvdata = false
+    inv.items.inKeyring = false
+    inv.items.keyringScanStarted = false
     inv.items.eqdataSeen = {}
     inv.items.forceIdentify = true
 
@@ -1676,8 +1690,8 @@ function inv.items.build(endTag)
     cecho("<white>  This process will:\n")
     cecho("<white>  1. Scan all worn equipment (eqdata)\n")
     cecho("<white>  2. Scan main inventory (invdata)\n")
-    cecho("<white>  3. Scan all containers\n")
-    cecho("<white>  4. Identify each item (get from container if needed)\n")
+    cecho("<white>  3. Scan all containers and keyring data\n")
+    cecho("<white>  4. Identify each non-keyring item (get from container if needed)\n")
     cecho("\n")
     cecho("<yellow>  Please wait... This may take several minutes.\n")
     cecho("<yellow>  To abort: dinv build abort\n")
@@ -1889,6 +1903,7 @@ function inv.items.startIdentifyHydrateFromInvdata(objId, source)
     inv.items.identifyHydrateTimerName = "inv.items.identifyHydrate." .. normalizedObjId
     inv.items.inEqdata = false
     inv.items.inInvdata = false
+    inv.items.inKeyring = false
     inv.items.currentContainerId = nil
     inv.items.currentInvdataSeen = nil
     inv.items.expectedInvdataContainerId = nil
@@ -1969,6 +1984,7 @@ function inv.items.finishIdentifyHydrateInvdata()
     inv.items.identifyHydrateTimerName = nil
     inv.items.inEqdata = false
     inv.items.inInvdata = false
+    inv.items.inKeyring = false
     inv.items.currentContainerId = nil
     inv.items.currentInvdataSeen = nil
     inv.items.expectedInvdataContainerId = nil
@@ -2984,6 +3000,9 @@ function inv.items.setItem(objId, itemData, options)
         and DINV and DINV.api and DINV.api._onItemSet then
         pcall(DINV.api._onItemSet, key, previousItem, itemData)
     end
+    if not bulkWorkflow and inv.consumeWindow and inv.consumeWindow.scheduleRefresh then
+        inv.consumeWindow.scheduleRefresh()
+    end
     return DRL_RET_SUCCESS
 end
 
@@ -3020,6 +3039,9 @@ function inv.items.removeItem(objId, options)
             and not silentApi
             and DINV and DINV.api and DINV.api._onItemRemoved then
             pcall(DINV.api._onItemRemoved, key, previousItem)
+        end
+        if not bulkWorkflow and inv.consumeWindow and inv.consumeWindow.scheduleRefresh then
+            inv.consumeWindow.scheduleRefresh()
         end
     end
     return DRL_RET_SUCCESS
@@ -3353,7 +3375,11 @@ function inv.items.updateLocation(item, newLocation)
     end
 end
 
-function inv.items.normalizeKeyringLocation(item)
+function inv.items.isKeyringItem(itemOrId)
+    local item = itemOrId
+    if type(itemOrId) ~= "table" then
+        item = inv.items.getItem and inv.items.getItem(itemOrId) or nil
+    end
     if not item or not item.stats then
         return false
     end
@@ -3361,11 +3387,18 @@ function inv.items.normalizeKeyringLocation(item)
     local location = tostring(item.stats[invStatFieldLocation] or "")
     local container = tostring(item.stats[invStatFieldContainer] or "")
     local lastStored = tostring(item.stats[invStatFieldLastStored] or "")
-    local isKeyring = (location == invItemLocKeyring)
-        or (container == invItemLocKeyring)
-        or (lastStored == invItemLocKeyring)
+    if location == invItemLocKeyring or container == invItemLocKeyring then
+        return true
+    end
+    -- lastStored is historical. Use it only to repair a record whose current
+    -- location is genuinely unknown, never to override a confirmed move out.
+    return (location == "" or location == "unknown")
+        and container == ""
+        and lastStored == invItemLocKeyring
+end
 
-    if not isKeyring then
+function inv.items.normalizeKeyringLocation(item)
+    if not inv.items.isKeyringItem(item) then
         return false
     end
 
@@ -3561,6 +3594,14 @@ function inv.items._parseDataLine(dataLine, source)
         else
             inv.items.updateLocation(item, wearLocText)
         end
+    elseif source == "keyring" then
+        -- Membership in keyring data is authoritative regardless of the
+        -- object's protocol type. Keyring items are tracked but never treated
+        -- as equipment-identification candidates.
+        item.stats[invStatFieldWorn] = invItemWornNotWorn
+        item.stats[invStatFieldLocation] = invItemLocKeyring
+        item.stats[invStatFieldContainer] = invItemLocKeyring
+        item.stats[invStatFieldLastStored] = invItemLocKeyring
     else
         -- invdata's wear-loc describes where the item *can* be worn. It is
         -- not evidence that an inventory/container item is currently worn.
@@ -3611,6 +3652,14 @@ function inv.items.onEqdata(dataLine)
         return DRL_RET_SUCCESS
     end
     return inv.items._parseDataLine(dataLine, "eqdata")
+end
+
+function inv.items.onKeyringData(dataLine)
+    if inv.items.identifyInProgress then
+        dbot.debug("Skipping keyring data during identify phase", "inv.items")
+        return DRL_RET_SUCCESS
+    end
+    return inv.items._parseDataLine(dataLine, "keyring")
 end
 
 function inv.items.onInvitem(dataLine)
@@ -3730,6 +3779,8 @@ function inv.items.sendDiscoveryCommand(command)
         scanAccepted = inv.items.expectRefreshScan("invdata", nil)
     elseif cmd:match("^eqdata%s*$") then
         scanAccepted = inv.items.expectRefreshScan("eqdata", nil)
+    elseif cmd:match("^keyring%s+data%s*$") then
+        scanAccepted = inv.items.expectRefreshScan("keyring", nil)
     end
 
     if scanAccepted == false then
@@ -3765,6 +3816,8 @@ function inv.items.discoverChain()
     inv.items.currentInvdataSeen = nil
     inv.items.inEqdata = false
     inv.items.inInvdata = false
+    inv.items.inKeyring = false
+    inv.items.keyringScanStarted = false
     inv.items.eqdataSeen = {}
 
     cecho("\n<cyan>[DINV] Stage 1/4: Scanning worn equipment...\n")
@@ -3932,17 +3985,11 @@ function inv.items.pruneRefreshOrphans()
             if container ~= "" and inv.config.isIgnored(container) then
                 -- Keep items in ignored containers.
             else
-                if item and inv.items.normalizeKeyringLocation(item) then
-                    inv.items.cacheObservedItem(item)
-                    inv.items.setItem(objId, item)
-                    dbot.debug(string.format("Refresh kept keyring item objId=%s name=%s", tostring(objId), tostring(item.stats[invStatFieldName] or "unknown")), "inv.items")
+                local lastEventSequence = tonumber(item and item.__dinvLastEventSeq) or 0
+                if lastEventSequence > startEventSequence then
+                    dbot.debug("Refresh kept item changed after scan start: " .. tostring(objId), "inv.items")
                 else
-                    local lastEventSequence = tonumber(item and item.__dinvLastEventSeq) or 0
-                    if lastEventSequence > startEventSequence then
-                        dbot.debug("Refresh kept item changed after scan start: " .. tostring(objId), "inv.items")
-                    else
-                        candidates[tostring(objId)] = item
-                    end
+                    candidates[tostring(objId)] = item
                 end
             end
         end
@@ -4148,6 +4195,7 @@ function inv.items.sendNextRefreshRecheck()
     inv.items.currentInvdataSeen = nil
     inv.items.inEqdata = false
     inv.items.inInvdata = false
+    inv.items.inKeyring = false
     if scope.kind == "eqdata" then
         inv.items.sendDiscoveryCommand("eqdata")
     elseif scope.containerId then
@@ -4159,14 +4207,68 @@ function inv.items.sendNextRefreshRecheck()
     end
 end
 
+function inv.items.finishLocationDiscovery()
+    if inv.items.refreshInProgress and inv.items.startRefreshRecheck() then
+        return
+    end
+    inv.items.finishDiscovery()
+end
+
+function inv.items.startKeyringScan()
+    if inv.items.keyringScanStarted then
+        inv.items.finishLocationDiscovery()
+        return
+    end
+
+    inv.items.keyringScanStarted = true
+    inv.items.inEqdata = false
+    inv.items.inInvdata = false
+    inv.items.inKeyring = false
+    inv.items.currentContainerId = nil
+    inv.items.expectedInvdataContainerId = nil
+    inv.items.awaitingInvdataContainerId = nil
+
+    local keyringLocation = tostring(invItemLocKeyring or "keyring")
+    if inv.config and inv.config.isIgnored and inv.config.isIgnored(keyringLocation) then
+        dbot.debug("Skipping ignored keyring scan", "inv.items")
+        if inv.items.refreshInProgress then
+            sendSilent("prompt")
+        end
+        inv.items.finishLocationDiscovery()
+        return
+    end
+
+    inv.items.progress.stage = "Scanning keyring"
+    dbot.debug("Scanning keyring data", "inv.items")
+    if inv.items.sendDiscoveryCommand then
+        inv.items.sendDiscoveryCommand("keyring data")
+    else
+        sendSilent("keyring data")
+    end
+
+    -- Restore normal prompt handling after the final initial discovery scope.
+    if inv.items.refreshInProgress then
+        sendSilent("prompt")
+    end
+end
+
+function inv.items.onKeyringComplete()
+    if not inv.items.buildInProgress and not inv.items.refreshInProgress then
+        return
+    end
+    inv.items.inKeyring = false
+    inv.items.finishLocationDiscovery()
+end
+
 function inv.items.discoverContainers()
     inv.items.discoveryContainers = {}
 
     for objId, item in pairs(inv.items.table or {}) do
         local typeNum = item.stats and item.stats[invStatFieldTypeNum]
+        local isKeyringItem = inv.items.isKeyringItem(item)
 
         -- Type 11 = Container
-        if typeNum == 11 then
+        if typeNum == 11 and not isKeyringItem then
             -- Skip containers with 0 capacity (card cases, etc.)
             local capacity = item.stats and item.stats[invStatFieldCapacity]
             if not capacity or capacity > 0 then
@@ -4182,10 +4284,7 @@ function inv.items.discoverContainers()
     local numContainers = #inv.items.discoveryContainers
     if numContainers == 0 then
         dbot.debug("No containers found to scan", "inv.items")
-        if inv.items.refreshInProgress and inv.items.startRefreshRecheck() then
-            return
-        end
-        inv.items.finishDiscovery()
+        inv.items.startKeyringScan()
         return
     end
 
@@ -4204,10 +4303,7 @@ function inv.items.discoverNextContainer()
         inv.items.expectedInvdataContainerId = nil
         inv.items.awaitingInvdataContainerId = nil
         dbot.debug("Finished scanning all containers", "inv.items")
-        if inv.items.refreshInProgress and inv.items.startRefreshRecheck() then
-            return
-        end
-        inv.items.finishDiscovery()
+        inv.items.startKeyringScan()
         return
     end
 
@@ -4224,11 +4320,6 @@ function inv.items.discoverNextContainer()
         sendSilent("invdata " .. containerId)
     end
 
-    -- Refresh relies on invdata completion markers that can occasionally be delayed,
-    -- so toggle prompt back immediately after the final container command is sent.
-    if inv.items.refreshInProgress and inv.items.containerIndex == #inv.items.discoveryContainers then
-        sendSilent("prompt")
-    end
 end
 
 function inv.items.finishDiscovery()
@@ -4337,6 +4428,9 @@ function inv.items.finishDiscovery()
             pcall(DINV.api._onRefreshComplete, refreshOriginalTable)
             dbot.perf("refresh API complete callbacks", apiStart)
         end
+        if inv.consumeWindow and inv.consumeWindow.scheduleRefresh then
+            inv.consumeWindow.scheduleRefresh()
+        end
         inv.items.maybeStartKeepFlagSync()
         if not inv.items.buildInProgress and not inv.items.identifyInProgress then
             inv.items.scheduleDeferredIdentifyProcessing("refreshComplete")
@@ -4424,7 +4518,8 @@ end
 function inv.items.identifyCR()
     for objId, item in pairs(inv.items.table or {}) do
         local idLevel = item.stats and item.stats.identifyLevel
-        if idLevel == nil or idLevel == invIdLevelNone then
+        if not inv.items.isKeyringItem(item)
+            and (idLevel == nil or idLevel == invIdLevelNone) then
             send("identify " .. objId)
         end
     end
@@ -4465,23 +4560,29 @@ function inv.items.startIdentification()
     -- Build queue of items needing identification
     for objId, item in pairs(inv.items.table or {}) do
         local idLevel = item.stats and item.stats.identifyLevel
+        local isKeyringItem = inv.items.isKeyringItem(item)
 
-        if inv.items.forceIdentify then
-            table.insert(inv.items.identifyQueue, objId)
-        elseif inv.items.identifyPartialOnly then
-            if idLevel == invIdLevelPartial then
-                local cacheHit = inv.items.applyCachedStats(item)
-                if not cacheHit then
-                    table.insert(inv.items.identifyQueue, objId)
+        -- Keyring data is the terminal level of detail for keyring members.
+        -- They remain queryable as partial records but are never retrieved or
+        -- identified by mass build/refresh workflows.
+        if not isKeyringItem then
+            if inv.items.forceIdentify then
+                table.insert(inv.items.identifyQueue, objId)
+            elseif inv.items.identifyPartialOnly then
+                if idLevel == invIdLevelPartial then
+                    local cacheHit = inv.items.applyCachedStats(item)
+                    if not cacheHit then
+                        table.insert(inv.items.identifyQueue, objId)
+                    end
                 end
-            end
-        else
-            -- Queue items that are NOT fully identified
-            -- nil/none/soft = never seen, partial = seen via invdata/eqdata but not identified
-            if idLevel == nil or idLevel == invIdLevelNone or idLevel == invIdLevelSoft or idLevel == invIdLevelPartial then
-                local cacheHit = inv.items.applyCachedStats(item)
-                if not cacheHit then
-                    table.insert(inv.items.identifyQueue, objId)
+            else
+                -- Queue items that are NOT fully identified.
+                -- nil/none/soft = never seen, partial = protocol data only.
+                if idLevel == nil or idLevel == invIdLevelNone or idLevel == invIdLevelSoft or idLevel == invIdLevelPartial then
+                    local cacheHit = inv.items.applyCachedStats(item)
+                    if not cacheHit then
+                        table.insert(inv.items.identifyQueue, objId)
+                    end
                 end
             end
         end
@@ -4494,7 +4595,7 @@ function inv.items.startIdentification()
     )
 
     if inv.items.identifyTotal == 0 then
-        cecho("\n<green>[DINV] All items already identified (or cached)!\n")
+        cecho("\n<green>[DINV] All eligible non-keyring items are already identified (or cached)!\n")
         local completeStart = dbot.perfNow and dbot.perfNow() or nil
         inv.items.buildComplete()
         dbot.perf("startIdentification buildComplete no queue", completeStart)
@@ -5059,6 +5160,9 @@ function inv.items.buildComplete()
         if DINV and DINV.api and DINV.api._onIdentifyComplete and singleId then
             pcall(DINV.api._onIdentifyComplete, tostring(singleId))
         end
+        if inv.consumeWindow and inv.consumeWindow.scheduleRefresh then
+            inv.consumeWindow.scheduleRefresh()
+        end
         dbot.debug("buildComplete: single-item identify complete for objId=" .. tostring(singleId), "inv.items")
         inv.items.scheduleDeferredIdentifyProcessing("buildComplete")
         inv.items.maybeStartKeepFlagSync()
@@ -5093,17 +5197,29 @@ function inv.items.buildComplete()
     local totalItems = 0
     local identifiedItems = 0
     local partialItems = 0
+    local partialKeyringItems = 0
+    local partialNonKeyringItems = 0
     local containerItems = 0
+    local keyringItems = 0
 
     for objId, item in pairs(inv.items.table or {}) do
         totalItems = totalItems + 1
         local idLevel = item.stats and item.stats.identifyLevel
+        local isKeyringItem = inv.items.isKeyringItem(item)
         if idLevel == invIdLevelFull then
             identifiedItems = identifiedItems + 1
         elseif idLevel == invIdLevelPartial then
             partialItems = partialItems + 1
+            if isKeyringItem then
+                partialKeyringItems = partialKeyringItems + 1
+            else
+                partialNonKeyringItems = partialNonKeyringItems + 1
+            end
         end
-        if item.stats and item.stats[invStatFieldContainer] then
+        if isKeyringItem then
+            keyringItems = keyringItems + 1
+        elseif item.stats and item.stats[invStatFieldContainer]
+            and item.stats[invStatFieldContainer] ~= "" then
             containerItems = containerItems + 1
         end
     end
@@ -5153,10 +5269,15 @@ function inv.items.buildComplete()
         end
         if inv.config and inv.config.save then inv.config.save() end
     end
+    if inv.consumeWindow and inv.consumeWindow.scheduleRefresh then
+        inv.consumeWindow.scheduleRefresh()
+    end
 
     if wasPartialIdentify then
         dbot.note("Partial identify complete. Fully identified: " ..
-            tostring(identifiedItems) .. "; partial: " .. tostring(partialItems) .. ".")
+            tostring(identifiedItems) .. "; partial: " .. tostring(partialItems) ..
+            " (keyring: " .. tostring(partialKeyringItems) ..
+            ", non-keyring: " .. tostring(partialNonKeyringItems) .. ").")
         inv.items.maybeStartKeepFlagSync()
         inv.items.scheduleDeferredIdentifyProcessing("partialIdentifyComplete")
         return
@@ -5175,6 +5296,7 @@ function inv.items.buildComplete()
         cecho("<white>    Partially identified: <yellow>" .. partialItems .. "\n")
     end
     cecho("<white>    Items in containers:  <green>" .. containerItems .. "\n")
+    cecho("<white>    Items on keyring:     <green>" .. keyringItems .. "\n")
     cecho("<white>    Time elapsed:         <green>" .. minutes .. "m " .. seconds .. "s\n")
     cecho("\n")
     cecho("<white>  Your inventory is ready! Try:\n")
@@ -5232,6 +5354,10 @@ function inv.items.buildAbort(options)
     inv.items.identifyCreatedMissing = {}
     inv.items.identifySawOutput = {}
     inv.items.identifyHydratedFromInvdata = {}
+    inv.items.inEqdata = false
+    inv.items.inInvdata = false
+    inv.items.inKeyring = false
+    inv.items.keyringScanStarted = nil
     local hasBuildSnapshot = inv.items.buildOriginalTable ~= nil
     if inv.items.databaseBuildId and DINV and DINV.database then
         local persistenceOk, persistenceErr

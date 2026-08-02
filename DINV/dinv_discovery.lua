@@ -18,15 +18,15 @@ DINV.discovery.debug = DINV.discovery.debug or {
 
 ----------------------------------------------------------------------------------------------------
 -- Build Phase Guard
--- Prevents stray invdata/eqdata from interrupting the identify phase
+-- Prevents stray inventory protocol data from interrupting the identify phase
 ----------------------------------------------------------------------------------------------------
 
 DINV.buildPhase = DINV.buildPhase or 0
 -- Phase 0: idle
 -- Phase 1: scanning eqdata
 -- Phase 2: scanning invdata
--- Phase 3: scanning containers
--- Phase 4: identifying (BLOCK all stray invdata/eqdata)
+-- Phase 3: scanning containers/keyring
+-- Phase 4: identifying (BLOCK all stray inventory protocol data)
 
 function DINV.setBuildPhase(phase)
     DINV.buildPhase = phase
@@ -34,9 +34,9 @@ function DINV.setBuildPhase(phase)
 end
 
 function DINV.shouldProcessData()
-    -- CRITICAL: During identify phase (4), block ALL invdata/eqdata
+    -- CRITICAL: During identify phase (4), block ALL inventory protocol data
     if DINV.buildPhase == 4 then
-        dbot.debug("@RBLOCKING invdata/eqdata: in identify phase@W", "discovery")
+        dbot.debug("@RBLOCKING inventory protocol data: in identify phase@W", "discovery")
         return false
     end
     return true
@@ -120,13 +120,22 @@ local function setSection(section, containerId)
     if section == "eqdata" then
         inv.items.inEqdata = true
         inv.items.inInvdata = false
+        inv.items.inKeyring = false
         dbot.debug("@YNow in eqdata section@W", "discovery")
     elseif section == "invdata" then
         inv.items.inInvdata = true
         inv.items.inEqdata = false
+        inv.items.inKeyring = false
         inv.items.currentContainerId = containerId
         _resetInvCounters()
         dbot.debug("@YNow in invdata section, container: " .. tostring(containerId) .. "@W", "discovery")
+    elseif section == "keyring" then
+        inv.items.inKeyring = true
+        inv.items.inEqdata = false
+        inv.items.inInvdata = false
+        inv.items.currentContainerId = nil
+        _resetInvCounters()
+        dbot.debug("@YNow in keyring section@W", "discovery")
     end
     return true
 end
@@ -138,7 +147,7 @@ local function shouldSuppressDiscoveryOutput()
     if DINV.discovery.currentSection ~= nil then
         return true
     end
-    if inv and inv.items and (inv.items.inEqdata or inv.items.inInvdata) then
+    if inv and inv.items and (inv.items.inEqdata or inv.items.inInvdata or inv.items.inKeyring) then
         return true
     end
     if inv and inv.items and inv.items.keepSync and inv.items.keepSync.active then
@@ -165,7 +174,8 @@ end
 
 function DINV.discovery.bumpRawSuppressWindow(command)
     local cmd = tostring(command or ""):lower()
-    if not (cmd:find("^invdata") or cmd:find("^eqdata") or cmd:find("^prompt")) then
+    if not (cmd:find("^invdata") or cmd:find("^eqdata") or cmd:find("^keyring data")
+        or cmd:find("^prompt")) then
         return
     end
     local now = os.clock()
@@ -325,6 +335,37 @@ local function clearSection(section)
             dbot.debug("@R[DINV DBG] inv.items.onInvdataComplete is NIL@W", "discovery")
         end
         finishKeepFlagCapture(section, containerId, wasActive)
+        return
+    end
+
+    if section == "keyring" then
+        if DINV.discovery.currentSection ~= "keyring" then
+            if inv.items.refreshInProgress and inv.items.invalidateRefresh then
+                inv.items.invalidateRefresh("received keyring end without an active keyring response")
+            end
+            return
+        end
+        inv.items.inKeyring = false
+        DINV.discovery.currentSection = nil
+        DINV.discovery.currentContainerId = nil
+        inv.items.currentContainerId = nil
+
+        local validCompletion = not inv.items.completeRefreshScan
+            or inv.items.completeRefreshScan("keyring", nil)
+        dbot.perf(
+            string.format(
+                "scan keyring lines=%d ok=%d err=%d parse %.1fms",
+                DINV.discovery.debug.inv_lines,
+                DINV.discovery.debug.inv_calls_ok,
+                DINV.discovery.debug.inv_calls_err,
+                perfParseMs
+            ),
+            perfSectionStart
+        )
+        DINV.discovery.perfSectionStart = nil
+        if validCompletion and inv.items.onKeyringComplete then
+            inv.items.onKeyringComplete()
+        end
     end
 end
 
@@ -413,6 +454,30 @@ local function handleDataLine(section, dataLine)
         if objId and containerId and tostring(containerId):match("^%d+$") and tostring(containerId) ~= "0" then
             if inv.items.setStatField then
                 inv.items.setStatField(objId, invStatFieldContainer, tostring(containerId))
+            end
+        end
+    end
+
+    if section == "keyring" then
+        DINV.discovery.debug.inv_lines = DINV.discovery.debug.inv_lines + 1
+        if inv.items.onKeyringData then
+            local parseStart = dbot.perfNow and dbot.perfNow() or nil
+            local ok, retval = pcall(inv.items.onKeyringData, dataLine)
+            if parseStart and dbot.perfNow then
+                local elapsedMs = (dbot.perfNow() - parseStart) * 1000
+                DINV.discovery.perfParseMs = (DINV.discovery.perfParseMs or 0) + elapsedMs
+                if elapsedMs >= 100 and dbot.perf then
+                    dbot.perf("slow keyring row id=" .. tostring(dataLine:match("^(%d+),") or "?"), parseStart)
+                end
+            end
+            if ok and retval == DRL_RET_SUCCESS then
+                DINV.discovery.debug.inv_calls_ok = DINV.discovery.debug.inv_calls_ok + 1
+            else
+                DINV.discovery.debug.inv_calls_err = DINV.discovery.debug.inv_calls_err + 1
+                if inv.items.refreshInProgress and inv.items.invalidateRefresh then
+                    inv.items.invalidateRefresh("failed to parse keyring item line")
+                end
+                dbot.debug("@R[DINV DBG] onKeyringData ERROR: " .. tostring(retval) .. "@W", "discovery")
             end
         end
     end
@@ -638,7 +703,58 @@ function DINV.discovery.register()
     )
 
     --------------------------------------------------------------------------------------------
-    -- Data lines: (keep broad match; it fires only when inEqdata or inInvdata)
+    -- KEYRING TAGS
+    --------------------------------------------------------------------------------------------
+
+    DINV.discovery.ids.keyringEmpty = tempRegexTrigger(
+        "\\{keyring\\}.*\\{/keyring\\}",
+        function()
+            if not DINV.shouldProcessData() then
+                deleteLine()
+                return
+            end
+            if not setSection("keyring", nil) then
+                if shouldSuppressDiscoveryOutput() then deleteLine() end
+                return
+            end
+            if shouldSuppressDiscoveryOutput() then deleteLine() end
+            clearSection("keyring")
+        end
+    )
+
+    DINV.discovery.ids.keyringStart = tempRegexTrigger(
+        "^\\{keyring\\}$",
+        function()
+            if not DINV.shouldProcessData() then
+                deleteLine()
+                return
+            end
+            if not setSection("keyring", nil) then
+                if shouldSuppressDiscoveryOutput() then deleteLine() end
+                return
+            end
+            if shouldSuppressDiscoveryOutput() then deleteLine() end
+        end
+    )
+
+    DINV.discovery.ids.keyringEnd = tempRegexTrigger(
+        "^\\{/keyring\\}$",
+        function()
+            if not DINV.shouldProcessData() then
+                deleteLine()
+                return
+            end
+            if DINV.discovery.currentSection ~= "keyring" then
+                dbot.debug("@R[DINV DBG] keyringEnd seen but NOT in keyring; ignoring@W", "discovery")
+                return
+            end
+            if shouldSuppressDiscoveryOutput() then deleteLine() end
+            clearSection("keyring")
+        end
+    )
+
+    --------------------------------------------------------------------------------------------
+    -- Data lines: (keep broad match; it fires only inside an admitted section)
     --------------------------------------------------------------------------------------------
 
     DINV.discovery.ids.dataLine = tempRegexTrigger(
@@ -654,13 +770,13 @@ function DINV.discovery.register()
             end
             dataLine = tostring(dataLine or ""):gsub("^%s+", ""):gsub("%s+$", "")
 
-            if not (inv.items.inEqdata or inv.items.inInvdata) then
+            if not (inv.items.inEqdata or inv.items.inInvdata or inv.items.inKeyring) then
                 if shouldSuppressRawDiscoveryNoise() and deleteLine then
                     deleteLine()
                 end
                 return
             end
-            if inv.items.inEqdata or inv.items.inInvdata then
+            if inv.items.inEqdata or inv.items.inInvdata or inv.items.inKeyring then
                 if shouldSuppressDiscoveryOutput() then deleteLine() end
 
                 dbot.debug("@YTrigger fired: dataLine@W", "discovery")
@@ -691,6 +807,8 @@ function DINV.discovery.register()
                             end
                         end
                     end
+                elseif inv.items.inKeyring then
+                    handleDataLine("keyring", dataLine)
                 end
             end
         end

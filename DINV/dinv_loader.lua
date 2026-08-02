@@ -10,7 +10,7 @@
 ----------------------------------------------------------------------------------------------------
 
 DINV = DINV or {}
-DINV.version = "2.0062"
+DINV.version = "2.0063"
 DINV.name = "Durel's Inventory Manager"
 
 -- Determine the path to the DINV directory
@@ -64,6 +64,7 @@ DINV.modules = {
     
     -- Item Actions
     "dinv_inv_consume",
+    "dinv_inv_consume_window",
     "dinv_inv_portal",
     "dinv_inv_pass",
     "dinv_inv_regen",

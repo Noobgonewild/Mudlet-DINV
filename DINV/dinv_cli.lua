@@ -24,7 +24,7 @@ inv.cli.commands = {
     -- Using equipment
     "portal", "consume", "pass",
     -- About the plugin
-    "help",
+    "config", "help",
     -- Custom modules
     "unused", "discover" -- "rid" command disabled per user request (kept in source as comments below)
 }
@@ -149,7 +149,7 @@ Usage:
     
 Available topics: build, refresh, identify, search, query, set, priority, analyze,
                   report, progress, compare, covet, snapshot, weapon, portal, consume,
-                  backup, notify, debug, levelup, unused, and more.
+                  config, backup, notify, debug, levelup, unused, and more.
 ]])
 end
 
@@ -401,6 +401,7 @@ function inv.cli.fullUsage()
     if inv.cli.pass and inv.cli.pass.usage then inv.cli.pass.usage() end
 
     dbot.printRaw("@CAbout:@w")
+    if inv.cli.config and inv.cli.config.usage then inv.cli.config.usage() end
     inv.cli.help.usage()
 end
 
@@ -476,8 +477,8 @@ depending on how many items you have.
 The build process:
   1. Scans worn equipment (eqdata)
   2. Scans main inventory (invdata)
-  3. Scans inside each container
-  4. Identifies each item (taking from containers if needed)
+  3. Scans inside each container and captures keyring data
+  4. Identifies each non-keyring item (taking from containers if needed)
 
 Kept state is read from the K flag in eqdata/invdata and stored with each item.
 After the initial build, changes are tracked automatically via invmon/invitem.
@@ -528,7 +529,7 @@ function inv.cli.refresh.fn(name, line, wildcards)
         if retval ~= DRL_RET_SUCCESS then
             return inv.tags.stop(invTagsRefresh, endTag, retval)
         end
-        cecho("\n<green>[DINV] Refresh started (partial items will be fully identified).\n")
+        cecho("\n<green>[DINV] Refresh started (non-keyring partial items will be fully identified).\n")
         return inv.tags.stop(invTagsRefresh, endTag, DRL_RET_SUCCESS)
     elseif action == "off" then
         inv.items.refreshOff()
@@ -578,6 +579,7 @@ function inv.cli.refresh.fn(name, line, wildcards)
 
     -- Count items by type
     local containerCount = 0
+    local keyringCount = 0
     local wornCount = 0
     local invCount = 0
 
@@ -585,6 +587,8 @@ function inv.cli.refresh.fn(name, line, wildcards)
         if item.stats then
             if inv.items.isWorn(objId) then
                 wornCount = wornCount + 1
+            elseif inv.items.isKeyringItem and inv.items.isKeyringItem(item) then
+                keyringCount = keyringCount + 1
             elseif item.stats[invStatFieldContainer] and item.stats[invStatFieldContainer] ~= "" then
                 containerCount = containerCount + 1
             else
@@ -598,6 +602,7 @@ function inv.cli.refresh.fn(name, line, wildcards)
     cecho("<white>    - Worn:            <green>" .. wornCount .. "\n")
     cecho("<white>    - In inventory:    <green>" .. invCount .. "\n")
     cecho("<white>    - In containers:   <green>" .. containerCount .. "\n")
+    cecho("<white>    - On keyring:       <green>" .. keyringCount .. "\n")
     cecho("\n")
     cecho("<white>  Changes are tracked automatically via invmon/invitem.\n")
     cecho("<white>  Refresh reconciles worn, inventory, and container IDs.\n")
@@ -627,13 +632,15 @@ Usage:
 Shows the current inventory tracking status. Changes to your inventory are
 tracked automatically via invmon/invitem events.
 
-Refresh scans worn equipment, main inventory, and each known container. Items
+Refresh scans worn equipment, main inventory, each known container, and
+keyring data. Items
 not seen in that scan are removed from active inventory: partial singletons are
 deleted, fully identified singletons are retained temporarily as pending
 removals, and tracked container subtrees are detached. A successful later
 refresh purges pending removals only after their minimum age has elapsed.
-Newly seen partial items are queued for identify. Kept state is refreshed from
-each observed eqdata/invdata K flag.
+Newly seen non-keyring partial items are queued for identify. Keyring data is
+sufficient for keyring members; they are not retrieved or identified. Kept
+state is refreshed from each observed protocol K flag.
 
 Subcommands:
   on            Enable automatic refreshes using the configured period.
@@ -1906,6 +1913,61 @@ Examples:
 end
 
 ----------------------------------------------------------------------------------------------------
+-- Config Command
+----------------------------------------------------------------------------------------------------
+
+inv.cli.config = {}
+function inv.cli.config.fn(name, line, wildcards)
+    local setting = tostring(wildcards and wildcards[1] or ""):lower()
+    local value = tostring(wildcards and wildcards[2] or ""):lower()
+
+    if setting == "" then
+        local state = inv.config.isConsumeWindowEnabled() and "on" or "off"
+        dbot.print("@WConfiguration:@w")
+        dbot.print("  @Cconsumewin@W: @G" .. state .. "@w")
+        dbot.print("  @DUse '@Gdinv help config@D' for available settings.@w")
+        return DRL_RET_SUCCESS
+    end
+
+    if setting ~= "consumewin" or (value ~= "on" and value ~= "off") then
+        inv.cli.config.usage()
+        return DRL_RET_INVALID_PARAM
+    end
+
+    local enabled = value == "on"
+    local retval = inv.config.setConsumeWindowEnabled(enabled)
+    if retval ~= DRL_RET_SUCCESS and retval ~= DRL_RET_UNINITIALIZED then
+        return retval
+    end
+
+    if inv.consumeWindow and inv.consumeWindow.onConfigChanged then
+        inv.consumeWindow.onConfigChanged(enabled)
+    end
+    dbot.info("Consumables miniwindow " .. (enabled and "enabled" or "disabled"))
+    return DRL_RET_SUCCESS
+end
+
+function inv.cli.config.usage()
+    dbot.printRaw(string.format("@W    %-50s @w- %s",
+               pluginNameCmd .. " config @Gconsumewin <on|off>",
+               "Show consumables as clickable cards in a draggable window"))
+end
+
+function inv.cli.config.examples()
+    dbot.print("@W\nUsage:\n")
+    inv.cli.config.usage()
+    dbot.print(
+[[@W
+The consumewin window shows every configured consumable as a card. Click the
+consumable name to travel to its vendor, or click x1, x10, or x50 to buy that
+exact consumable. The window is draggable, resizable, and displays live counts.
+
+  consumewin on   - Use the draggable, resizable consumables miniwindow.
+  consumewin off  - Use clickable rows in the main console.
+]])
+end
+
+----------------------------------------------------------------------------------------------------
 -- Regen Command
 ----------------------------------------------------------------------------------------------------
 
@@ -2435,10 +2497,26 @@ function inv.cli.query.examples()
 [[@W
 Search queries support @Call persisted item properties@W in DINV data.
 
-Common tags:
-  @Cname@W, @Ctype@W, @Ckeywords@W/@Ckey@W, @Cflags@W/@Cflag@W, @Clevel@W/@Cminlevel@W/@Cmaxlevel@W,
-  @Cwearable@W, @Cmaterial@W, @Cclan@W, @Cscore@W, @Cweight@W, @Cworth@W, @Cowner@W,
-  @Cdamtype@W, @Cweapontype@W, @Cspecials@W, @Cleadsto@W, and any other stored item property.
+Supported query keys (case-insensitive):
+  Identity: @Cid@W, @Cname@W, @Crname@W, @Ccolorname@W, @Ctype@W, @Ctypenum@W, @Cidentifylevel@W
+  Level/location: @Clevel@W, @Cminlevel@W, @Cmaxlevel@W, @Cwearable@W, @Cworn@W, @Ccontainer@W,
+    @Clocation@W/@Cloc@W, @Crlocation@W/@Crloc@W, @Claststored@W, @Ctimer@W, @Ckeepflag@W
+  Description: @Ckeywords@W/@Ckeyword@W/@Ckey@W, @Cflags@W/@Cflag@W, @Cmaterial@W, @Cfoundat@W,
+    @Cowner@W, @Cclan@W, @Cserial@W, @Cscore@W, @Cweight@W, @Cworth@W
+  Attributes: @Cstr@W, @Cint@W, @Cwis@W, @Cdex@W, @Ccon@W, @Cluck@W, @Chp@W, @Cmana@W, @Cmoves@W,
+    @Chitroll@W, @Cdamroll@W, @Csaves@W, @Chr@W, @Cdr@W
+  Resistances: @Callphys@W, @Callmagic@W, @Cbash@W, @Cpierce@W, @Cslash@W, @Cacid@W, @Ccold@W,
+    @Cenergy@W, @Choly@W, @Celectric@W, @Cnegative@W, @Cshadow@W, @Cmagic@W, @Cair@W, @Cearth@W,
+    @Cfire@W, @Clight@W, @Cmental@W, @Csonic@W, @Cwater@W, @Cdisease@W, @Cpoison@W
+  Weapon/armor: @Cavedam@W, @Cinflicts@W, @Cdamtype@W, @Cweapontype@W, @Cspecials@W, @Carmor@W
+  Containers: @Ccapacity@W, @Cholding@W, @Cheaviestitem@W, @Citemsinside@W, @Ctotweight@W,
+    @Citemburden@W, @Citemweight@W, @Creducedby@W
+  Item-specific: @Cduration@W, @Cnutrition@W, @Cfoodaffects@W, @Cdestination@W, @Cleadsto@W,
+    @Cspells@W, @Cspelluses@W, @Cspelllevel@W, @Cspellname@W, @Cskills@W, @Caffects@W,
+    @Caffectmods@W, @Cabilmods@W, @Cenchants@W, @Cilluminate@W, @Cresonate@W, @Csolidify@W
+  DINV metadata: @Corganize@W, @Cloctype@W, @Clocname@W
+
+Any additional property present in persisted item data can also be used as a query key.
 
 Operators:
   @C~key value@W   negates a match

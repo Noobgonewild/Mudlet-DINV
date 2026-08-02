@@ -16,7 +16,7 @@
 ----------------------------------------------------------------------------------------------------
 
 DINV = DINV or {}
-DINV.version = { major = 2, minor = 62 }
+DINV.version = { major = 2, minor = 63 }
 
 -- Get the Mudlet profile directory for module loading
 local profilePath = getMudletHomeDir()
@@ -28,7 +28,7 @@ DINV.modules = {
     "dinv_inv_config", "dinv_inv_items", "dinv_operations", "dinv_discovery", "dinv_inv_cache",
     "dinv_inv_priority", "dinv_inv_score", "dinv_inv_set", "dinv_inv_weapon",
     "dinv_inv_snapshot", "dinv_inv_analyze", "dinv_levelup", "dinv_inv_usage",
-    "dinv_inv_compare", "dinv_inv_statbonus", "dinv_inv_consume", "dinv_inv_portal",
+    "dinv_inv_compare", "dinv_inv_statbonus", "dinv_inv_consume", "dinv_inv_consume_window", "dinv_inv_portal",
     "dinv_inv_pass", "dinv_inv_regen", "dinv_inv_organize", "dinv_inv_keyword",
     "dinv_inv_tags", "dinv_inv_unused", "dinv_inv_discover", "dinv_inv_report",
     "dinv_rid", "dinv_api", "dinv_cli", "dinv_triggers", "dinv_aliases",

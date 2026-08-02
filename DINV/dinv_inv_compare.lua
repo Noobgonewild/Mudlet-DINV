@@ -832,6 +832,9 @@ function inv.compare.covet(priorityName, auctionNum, skipLevels, endTag)
         -- which would break a strict tempExactMatchTrigger on the fence.
         local fencePattern = "^\\s*" .. fence:gsub("([^%w%s])", "\\%1") .. "\\s*$"
         inv.compare.covetPkg.fenceTriggerId = tempRegexTrigger(fencePattern, function()
+            if deleteLine then
+                deleteLine()
+            end
             if tempTimer then
                 tempTimer(0.05, function()
                     inv.compare._covetFinishFromMarket()

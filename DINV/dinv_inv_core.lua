@@ -294,7 +294,7 @@ invTagsDiscover  = "discover"
 
 inv = {}
 inv.init = {}
-inv.modules = "config items cache priority set statBonus consume snapshot tags analyze levelup"
+inv.modules = "config items cache priority set statBonus consume consumeWindow snapshot tags analyze levelup"
 inv.inSafeMode = false
 
 -- Pre-declare all inv module tables to prevent nil errors during load
@@ -307,6 +307,7 @@ inv.score    = inv.score or {}
 inv.set      = inv.set or {}
 inv.statBonus = inv.statBonus or {}
 inv.consume  = inv.consume or {}
+inv.consumeWindow = inv.consumeWindow or {}
 inv.snapshot = inv.snapshot or {}
 inv.tags     = inv.tags or {}
 inv.weapon   = inv.weapon or {}
@@ -529,7 +530,7 @@ inv.state = invStateIdle
 
 inv.version = {}
 inv.version.pluginMajor = 2
-inv.version.pluginMinor = 62
+inv.version.pluginMinor = 63
 inv.version.full = inv.version.pluginMajor + (inv.version.pluginMinor / 10000)
 
 inv.version.table = {

@@ -135,38 +135,55 @@ local function itemMatchesConsumeEntry(entry, objId)
         return true
     end
 
-    local normalizedSearchTerm = tostring(entry.name or entry.key or entry.fullName or ""):lower()
-    if normalizedSearchTerm ~= "" and itemName:lower():find(normalizedSearchTerm, 1, true) then
-        return true
-    end
-
+    -- The user-configured name/key is the authority for consume matching.
+    -- Do not use the persisted item's complete keyword list as a set of
+    -- alternatives: generic words such as "potion" can identify an unrelated
+    -- consumable at the same level.
+    local configuredTarget = firstNonEmpty(entry.name, entry.key)
+    local configuredWords = splitWords(configuredTarget)
     local keywords = tostring(inv.items.getStatField(objId, invStatFieldKeywords) or ""):lower()
-    if keywords ~= "" then
-        if normalizedSearchTerm ~= "" and dbot.isWordInString(normalizedSearchTerm, keywords) then
-            return true
-        end
-
-        local words = splitWords(normalizedSearchTerm)
-        for _, keyword in ipairs(splitWords(entry.keywords or "")) do
-            table.insert(words, keyword)
-        end
-
-        if #words > 0 then
-            local allWordsPresent = true
-            for _, word in ipairs(words) do
-                if not dbot.isWordInString(word, keywords) then
-                    allWordsPresent = false
-                    break
-                end
-            end
-            if allWordsPresent then
-                return true
+    if keywords ~= "" and #configuredWords > 0 then
+        for _, word in ipairs(configuredWords) do
+            if not dbot.isWordInString(word, keywords) then
+                return false
             end
         end
+        return true
     end
 
     return false
 end
+
+function inv.consume.getEntry(typeName, entryIndex)
+    local normalizedType = normalizeTypeName(typeName)
+    local entries = inv.consume.table and inv.consume.table[normalizedType] or nil
+    local index = tonumber(entryIndex)
+    if type(entries) ~= "table" or not index or index < 1 then
+        return nil
+    end
+    return entries[math.floor(index)], normalizedType
+end
+
+function inv.consume.countEntry(entry)
+    local count = 0
+    if not entry then return count end
+    for objId, _ in pairs(inv.items and inv.items.table or {}) do
+        local containerId = inv.items.getStatField(objId, invStatFieldContainer)
+        local isIgnored = containerId ~= nil and containerId ~= ""
+            and inv.config and inv.config.isIgnored and inv.config.isIgnored(containerId)
+        if not isIgnored and itemMatchesConsumeEntry(entry, objId) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+function inv.consume.notifyWindowChanged()
+    if inv.consumeWindow and inv.consumeWindow.scheduleRefresh then
+        inv.consumeWindow.scheduleRefresh(true)
+    end
+end
+
 local function loadPersistentConsumableTemplates()
     if not DINV or not DINV.database or not DINV.database.listConsumableTemplates then
         return nil
@@ -491,6 +508,7 @@ function inv.consume.addResolved(typeName, itemName, itemLevel, roomId, fullName
     end)
 
     inv.consume.save()
+    inv.consume.notifyWindowChanged()
     dbot.info("Added \"" .. itemName .. "\" to consumable type \"" .. typeName .. "\"")
     return DRL_RET_SUCCESS
 end
@@ -610,6 +628,7 @@ function inv.consume.addType(typeName)
 
     inv.consume.table[normalizedType] = {}
     inv.consume.save()
+    inv.consume.notifyWindowChanged()
     dbot.info('Added empty consumable type "' .. normalizedType .. '"')
     return DRL_RET_SUCCESS
 end
@@ -628,6 +647,7 @@ function inv.consume.removeType(typeName)
 
     inv.consume.table[normalizedType] = nil
     inv.consume.save()
+    inv.consume.notifyWindowChanged()
     dbot.note('Removed consumable type "' .. normalizedType .. '"')
     return DRL_RET_SUCCESS
 end
@@ -654,6 +674,7 @@ function inv.consume.remove(typeName, itemName)
         if targetName == "" then
             inv.consume.table[targetType] = nil
             inv.consume.save()
+            inv.consume.notifyWindowChanged()
             return DRL_RET_SUCCESS
         end
 
@@ -663,6 +684,7 @@ function inv.consume.remove(typeName, itemName)
                     targetType .. '" consumable table')
                 table.remove(inv.consume.table[targetType], i)
                 inv.consume.save()
+                inv.consume.notifyWindowChanged()
                 return DRL_RET_SUCCESS
             end
         end
@@ -691,6 +713,7 @@ function inv.consume.remove(typeName, itemName)
                     consumeType .. '" consumable table')
                 table.remove(entries, i)
                 inv.consume.save()
+                inv.consume.notifyWindowChanged()
                 return DRL_RET_SUCCESS
             end
         end
@@ -700,7 +723,39 @@ function inv.consume.remove(typeName, itemName)
     return DRL_RET_MISSING_ENTRY
 end
 
+function inv.consume.getSortedTypes()
+    local sortedTypes = {}
+    for itemType, _ in pairs(inv.consume.table or {}) do
+        table.insert(sortedTypes, itemType)
+    end
+    local priority = { heal = 1, mana = 2 }
+    table.sort(sortedTypes, function(left, right)
+        local leftPriority = priority[tostring(left):lower()] or 100
+        local rightPriority = priority[tostring(right):lower()] or 100
+        if leftPriority ~= rightPriority then
+            return leftPriority < rightPriority
+        end
+        return tostring(left):lower() < tostring(right):lower()
+    end)
+    return sortedTypes
+end
+
 function inv.consume.display(typeName)
+    local normalizedType = normalizeTypeName(typeName)
+    if inv.config and inv.config.isConsumeWindowEnabled
+        and inv.config.isConsumeWindowEnabled()
+        and inv.consumeWindow and inv.consumeWindow.show then
+        local shown, showErr = inv.consumeWindow.show(normalizedType)
+        if shown then
+            return DRL_RET_SUCCESS
+        end
+        dbot.warn("Unable to show the consumables miniwindow; using console rows: " ..
+            tostring(showErr or "unknown error"))
+    end
+    return inv.consume.displayConsole(normalizedType)
+end
+
+function inv.consume.displayConsole(typeName)
     local normalizedType = normalizeTypeName(typeName)
     local numEntries = 0
     local isOwned = normalizedType == "owned"
@@ -708,13 +763,7 @@ function inv.consume.display(typeName)
     if normalizedType ~= "" and not isOwned then
         numEntries = inv.consume.displayType(normalizedType, isOwned)
     else
-        local sortedTypes = {}
-        for itemType, _ in pairs(inv.consume.table) do
-            table.insert(sortedTypes, itemType)
-        end
-        table.sort(sortedTypes, function(v1, v2) return v1 < v2 end)
-
-        for _, itemType in ipairs(sortedTypes) do
+        for _, itemType in ipairs(inv.consume.getSortedTypes()) do
             numEntries = numEntries + inv.consume.displayType(itemType, isOwned)
         end
     end
@@ -736,34 +785,46 @@ function inv.consume.displayType(typeName, isOwned)
         return numEntries
     end
 
-    local header = string.format("\n@W@C%-10s@W Level   Room  # Avail  Name", (typeName or "nil"))
+    local header = string.format("\n@W@C%-12s@W  Level  # Avail  Name", (typeName or "nil"))
     local didPrintHeader = false
 
-    for _, entry in ipairs(inv.consume.table[typeName]) do
-        local count = 0
-
-        for objId, _ in pairs(inv.items.table or {}) do
-            local containerId = inv.items.getStatField(objId, invStatFieldContainer)
-            local isIgnored = containerId ~= nil and containerId ~= "" and inv.config.isIgnored(containerId)
-            if not isIgnored and itemMatchesConsumeEntry(entry, objId) then
-                count = count + 1
-            end
-        end
-
-        local countColor = ""
-        if count > 0 then
-            countColor = "@M"
-        end
-
+    for entryIndex, entry in ipairs(inv.consume.table[typeName]) do
+        local count = inv.consume.countEntry(entry)
         if not isOwned or count > 0 then
             if not didPrintHeader then
                 dbot.print(header)
                 didPrintHeader = true
             end
-            dbot.print(string.format("             %3d  %5s     %s%4d@w  %s",
-                (entry.level or 0), (entry.room or 0), countColor, count, (entry.name or "nil")))
+
+            local buyOne = string.format("inv.consume.buyExact(%q, %d, 1, nil, %q)",
+                tostring(typeName), entryIndex, "console")
+            local buyTen = string.format("inv.consume.buyExact(%q, %d, 10, nil, %q)",
+                tostring(typeName), entryIndex, "console")
+            local buyFifty = string.format("inv.consume.buyExact(%q, %d, 50, nil, %q)",
+                tostring(typeName), entryIndex, "console")
+            local travel = string.format("inv.consume.travelExact(%q, %d, %q)",
+                tostring(typeName), entryIndex, "console")
+            local displayName = dbot.stripColors(tostring(entry.name or "nil"))
+            displayName = displayName:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+
+            if cecho and cechoLink then
+                cecho("  ")
+                cechoLink("<cyan>x1 <reset>", buyOne, "Buy 1 " .. displayName, true)
+                cechoLink("<cyan>x10<reset>", buyTen, "Buy 10 " .. displayName, true)
+                cecho(" ")
+                cechoLink("<cyan>x50<reset>", buyFifty, "Buy 50 " .. displayName, true)
+                cecho(string.format("    %3d     ", tonumber(entry.level) or 0))
+                cecho(count > 0 and "<magenta>" or "<white>")
+                cecho(string.format("%4d<reset>  ", count))
+                cechoLink("<white>" .. displayName .. "<reset>", travel,
+                    "Travel to the vendor for " .. displayName, true)
+                cecho("\n")
+            else
+                dbot.print(string.format("  x1  x10  x50    %3d     %4d  %s",
+                    tonumber(entry.level) or 0, count, tostring(entry.name or "nil")))
+            end
+            numEntries = numEntries + 1
         end
-        numEntries = numEntries + 1
     end
 
     return numEntries
@@ -773,18 +834,129 @@ end
 -- Buy
 ----------------------------------------------------------------------------------------------------
 
+local function startMapperTravel(room)
+    if snd and snd.mapper and type(snd.mapper.xrt) == "function" then
+        local travelOk, travelResult = pcall(snd.mapper.xrt, tostring(room))
+        if not travelOk or travelResult == false then
+            return false, tostring(not travelOk and travelResult or "route was not started")
+        end
+        return true
+    end
+    if type(expandAlias) == "function" then
+        expandAlias("xrt " .. tostring(room), false)
+        return true
+    end
+    return false, "Aardwolf mapper xrt is unavailable"
+end
+
+local function finishWindowAction(pkg, succeeded)
+    if pkg and pkg.source == "window" and inv.consumeWindow
+        and inv.consumeWindow.completeTravel then
+        inv.consumeWindow.completeTravel(succeeded == true)
+    end
+end
+
+function inv.consume.startBuyEntry(entry, numItems, containerName, source)
+    if type(entry) ~= "table" then
+        dbot.info("The selected consumable is no longer in the consumable table")
+        return DRL_RET_MISSING_ENTRY
+    end
+    if inv.consume.buyPkg ~= nil then
+        dbot.info("Skipping consumable purchase: another request is in progress")
+        return DRL_RET_BUSY
+    end
+
+    numItems = math.max(1, math.floor(tonumber(numItems or "") or 1))
+    local normalizedContainerName = tostring(containerName or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if normalizedContainerName == "" then
+        normalizedContainerName = inv.consume.getAutoPotionContainerId() or ""
+        if normalizedContainerName ~= "" then
+            dbot.debug("inv.consume.buy: Using auto potion container " .. normalizedContainerName, "inv.consume")
+        end
+    end
+
+    inv.consume.buyPkg = {
+        room = entry.room,
+        itemName = entry.name,
+        fullName = entry.fullName,
+        keywords = entry.keywords,
+        storeKeyword = getPreferredStoreTarget(entry),
+        numItems = numItems,
+        containerName = normalizedContainerName,
+        timeoutSec = 10,
+        source = source,
+    }
+
+    if source == "window" and inv.consumeWindow and inv.consumeWindow.beginTravel then
+        inv.consumeWindow.beginTravel(entry.room, "buy")
+    end
+
+    return inv.consume.buyCR()
+end
+
+function inv.consume.buyExact(typeName, entryIndex, numItems, containerName, source)
+    if not (inv.init and inv.init.initializedActive) then
+        dbot.info("Skipping consumable purchase: plugin is not yet initialized")
+        return DRL_RET_UNINITIALIZED
+    end
+    if dbot.gmcp and dbot.gmcp.statePreventsActions and dbot.gmcp.statePreventsActions() then
+        dbot.info("Skipping consumable purchase: character's state does not allow actions")
+        return DRL_RET_NOT_ACTIVE
+    end
+    local entry = inv.consume.getEntry(typeName, entryIndex)
+    if not entry then
+        dbot.info("The selected consumable is no longer in the consumable table")
+        inv.consume.notifyWindowChanged()
+        return DRL_RET_MISSING_ENTRY
+    end
+    return inv.consume.startBuyEntry(entry, numItems, containerName, source)
+end
+
+function inv.consume.travelExact(typeName, entryIndex, source)
+    if not (inv.init and inv.init.initializedActive) then
+        dbot.info("Skipping consumable travel: plugin is not yet initialized")
+        return DRL_RET_UNINITIALIZED
+    end
+    if dbot.gmcp and dbot.gmcp.statePreventsActions and dbot.gmcp.statePreventsActions() then
+        dbot.info("Skipping consumable travel: character's state does not allow actions")
+        return DRL_RET_NOT_ACTIVE
+    end
+    local entry = inv.consume.getEntry(typeName, entryIndex)
+    if not entry then
+        dbot.info("The selected consumable is no longer in the consumable table")
+        inv.consume.notifyWindowChanged()
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    local room = tonumber(entry.room or "")
+    if not room or room == 0 then
+        dbot.warn("The selected consumable has no vendor room")
+        return DRL_RET_INVALID_PARAM
+    end
+
+    if source == "window" and inv.consumeWindow and inv.consumeWindow.beginTravel then
+        inv.consumeWindow.beginTravel(room, "travel")
+    end
+    if tonumber(dbot.gmcp.getRoomId() or "") == room then
+        finishWindowAction({ source = source }, true)
+        return DRL_RET_SUCCESS
+    end
+
+    local traveled, travelErr = startMapperTravel(room)
+    if not traveled then
+        dbot.warn("Unable to travel to the consumable vendor: " .. tostring(travelErr))
+        finishWindowAction({ source = source }, false)
+        return DRL_RET_UNSUPPORTED
+    end
+    return DRL_RET_SUCCESS
+end
+
 function inv.consume.buy(typeName, numItems, containerName)
     local normalizedType = normalizeTypeName(typeName)
     if normalizedType == "" then
         dbot.warn("inv.consume.buy: Missing type name")
         return DRL_RET_INVALID_PARAM
     end
-
-    numItems = tonumber(numItems or "") or 1
-    if numItems < 1 then
-        numItems = 1
-    end
-
     if inv.consume.table[normalizedType] == nil then
         dbot.info("No items of type \"" .. normalizedType .. "\" are in the consumable table")
         return DRL_RET_MISSING_ENTRY
@@ -800,37 +972,11 @@ function inv.consume.buy(typeName, numItems, containerName)
             bestEntry = entry
         end
     end
-
     if bestEntry == nil then
         dbot.info("No items of type \"" .. normalizedType .. "\" are available at level " .. effectiveLevel)
         return DRL_RET_MISSING_ENTRY
     end
-
-    if inv.consume.buyPkg ~= nil then
-        dbot.info("Skipping request to buy consumable \"" .. normalizedType .. "\": another request is in progress")
-        return DRL_RET_BUSY
-    end
-
-    local normalizedContainerName = tostring(containerName or ""):gsub("^%s+", ""):gsub("%s+$", "")
-    if normalizedContainerName == "" then
-        normalizedContainerName = inv.consume.getAutoPotionContainerId() or ""
-        if normalizedContainerName ~= "" then
-            dbot.debug("inv.consume.buy: Using auto potion container " .. normalizedContainerName, "inv.consume")
-        end
-    end
-
-    inv.consume.buyPkg = {
-        room = bestEntry.room,
-        itemName = bestEntry.name,
-        fullName = bestEntry.fullName,
-        keywords = bestEntry.keywords,
-        storeKeyword = getPreferredStoreTarget(bestEntry),
-        numItems = numItems,
-        containerName = normalizedContainerName,
-        timeoutSec = 10
-    }
-
-    return inv.consume.buyCR()
+    return inv.consume.startBuyEntry(bestEntry, numItems, containerName, nil)
 end
 
 function inv.consume.getAutoPotionContainerId()
@@ -870,6 +1016,7 @@ function inv.consume.buyCR()
     if room == nil or room == 0 then
         dbot.warn("inv.consume.buyCR: Target room is missing")
         inv.consume.buyPkg = nil
+        finishWindowAction(pkg, false)
         return DRL_RET_INVALID_PARAM
     end
 
@@ -886,6 +1033,7 @@ function inv.consume.buyCR()
         end
         sendConsumeCommands(commands)
         inv.consume.buyPkg = nil
+        finishWindowAction(pkg, true)
         return DRL_RET_SUCCESS
     end
 
@@ -894,22 +1042,11 @@ function inv.consume.buyCR()
         pkg.startTime = os.time()
         dbot.debug("Running to \"" .. pkg.room .. "\" to buy \"" .. pkg.numItems ..
             "\" of \"" .. pkg.itemName .. "\"", "inv.consume")
-        if snd and snd.mapper and type(snd.mapper.xrt) == "function" then
-            local travelOk, travelResult = pcall(snd.mapper.xrt, tostring(room))
-            if not travelOk or travelResult == false then
-                dbot.warn("inv.consume.buyCR: mapper travel failed: " ..
-                    tostring(not travelOk and travelResult or "route was not started"))
-                inv.consume.buyPkg = nil
-                return DRL_RET_INTERNAL_ERROR
-            end
-        elseif type(expandAlias) == "function" then
-            -- Compatibility fallback for mapper packages that expose xrt only
-            -- as an alias. This is one expansion per buy request, not one per
-            -- generated inventory action.
-            expandAlias("xrt " .. tostring(room), false)
-        else
-            dbot.warn("inv.consume.buyCR: Aardwolf mapper xrt is unavailable; cannot travel to the shop")
+        local traveled, travelErr = startMapperTravel(room)
+        if not traveled then
+            dbot.warn("inv.consume.buyCR: mapper travel failed: " .. tostring(travelErr))
             inv.consume.buyPkg = nil
+            finishWindowAction(pkg, false)
             return DRL_RET_UNSUPPORTED
         end
     end
@@ -917,6 +1054,7 @@ function inv.consume.buyCR()
     if pkg.startTime and (os.time() - pkg.startTime) > pkg.timeoutSec then
         dbot.warn("inv.consume.buyCR: Timed out running to room " .. room)
         inv.consume.buyPkg = nil
+        finishWindowAction(pkg, false)
         return DRL_RET_TIMEOUT
     end
 
@@ -927,6 +1065,7 @@ function inv.consume.buyCR()
 
     dbot.warn("inv.consume.buyCR: tempTimer unavailable; aborting")
     inv.consume.buyPkg = nil
+    finishWindowAction(pkg, false)
     return DRL_RET_UNSUPPORTED
 end
 
@@ -980,59 +1119,24 @@ function inv.consume.get(typeName, size, containerId)
         local preferredId = nil
         local count = 0
         local entryLevel = entry.level or 0
-        local searchTerm = firstNonEmpty(entry.fullName, entry.name, entry.key)
-        local entryKeywords = tostring(entry.keywords or "")
-        local searchWords = splitWords(searchTerm)
-        for _, keyword in ipairs(splitWords(entryKeywords)) do
-            table.insert(searchWords, keyword)
-        end
+        local searchTerm = firstNonEmpty(entry.name, entry.key, entry.fullName)
 
         dbot.debug("inv.consume.get: checking entry level=" .. tostring(entryLevel) ..
             " key=\"" .. tostring(searchTerm) .. "\"", "inv.consume")
 
-        local normalizedSearchTerm = tostring(searchTerm or ""):lower()
-
-        local idArray, searchRet = inv.items.search(searchTerm)
-        if searchRet ~= DRL_RET_SUCCESS then
-            dbot.warn("inv.consume.get: Failed to search persistence for \"" .. tostring(searchTerm) ..
-                "\": " .. dbot.retval.getString(searchRet))
-            return nil, nil, searchRet
-        end
-
-        local candidateIds = idArray or {}
-        if #candidateIds == 0 then
-            candidateIds = {}
-            for objId, _ in pairs(inv.items.table or {}) do
-                table.insert(candidateIds, objId)
-            end
-        end
-
-        for _, objId in ipairs(candidateIds) do
+        -- Every tracked object is checked against this exact configured entry.
+        -- There is deliberately no fallback that broadens the match when the
+        -- configured consumable is unavailable.
+        for objId, _ in pairs(inv.items.table or {}) do
             local container = inv.items.getStatField(objId, invStatFieldContainer)
             local isIgnored = container ~= nil and container ~= "" and inv.config.isIgnored(container)
-            if not isIgnored then
-                local itemLevel = tonumber(inv.items.getStatField(objId, invStatFieldLevel) or "") or 0
-                local itemName = tostring(inv.items.getStatField(objId, invStatFieldName) or "")
-                local keywords = tostring(inv.items.getStatField(objId, invStatFieldKeywords) or "")
+            if not isIgnored and itemMatchesConsumeEntry(entry, objId) then
                 local location = inv.items.getStatField(objId, invStatFieldLocation)
-                local keywordMatch = normalizedSearchTerm ~= "" and dbot.isWordInString(normalizedSearchTerm, keywords:lower())
-                if not keywordMatch then
-                    for _, searchWord in ipairs(searchWords) do
-                        if dbot.isWordInString(searchWord, keywords:lower()) then
-                            keywordMatch = true
-                            break
-                        end
-                    end
-                end
-                local nameMatch = normalizedSearchTerm ~= "" and itemName:lower():find(normalizedSearchTerm, 1, true) ~= nil
-
-                if entry.level == itemLevel and (keywordMatch or nameMatch) then
-                    count = count + 1
-                    if preferredId == nil and location == preferredLocation then
-                        preferredId = objId
-                    else
-                        finalId = objId
-                    end
+                count = count + 1
+                if preferredId == nil and location == preferredLocation then
+                    preferredId = objId
+                else
+                    finalId = objId
                 end
             end
         end
@@ -1061,7 +1165,7 @@ function inv.consume.get(typeName, size, containerId)
             dbot.debug("inv.consume.get: matched L" .. tostring(entryLevel) ..
                 " but effectiveLevel=" .. tostring(effectiveLevel) .. " blocks use", "inv.consume")
         else
-            dbot.debug("inv.consume.get: no persistence match for L" .. tostring(entryLevel) ..
+            dbot.debug("inv.consume.get: no configured consumable match for L" .. tostring(entryLevel) ..
                 " key=\"" .. tostring(searchTerm) .. "\" (count=" .. tostring(count) .. ")", "inv.consume")
         end
     end
@@ -1212,6 +1316,9 @@ function inv.consume.useCR()
     if commandArray ~= nil then
         if #commandArray > 0 then
             sendConsumeCommands(commandArray)
+        elseif retval == DRL_RET_MISSING_ENTRY then
+            dbot.note("No available items match the configured \"" .. pkg.typeName ..
+                "\" consumable list; nothing was consumed")
         else
             dbot.note("Skipping request to consume items: no items matching the request were found")
         end

@@ -40,6 +40,16 @@ local configDefaults = {
     reportChannel = "echo",
     reportMode = "classic",
 
+    -- Consumables window settings
+    isConsumeWindowEnabled = false,
+    consumeWindowGeometry = {
+        x = "2%",
+        y = "2%",
+        width = 190,
+        height = 390,
+        layoutVersion = 2,
+    },
+
     -- Priority defaults
     defaultPriorityName = nil,
 }
@@ -205,6 +215,49 @@ function inv.config.setReportMode(mode)
         return DRL_RET_INVALID_PARAM
     end
     return inv.config.set("reportMode", normalized)
+end
+
+function inv.config.isConsumeWindowEnabled()
+    return inv.config.get("isConsumeWindowEnabled") == true
+end
+
+function inv.config.setConsumeWindowEnabled(enabled)
+    return inv.config.set("isConsumeWindowEnabled", enabled == true)
+end
+
+function inv.config.getConsumeWindowGeometry()
+    local stored = inv.config.get("consumeWindowGeometry")
+    stored = type(stored) == "table" and stored or {}
+    local width = stored.width ~= nil and stored.width or 190
+    local height = stored.height ~= nil and stored.height or 390
+
+    -- Version 1 used a 360x620 default. Compact it once while preserving any
+    -- dimensions the user already made smaller than the new defaults.
+    if tonumber(stored.layoutVersion) ~= 2 then
+        width = tonumber(width) and math.min(tonumber(width), 190) or 190
+        height = tonumber(height) and math.min(tonumber(height), 390) or 390
+    end
+    return {
+        x = stored.x ~= nil and stored.x or "2%",
+        y = stored.y ~= nil and stored.y or "2%",
+        width = width,
+        height = height,
+        layoutVersion = 2,
+    }
+end
+
+function inv.config.setConsumeWindowGeometry(geometry)
+    if type(geometry) ~= "table" then
+        return DRL_RET_INVALID_PARAM
+    end
+    local current = inv.config.getConsumeWindowGeometry()
+    for _, key in ipairs({ "x", "y", "width", "height" }) do
+        if geometry[key] ~= nil then
+            current[key] = geometry[key]
+        end
+    end
+    current.layoutVersion = 2
+    return inv.config.set("consumeWindowGeometry", current)
 end
 
 ----------------------------------------------------------------------------------------------------
