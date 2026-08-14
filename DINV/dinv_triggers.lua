@@ -574,7 +574,7 @@ function inv.items.parseIdentifyLine(item, line)
         end
     end
     if itemType then
-        item.stats[invStatFieldType] = itemType
+        item.stats[invStatFieldType] = inv.items.normalizeItemType(itemType)
     end
 
     -- Worn : Wielded
@@ -661,14 +661,40 @@ function inv.items.parseIdentifyLine(item, line)
     end
 
     ---------------------------------------------------------------------------
+    -- DRINK FIELDS
+    ---------------------------------------------------------------------------
+
+    local servings, liquid = cleanLine:match("(%d+)%s+servings?%s+of%s+(.-)%s*|%s*$")
+    if not servings then
+        servings, liquid = cleanLine:match("(%d+)%s+servings?%s+of%s+(.+)%s*$")
+    end
+    if servings then
+        liquid = tostring(liquid or "")
+            :gsub("%s*|%s*$", "")
+            :gsub("%.%s*$", "")
+            :gsub("^%s+", "")
+            :gsub("%s+$", "")
+        item.stats[invStatFieldServings] = toNumber(servings)
+        item.stats[invStatFieldLiquid] = liquid
+        item.stats[invStatFieldDrinkDataVersion] = inv.items.consumableDrinkDataVersion
+        continuationState.name = false
+        continuationState.keywords = false
+        continuationState.flags = false
+        continuationState.affectMods = false
+    end
+
+    ---------------------------------------------------------------------------
     -- POTION/PILL/WAND/STAFF FIELDS
     ---------------------------------------------------------------------------
 
-    local spellUses, spellLevel, spellName = cleanLine:match("(%d+) uses? of level (%d+) '(.-)'")
+    local spellUses, spellLevel, spellName = cleanLine:match("(%d+) uses? of level (%d+) '(.*)'%s*|?%s*$")
     if spellUses then
-        item.stats[invStatFieldSpellUses] = toNumber(spellUses)
-        item.stats[invStatFieldSpellLevel] = toNumber(spellLevel)
-        item.stats[invStatFieldSpellName] = spellName
+        inv.items.addIdentifiedSpell(
+            item,
+            toNumber(spellUses),
+            toNumber(spellLevel),
+            spellName
+        )
         continuationState.name = false
         continuationState.keywords = false
         continuationState.flags = false
@@ -679,40 +705,6 @@ function inv.items.parseIdentifyLine(item, line)
     local leadsTo = cleanLine:match("Leads to%s+:%s+(.-)%s*|")
     if leadsTo then
         item.stats[invStatFieldLeadsTo] = leadsTo
-    end
-
-    ---------------------------------------------------------------------------
-    -- RESIST FIELDS (standalone lines)
-    ---------------------------------------------------------------------------
-
-    local resistPatterns = {
-        { pattern = "slash%s+:%s+([+-]?%d+)", field = invStatFieldSlash },
-        { pattern = "pierce%s+:%s+([+-]?%d+)", field = invStatFieldPierce },
-        { pattern = "bash%s+:%s+([+-]?%d+)", field = invStatFieldBash },
-        { pattern = "acid%s+:%s+([+-]?%d+)", field = invStatFieldAcid },
-        { pattern = "cold%s+:%s+([+-]?%d+)", field = invStatFieldCold },
-        { pattern = "energy%s+:%s+([+-]?%d+)", field = invStatFieldEnergy },
-        { pattern = "holy%s+:%s+([+-]?%d+)", field = invStatFieldHoly },
-        { pattern = "electric%s+:%s+([+-]?%d+)", field = invStatFieldElectric },
-        { pattern = "negative%s+:%s+([+-]?%d+)", field = invStatFieldNegative },
-        { pattern = "shadow%s+:%s+([+-]?%d+)", field = invStatFieldShadow },
-        { pattern = "magic%s+:%s+([+-]?%d+)", field = invStatFieldMagic },
-        { pattern = "air%s+:%s+([+-]?%d+)", field = invStatFieldAir },
-        { pattern = "earth%s+:%s+([+-]?%d+)", field = invStatFieldEarth },
-        { pattern = "fire%s+:%s+([+-]?%d+)", field = invStatFieldFire },
-        { pattern = "light%s+:%s+([+-]?%d+)", field = invStatFieldLight },
-        { pattern = "mental%s+:%s+([+-]?%d+)", field = invStatFieldMental },
-        { pattern = "sonic%s+:%s+([+-]?%d+)", field = invStatFieldSonic },
-        { pattern = "water%s+:%s+([+-]?%d+)", field = invStatFieldWater },
-        { pattern = "poison%s+:%s+([+-]?%d+)", field = invStatFieldPoison },
-        { pattern = "disease%s+:%s+([+-]?%d+)", field = invStatFieldDisease },
-    }
-
-    for _, rp in ipairs(resistPatterns) do
-        local value = lowerTrimmed:match(rp.pattern)
-        if value then
-            item.stats[rp.field] = toNumber(value)
-        end
     end
 
     ---------------------------------------------------------------------------
@@ -772,20 +764,29 @@ function inv.items.parseIdentifyLine(item, line)
         ["disease"] = { field = invStatFieldDisease, additive = true },
     }
 
+    -- Section headings share a line with the first property. Remove those
+    -- headings so parsePropertyName sees "All physical", not
+    -- "Resist Mods: All physical" (and likewise for the first stat mod).
+    -- All resistance values are parsed here once; a separate substring pass
+    -- would also mistake "All magic" for the individual "magic" resist.
+    local propertyLine = cleanLine
+        :gsub("Stat%s+Mods%s*:%s*", "")
+        :gsub("Resist%s+Mods%s*:%s*", "")
+
     -- Find all colons and extract properties
     local i = 1
-    while i <= #cleanLine do
-        local colonPos = cleanLine:find(":", i)
+    while i <= #propertyLine do
+        local colonPos = propertyLine:find(":", i)
         if not colonPos then break end
 
-        local propName, propStart = parsePropertyName(cleanLine, colonPos)
+        local propName, propStart = parsePropertyName(propertyLine, colonPos)
         if propName then
             local propLower = propName:lower()
             local propDef = numericProps[propLower]
 
             if propDef then
                 -- Extract numeric value after colon
-                local value, endPos = extractNumber(cleanLine, colonPos + 1)
+                local value, endPos = extractNumber(propertyLine, colonPos + 1)
                 if value then
                     if propDef.additive then
                         -- Additive: add to existing value (for stat mods, resists)

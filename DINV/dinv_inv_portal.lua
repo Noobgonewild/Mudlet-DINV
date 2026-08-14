@@ -176,16 +176,16 @@ function inv.portal.use(query, endTag)
         return inv.tags.stop(invTagsPortal, endTag, retval)
     end
 
-    if shouldReturnToContainer then
-        local postCommands = {}
-        if origId ~= nil and origId ~= portalId then
-            table.insert(postCommands, "wear " .. origId .. " " .. origLoc)
-        else
-            table.insert(postCommands, "remove " .. portalId)
-        end
-        table.insert(postCommands, "put " .. portalId .. " " .. objLocNum)
-        retval = dbot.execute.safe.commands(postCommands, nil, nil, nil, nil)
+    local postCommands = {}
+    if origId ~= nil and origId ~= portalId then
+        table.insert(postCommands, "wear " .. origId .. " " .. origLoc)
+    else
+        table.insert(postCommands, "remove " .. portalId)
     end
+    if shouldReturnToContainer then
+        table.insert(postCommands, "put " .. portalId .. " " .. objLocNum)
+    end
+    retval = dbot.execute.safe.commands(postCommands, nil, nil, nil, nil)
     inv.portal.lastRemovedPortalId = nil
     inv.portal.pendingUseId = nil
     _G.dinvPortalUseWornPortalId = nil

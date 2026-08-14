@@ -478,7 +478,7 @@ The build process:
   1. Scans worn equipment (eqdata)
   2. Scans main inventory (invdata)
   3. Scans inside each container and captures keyring data
-  4. Identifies each non-keyring item (taking from containers if needed)
+  4. Identifies non-keyring items, then partial keyring items as one batch
 
 Kept state is read from the K flag in eqdata/invdata and stored with each item.
 After the initial build, changes are tracked automatically via invmon/invitem.
@@ -529,7 +529,7 @@ function inv.cli.refresh.fn(name, line, wildcards)
         if retval ~= DRL_RET_SUCCESS then
             return inv.tags.stop(invTagsRefresh, endTag, retval)
         end
-        cecho("\n<green>[DINV] Refresh started (non-keyring partial items will be fully identified).\n")
+        cecho("\n<green>[DINV] Refresh started (partial items, including the keyring backlog, will be fully identified).\n")
         return inv.tags.stop(invTagsRefresh, endTag, DRL_RET_SUCCESS)
     elseif action == "off" then
         inv.items.refreshOff()
@@ -638,9 +638,13 @@ not seen in that scan are removed from active inventory: partial singletons are
 deleted, fully identified singletons are retained temporarily as pending
 removals, and tracked container subtrees are detached. A successful later
 refresh purges pending removals only after their minimum age has elapsed.
-Newly seen non-keyring partial items are queued for identify. Keyring data is
-sufficient for keyring members; they are not retrieved or identified. Kept
-state is refreshed from each observed protocol K flag.
+Live invmon/invitem tracking records newly looted items without starting an
+identify. Build and refresh still fully identify eligible non-keyring items,
+then identify the partial keyring backlog as one batch. Each keyring item is
+temporarily retrieved by object ID, identified, and returned to the keyring.
+Use 'dinv identify <id>' (also used by Mapper's cexitif keyid command) for an
+explicit live targeted identify.
+Kept state is refreshed from each observed protocol K flag.
 
 Subcommands:
   on            Enable automatic refreshes using the configured period.
@@ -679,7 +683,7 @@ end
 
 function inv.cli.identify.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s",
-               pluginNameCmd .. " identify @G<itemId>", "Re-identify one tracked or main-inventory item"))
+               pluginNameCmd .. " identify @G<itemId>", "Re-identify one tracked item, including keyring items"))
 end
 
 function inv.cli.identify.examples()
@@ -689,7 +693,8 @@ Usage:
 
 Re-identifies a single item using the same identify flow as build/refresh.
 If the item is not already tracked, DINV first checks main inventory data for
-that id and then identifies it.
+that id and then identifies it. A tracked keyring item is temporarily retrieved,
+identified, and returned to the keyring.
 ]])
 end
 
@@ -716,9 +721,31 @@ end
 
 function inv.cli.search.fn(name, line, wildcards)
     local tokens = wildcards or {}
-    local displayMode, explicitMode = extractSearchDisplayMode(tokens, true)
+    local displayMode, explicitMode = extractSearchDisplayMode(tokens, false)
+    local statIndex = nil
+    for index, token in ipairs(tokens) do
+        if tostring(token or ""):lower() == "stat" then
+            statIndex = index
+            break
+        end
+    end
 
-    local query = table.concat(tokens, " ")
+    if statIndex and explicitMode then
+        dbot.warn("Stat search cannot be combined with the '" .. tostring(displayMode) .. "' display mode.")
+        dbot.info("Put the item query first, followed by 'stat', for example: " ..
+            "@Gdinv search immortal providence stat solidify@W.")
+        return DRL_RET_INVALID_PARAM
+    end
+
+    local query
+    local statQuery
+    if statIndex then
+        displayMode = "stat"
+        query = table.concat(tokens, " ", 1, statIndex - 1)
+        statQuery = table.concat(tokens, " ", statIndex)
+    else
+        query = table.concat(tokens, " ")
+    end
     local endTag = inv.tags.new(line)
 
     local itemIds
@@ -726,13 +753,13 @@ function inv.cli.search.fn(name, line, wildcards)
     local statSpec
     if displayMode == "stat" then
         local statError
-        statSpec, statError = inv.items.parseStatSearchQuery(query)
+        statSpec, statError = inv.items.parseStatSearchQuery(statQuery)
         if not statSpec then
             dbot.warn("Invalid stat search: " .. tostring(statError))
             dbot.info("Use '@Gdinv help search@W' for stat-search syntax and allowed fields.")
             return inv.tags.stop(invTagsSearch, endTag, DRL_RET_INVALID_PARAM)
         end
-        itemIds, retval = inv.items.searchStats(statSpec)
+        itemIds, retval = inv.items.searchStats(statSpec, { query = query })
     else
         itemIds, retval = inv.items.search(query)
     end
@@ -756,7 +783,8 @@ end
 
 function inv.cli.search.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s", 
-               pluginNameCmd .. " search @G[basic|objid|full|stat] <query>", "Search inventory (default: objid)"))
+               pluginNameCmd .. " search @G[basic|objid|full] <query> [stat <expression>]",
+               "Search inventory (default: objid)"))
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -795,9 +823,9 @@ function inv.cli.api.examples()
   Other Mudlet scripts can call @GDINV.api@W directly. API calls return Lua values
   silently: they do not print search results or errors in the main window.
 
-  API version: @G2@W
+  API version: @G3@W
   API namespace: @GDINV.api@W
-  Mode: @Gread-only@W
+  Mode: @Gcontrolled-actions@W
 
 @CCore Methods@W
   @GDINV.api.getVersion()@W
@@ -842,6 +870,7 @@ function inv.cli.api.examples()
     @Glimit / offset@W  pagination controls
     @Gsource@W          "auto", "live", or "persistence"
     @GincludeIgnored@W  include items in ignored containers
+    @GexactName@W       exact normalized item name (case, color, and spacing independent)
     @Gtrace@W           include silent diagnostics in result.diagnostics
 
 @CInventory Structure@W
@@ -859,6 +888,8 @@ function inv.cli.api.examples()
   @GDINV.api.getWeaponDamageTypes(options)@W
   @GDINV.api.getPortals(options)@W
   @GDINV.api.getConsumables(options)@W
+  @GDINV.api.getStaves(options)@W
+  @GDINV.api.getStaveChargeState(objId, options)@W
   @GDINV.api.getKeys(options)@W
   @GDINV.api.getWearableItems(wearLocation, options)@W
   @GDINV.api.getNewItems(sinceRevision, options)@W
@@ -871,10 +902,22 @@ function inv.cli.api.examples()
   @GDINV.api.compareItems(firstId, secondId, priorityName, options)@W
   @GDINV.api.getBestItems(wearLocation, priorityName, options)@W
 
-@CRead-Only Boundary@W
-  @GDINV.api@W never sends commands to Aardwolf and never pushes Mudlet events.
-  @GDINV.actions@W exists only as a compatibility namespace; its methods return
-  @YUNSUPPORTED@W in read-only mode.
+@CControlled Actions@W
+  Queries remain read-only copies. The narrow @GDINV.actions@W namespace exposes
+  exact-ID inventory and stave-charge operations for cooperating addons:
+
+  @GDINV.actions.identify(objIdOrIds, options)@W
+  @GDINV.actions.retrieve(objIdOrIds, options)@W
+  @GDINV.actions.hold(objId, options)@W
+  @GDINV.actions.remove(objIdOrIds, options)@W
+  @GDINV.actions.reserveStaveUse(objId, {floor=1})@W
+  @GDINV.actions.observeStaveCharges(objId, charges, options)@W
+  @GDINV.actions.cancelStaveUse(objId, token, options)@W
+  @GDINV.actions.markStaveChargesUnknown(objId, options)@W
+
+  A reservation never decrements charges. The authoritative Aardwolf result line
+  must be passed to @GobserveStaveCharges@W; missing or ambiguous output should be
+  cancelled with @GmarkUnknown=true@W.
 
   Subscriptions are disabled. Use polling/query methods instead:
   @GDINV.api.getChangesSince(revision)@W
@@ -885,11 +928,14 @@ function inv.cli.api.examples()
       { fields = {"id", "name", "location"} }
     )@W
 
-  @Glocal keys = DINV.api.findDuplicates({
-      query = "type key location keyring",
-      groupBy = "normalizedName",
-      fields = {"id", "name", "timer", "normalizedName"}
+  @Glocal keys = DINV.api.getKeys({
+      source = "live",
+      exactKeywords = "eternal damnation small key",
+      fields = {"id", "name", "keywords", "identifyLevel", "location"}
     })@W
+
+  @G-- exactKeywords compares the full normalized token set and only matches
+  -- fully identified isKey flags or Type Key items in any location.@W
 
   @Glocal changes = DINV.api.getChangesSince(lastRevision)@W
 
@@ -973,8 +1019,8 @@ function inv.cli.report.fn(name, line, wildcards)
         elseif displayMode == "basic" then
             dbot.info("@WBasic mode omits IDs. Use '@Gdinv report objid <query>@W' to show clickable IDs.")
         elseif displayMode ~= "itemid" then
-            dbot.info("@WClick an ID or use '@Gdinv report <itemid>@W' to send a report over the configured channel (@G" ..
-                tostring(channel) .. "@W).")
+            dbot.info("@WLeft-click an ID to report over the configured channel (@G" .. tostring(channel) ..
+                "@W), or right-click it to choose another channel.")
         end
     end
 
@@ -2158,22 +2204,27 @@ solidified flags.  An objid search shows the standard output with object IDs, hi
 moves, and the illuminated/resonated/solidified flags.  A full search adds stored key/value data
 for every item.  Stat mode displays only object ID, item name, and requested stat values.  It accepts
 only real item stats, sorts descending by the first requested stat, and keeps missing sort values last.
+Basic results have no report links.  In objid and full modes, left-click an object ID to use the
+configured report channel or right-click it to choose a channel.  Stat mode uses the same object-ID
+menu, but its channel report omits the object ID and sends the same compact field/value sequence shown
+in the search row, using the item's colorName and the requested stat fields.
 
 Stat mode syntax:
-  @Gdinv search stat <stat> [value|comparison] [<stat> ...] [|| <stat> ...]@W
+  @Gdinv search <item query> stat <expression> [|| stat <expression> ...]@W
 
-Use "stat" only once, immediately after "search".  A bare numeric stat matches present, non-zero
-values.  Comparisons support =, <, <=, >, and >= and require a valid number.  Enchant selectors for
-illuminate, resonate, and solidify must be quoted.  An optional comparison checks the signed number
-in the matching enchant component, for example @Gsolidify "hit roll" < 8@W.  A quoted selector belongs
-only to its preceding enchant: @Gilluminate "wis"@W matches Wisdom within Illuminate and displays the
-complete Illuminate value, while @Gwis@W by itself searches and displays the normal wisdom stat.
+Everything before the first "stat" is the item query and applies to every chained stat expression.
+Use "|| stat" between alternative stat conditions.  The item query may be omitted to search all
+items.  A bare numeric stat matches present, non-zero values.  Comparisons support =, <, <=, >, and >=
+and require a valid number.  Single-word enchant selectors such as @Gwis@W do not need quotes;
+multiword selectors such as @G"hit roll"@W must be quoted.  An optional comparison checks the signed
+number in the matching enchant component.  The complete requested enchant field is displayed and
+reported even when a selector matched only one component.
 
 Allowed stat fields:
   str, int, wis, dex, con, luck, hp, mana, moves, hitroll, damroll, saves, avedam,
   allphys, allmagic, bash, pierce, slash, acid, cold, energy, holy, electric,
   negative, shadow, magic, air, earth, fire, light, mental, sonic, water,
-  disease, poison, illuminate, resonate, solidify.
+  disease, poison, illuminate, resonate, solidify, servings, liquid.
 
 Examples:
   1) Show basic info for all weapons between the levels of 1 to 40
@@ -2233,10 +2284,10 @@ Cosmic Calling           lv150   0str  0int  0wis  0dex  0con  0luc   0hr   0dr
      "@Gdinv search stat solidify "hit roll"@W"
 
  10) Show items with strength or dexterity bonuses, sorted by strength
-     "@Gdinv search stat str || dex@W"
+     "@Gdinv search stat str || stat dex@W"
 
- 11) Require two stat conditions and display both values
-     "@Gdinv search stat str < 9 solidify "hit roll" < 8@W"
+ 11) Search one item name and chain alternative enchant conditions
+     "@Gdinv search immortal providence stat solidify "hit roll" < 3 || stat illuminate wis > 3 || stat resonate@W"
 
  12) Show average weapon damage at or above 600
      "@Gdinv search stat avedam >= 600@W"
@@ -2292,9 +2343,9 @@ set.  Finding pieces that are complementary without wasting points on overmaxed 
 a process that is well-suited for a plugin -- hence this plugin :)
 
 The "@Cset wear@W" command calculates a live set and then wears it. Add "@Ccache@W"
-to prefer a previously calculated set. If that cache entry is missing, DINV explains that
-it is calculating the set now. A cached set containing missing items is not worn; DINV lists
-the missing items and leaves your equipment unchanged.
+to wear a previously calculated set without recalculating it. If that cache entry is missing,
+DINV reports the missing wearable level and leaves your equipment unchanged. A cached set
+containing missing items is not worn; DINV lists the missing items and leaves your equipment unchanged.
 If no priority is supplied, set wear uses the global default priority.
 The "@Ctest@W" option controls how set creation is evaluated:
   - "@Ctest cache@W" uses cached set data only (faster, no rebuild)
@@ -2511,8 +2562,10 @@ Supported query keys (case-insensitive):
   Weapon/armor: @Cavedam@W, @Cinflicts@W, @Cdamtype@W, @Cweapontype@W, @Cspecials@W, @Carmor@W
   Containers: @Ccapacity@W, @Cholding@W, @Cheaviestitem@W, @Citemsinside@W, @Ctotweight@W,
     @Citemburden@W, @Citemweight@W, @Creducedby@W
-  Item-specific: @Cduration@W, @Cnutrition@W, @Cfoodaffects@W, @Cdestination@W, @Cleadsto@W,
-    @Cspells@W, @Cspelluses@W, @Cspelllevel@W, @Cspellname@W, @Cskills@W, @Caffects@W,
+  Item-specific: @Cduration@W, @Cnutrition@W, @Cfoodaffects@W, @Cservings@W, @Cliquid@W,
+    @Cdestination@W, @Cleadsto@W,
+    @Cspells@W, @Cspelluses@W, @Cspelllevel@W, @Cspellname@W, @Ccharges@W,
+    @Cchargeknown@W, @Cchargedirty@W, @Cchargesource@W, @Cskills@W, @Caffects@W,
     @Caffectmods@W, @Cabilmods@W, @Cenchants@W, @Cilluminate@W, @Cresonate@W, @Csolidify@W
   DINV metadata: @Corganize@W, @Cloctype@W, @Clocname@W
 

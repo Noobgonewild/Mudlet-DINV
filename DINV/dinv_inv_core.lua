@@ -114,6 +114,9 @@ invStatFieldDuration   = "duration"
 -- Food/Drink fields
 invStatFieldNutrition  = "nutrition"
 invStatFieldFoodAffects = "foodaffects"
+invStatFieldServings   = "servings"
+invStatFieldLiquid     = "liquid"
+invStatFieldDrinkDataVersion = "drinkdataversion"
 
 -- Portal fields
 invStatFieldDestination = "destination"
@@ -124,6 +127,15 @@ invStatFieldSpells     = "spells"
 invStatFieldSpellUses  = "spelluses"
 invStatFieldSpellLevel = "spelllevel"
 invStatFieldSpellName  = "spellname"
+invStatFieldSpellListVersion = "spelllistversion"
+-- Stave charges are per physical object.  They must never be inferred from
+-- another stave with the same name, even though the spell itself is static.
+invStatFieldCharges          = "charges"
+invStatFieldChargeKnown      = "chargeknown"
+invStatFieldChargeDirty      = "chargedirty"
+invStatFieldChargeSource     = "chargesource"
+invStatFieldChargeObservedAt = "chargeobservedat"
+invStatFieldChargeRevision   = "chargerevision"
 invStatFieldSkills     = "skills"
 invStatFieldAffects    = "affects"
 invStatFieldAffectMods = "affectMods"

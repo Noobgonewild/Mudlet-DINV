@@ -10,9 +10,9 @@ DINV.actions = DINV.actions or {}
 local api = DINV.api
 local actions = DINV.actions
 
-api.version = 2
-api.mode = "read-only"
-actions.version = 0
+api.version = 3
+api.mode = "controlled-actions"
+actions.version = 1
 api.revision = tonumber(api.revision) or 0
 api.history = api.history or {}
 api.historyLimit = tonumber(api.historyLimit) or 250
@@ -26,6 +26,7 @@ local SUMMARY_FIELDS = {
     "id", "name", "colorName", "normalizedName", "type", "level", "keywords", "flags",
     "location", "container", "lastStored", "worn", "wearable", "timer", "owner", "clan",
     "material", "weight", "worth", "score", "identifyLevel",
+    "charges", "chargeKnown", "chargeDirty", "chargeSource", "chargeObservedAt", "chargeRevision",
 }
 
 local FIELD_ALIASES = {
@@ -57,6 +58,14 @@ local FIELD_ALIASES = {
     spells = { "spells" },
     spelluses = { "spelluses" },
     spelllevel = { "spelllevel" },
+    charges = { "charges" },
+    chargeKnown = { "chargeKnown", "chargeknown" },
+    chargeDirty = { "chargeDirty", "chargedirty" },
+    chargeSource = { "chargeSource", "chargesource" },
+    chargeObservedAt = { "chargeObservedAt", "chargeobservedat" },
+    chargeRevision = { "chargeRevision", "chargerevision" },
+    servings = { "servings" },
+    liquid = { "liquid" },
     destination = { "destination" },
     leadsto = { "leadsto" },
     enchants = { "enchants" },
@@ -151,6 +160,18 @@ end
 
 local function normalizeName(value)
     return trim(stripColors(value):gsub("%s+", " ")):lower()
+end
+
+local function normalizeKeywordSignature(value)
+    local seen, tokens = {}, {}
+    for token in stripColors(value):lower():gmatch("%S+") do
+        if not seen[token] then
+            seen[token] = true
+            table.insert(tokens, token)
+        end
+    end
+    table.sort(tokens)
+    return table.concat(tokens, " ")
 end
 
 local function getRawField(item, field)
@@ -534,8 +555,9 @@ local function hasFlag(item, value)
         local keep = getRawField(item, "keepflag")
         return keep == true or tostring(keep):lower() == "true" or tostring(keep) == "1"
     end
-    for flag in tostring(getRawField(item, "flags") or ""):gmatch("%S+") do
-        if contains(flag:gsub(",", ""), normalized) then
+    for flag in tostring(getRawField(item, "flags") or ""):gmatch("[^,%s]+") do
+        local candidate = tostring(flag):lower()
+        if candidate == normalized or (normalized ~= "iskey" and contains(candidate, normalized)) then
             return true
         end
     end
@@ -560,7 +582,11 @@ local function matchesCriteria(objId, item, clauses)
             local matched = false
 
             if key == "type" then
-                matched = tostring(itemType):lower() == tostring(value):lower()
+                local actualType = tostring(itemType):lower()
+                local requestedType = tostring(value):lower()
+                if actualType == "staff" then actualType = "stave" end
+                if requestedType == "staff" then requestedType = "stave" end
+                matched = actualType == requestedType
             elseif key == "name" then
                 local _, relativeName = relativeParts(value)
                 matched = contains(name, relativeName or value)
@@ -790,8 +816,12 @@ function api.getCapabilities()
                 "getWeapons", "getWeaponDamageTypes", "getPortals", "getConsumables", "getKeys",
                 "getWearableItems", "getNewItems", "findDuplicates", "getPriority",
                 "listPriorities", "scoreItem", "compareItems", "getBestItems", "getChangesSince",
+                "getStaves", "getStaveChargeState",
             },
-            actions = {},
+            actions = {
+                "identify", "retrieve", "hold", "remove", "reserveStaveUse",
+                "observeStaveCharges", "cancelStaveUse", "markStaveChargesUnknown",
+            },
             events = {},
         },
     })
@@ -818,6 +848,8 @@ function api.getStatus(options)
             buildInProgress = inv and inv.items and inv.items.buildInProgress == true or false,
             refreshInProgress = inv and inv.items and inv.items.refreshInProgress == true or false,
             identifyInProgress = inv and inv.items and inv.items.identifyInProgress == true or false,
+            targetedIdentifyInProgress = inv and inv.items
+                and inv.items.singleIdentifyMode == true or false,
             mode = api.mode,
         })
     end)
@@ -850,6 +882,7 @@ function api.search(query, options)
         local clauses = parseQuery(query, source)
         local items = {}
         local scanned = 0
+        local exactName = options.exactName ~= nil and normalizeName(options.exactName) or nil
 
         -- The public source contract is stronger than the internal default
         -- search target: live, active persistence, and build staging can be
@@ -862,8 +895,10 @@ function api.search(query, options)
                 local container = tostring(getRawField(item, "container") or "")
                 ignored = container ~= "" and inv.config.isIgnored(container)
             end
+            local itemName = getRawField(item, "name") or getRawField(item, "colorName")
+            local exactNameMatches = exactName == nil or normalizeName(itemName) == exactName
             if shouldExposeItem(item, options) and not ignored
-                and matchesCriteria(objId, item, clauses) then
+                and exactNameMatches and matchesCriteria(objId, item, clauses) then
                 table.insert(items, normalizeItem(objId, item, options))
             end
         end
@@ -1243,9 +1278,103 @@ function api.getConsumables(options)
     end)
 end
 
+function api.getStaves(options)
+    options = options or {}
+    return invoke("getStaves", options, function()
+        local source, sourceName = getSourceTable(options)
+        local clauses = parseQuery(options.query or "", source)
+        local items = {}
+        for objId, item in pairs(source) do
+            local itemType = tostring(getRawField(item, "type") or ""):lower()
+            if itemType == "staff" then itemType = "stave" end
+            if itemType == "stave" and shouldExposeItem(item, options)
+                and matchesCriteria(objId, item, clauses) then
+                table.insert(items, normalizeItem(objId, item, options))
+            end
+        end
+        sortItems(items, options.sortBy or { "name" })
+        return success({ source = sourceName, count = #items, items = items })
+    end)
+end
+
+function api.getStaveChargeState(objId, options)
+    options = options or {}
+    return invoke("getStaveChargeState", options, function()
+        local key = tostring(objId or "")
+        if key == "" then
+            return failure("INVALID_ARGUMENT", "objId is required.")
+        end
+        local source, sourceName = getSourceTable(options)
+        local item = source[key] or source[tonumber(key)]
+        if not item then
+            return failure("NOT_FOUND", "Item was not found in DINV.", { id = key })
+        end
+        local itemType = tostring(getRawField(item, "type") or ""):lower()
+        if itemType ~= "stave" and itemType ~= "staff" then
+            return failure("WRONG_TYPE", "Item is not a stave.", { id = key })
+        end
+        local knownValue = getRawField(item, "chargeKnown")
+        local known = knownValue == true or knownValue == 1 or tostring(knownValue):lower() == "true"
+        local dirtyValue = getRawField(item, "chargeDirty")
+        local dirty = dirtyValue == true or dirtyValue == 1 or tostring(dirtyValue):lower() == "true"
+        local charges = known and tonumber(getRawField(item, "charges")) or nil
+        local runtimeState = sourceName == "live" and inv.items.getStaveChargeState
+            and inv.items.getStaveChargeState(key) or nil
+        return success({
+            source = sourceName,
+            state = {
+                id = key,
+                charges = charges and math.max(0, math.floor(charges)) or nil,
+                known = known,
+                dirty = dirty,
+                source = tostring(getRawField(item, "chargeSource") or ""),
+                observedAt = tonumber(getRawField(item, "chargeObservedAt")),
+                revision = tonumber(getRawField(item, "chargeRevision")) or 0,
+                pending = runtimeState and runtimeState.pending or false,
+                reservationToken = runtimeState and runtimeState.reservationToken or nil,
+            },
+            item = normalizeItem(key, item, options),
+        })
+    end)
+end
+
 function api.getKeys(options)
     options = options or {}
-    return api.search(combineQuery(options.query, "type key"), options)
+    -- Aardwolf uses both representations in live data: some usable keys carry
+    -- the isKey flag regardless of object type, while ordinary temporary keys
+    -- can be Type Key without that flag. A caller query must apply to both OR
+    -- branches. exactName is normalized by api.search.
+    local searchOptions = deepCopy(options)
+    if options.exactKeywords ~= nil and type(searchOptions.fields) == "table" then
+        local wanted = { keywords = true, identifyLevel = true }
+        for _, field in ipairs(searchOptions.fields) do wanted[tostring(field)] = nil end
+        for field in pairs(wanted) do table.insert(searchOptions.fields, field) end
+    end
+    local flagged = combineQuery(options.query, "flag iskey")
+    local typed = combineQuery(options.query, "type key")
+    local result = api.search(flagged .. " || " .. typed, searchOptions)
+    if type(result) == "table" then
+        result.keyDefinition = "isKeyOrTypeKey"
+        result.exactNameApplied = options.exactName ~= nil
+        result.exactName = options.exactName ~= nil and normalizeName(options.exactName) or nil
+        result.exactKeywordsApplied = options.exactKeywords ~= nil
+        result.exactKeywords = options.exactKeywords ~= nil
+            and normalizeKeywordSignature(options.exactKeywords) or nil
+        result.keywordDefinition = "exactFullIdentifyTokenSet"
+        if result.ok == true and options.exactKeywords ~= nil then
+            local matched = {}
+            for _, item in ipairs(type(result.items) == "table" and result.items or {}) do
+                if tostring(item.identifyLevel or ""):lower() == "full"
+                    and normalizeKeywordSignature(item.keywords) == result.exactKeywords then
+                    table.insert(matched, item)
+                end
+            end
+            result.items = matched
+            result.count = #matched
+            result.total = #matched
+        end
+    end
+    return result
 end
 
 function api.getWearableItems(wearLocation, options)
@@ -1502,36 +1631,261 @@ function api.getChangesSince(revision, options)
 end
 
 function api.subscribe(eventName, subscriber)
-    return failure("UNSUPPORTED", "DINV API subscriptions are disabled in read-only mode.", {
+    return failure("UNSUPPORTED", "DINV API subscriptions are disabled; use Mudlet events or polling.", {
         mode = api.mode,
     })
 end
 
 function api.unsubscribe(subscriptionId)
-    return failure("UNSUPPORTED", "DINV API subscriptions are disabled in read-only mode.", {
+    return failure("UNSUPPORTED", "DINV API subscriptions are disabled; use Mudlet events or polling.", {
         mode = api.mode,
     })
 end
 
-----------------------------------------------------------------------------------------------------
--- Read-only action namespace
+-- Controlled action namespace
 ----------------------------------------------------------------------------------------------------
 
-local actionEndpointNames = {
-    "identify", "ensureIdentified", "ensureInInventory", "moveToContainer",
-    "restoreToHome", "wear", "remove", "usePortal", "useConsumable", "selectWeapon",
+local function normalizeActionIds(value)
+    local source = type(value) == "table" and value or { value }
+    local ids, seen = {}, {}
+    for _, candidate in ipairs(source) do
+        local id = tostring(candidate or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        if id ~= "" and id:match("^%d+$") and not seen[id] then
+            seen[id] = true
+            table.insert(ids, id)
+        end
+    end
+    return ids
+end
+
+local function chargeActionResult(endpointName, state, code, message)
+    if not state then
+        return failure(code or "INTERNAL_ERROR", message or "Stave charge action failed.")
+    end
+    return success({ endpoint = endpointName, state = deepCopy(state) })
+end
+
+local function startObservedCommands(label, commands, options)
+    options = options or {}
+    if #commands == 0 then
+        return success({ operationId = nil, commandCount = 0, commands = {} })
+    end
+    if not inv or not inv.items or not inv.items.sendActionCommands then
+        return failure("NOT_READY", "DINV inventory actions are not ready.")
+    end
+    local operationId = nil
+    if inv.operations and inv.operations.startBatchFromCommands then
+        operationId = inv.operations.startBatchFromCommands(label, commands, {
+            report = options.report == true,
+            timeout = options.timeout,
+            onFinish = options.onFinish,
+        })
+    end
+    local retval = inv.items.sendActionCommands(commands)
+    if tonumber(retval) ~= tonumber(DRL_RET_SUCCESS or 0) then
+        return retvalResult(retval, { operationId = operationId })
+    end
+    return success({
+        operationId = operationId,
+        commandCount = #commands,
+        commands = deepCopy(commands),
+    })
+end
+
+local function isCarriedContainer(containerId, seen)
+    local key = tostring(containerId or "")
+    if key == "" then return false end
+    seen = seen or {}
+    if seen[key] then return false end
+    seen[key] = true
+    local container = inv.items and inv.items.getItem and inv.items.getItem(key) or nil
+    if not container or not container.stats then return false end
+    if isWornItem(container) then return true end
+    local location = tostring(container.stats[invStatFieldLocation] or "")
+    if location == tostring(invItemLocInventory or "inventory") then return true end
+    local parent = inv.items.normalizeContainerId(container.stats[invStatFieldContainer])
+        or inv.items.normalizeContainerId(location)
+    return parent ~= nil and isCarriedContainer(parent, seen) or false
+end
+
+function actions.identify(objIds, options)
+    options = options or {}
+    return invoke("actions.identify", options, function()
+        local ids = normalizeActionIds(objIds)
+        if #ids == 0 then
+            return failure("INVALID_ARGUMENT", "At least one numeric object id is required.")
+        end
+        if not inv or not inv.items or not inv.items.identifySingleItem then
+            return failure("NOT_READY", "DINV identification is not ready.")
+        end
+        local accepted, rejected = {}, {}
+        for _, id in ipairs(ids) do
+            local retval = inv.items.identifySingleItem(id, options.source or "DINV.api")
+            if tonumber(retval) == tonumber(DRL_RET_SUCCESS or 0) then
+                table.insert(accepted, id)
+            else
+                table.insert(rejected, {
+                    id = id,
+                    retval = retval,
+                    code = RESULT_CODES[tonumber(retval)] or "INTERNAL_ERROR",
+                })
+            end
+        end
+        if #accepted == 0 then
+            return failure(rejected[1] and rejected[1].code or "BUSY",
+                "No items were accepted for identification.", { rejected = rejected })
+        end
+        return success({ accepted = accepted, rejected = rejected, count = #accepted })
+    end)
+end
+
+function actions.retrieve(objIds, options)
+    options = options or {}
+    return invoke("actions.retrieve", options, function()
+        local ids = normalizeActionIds(objIds)
+        if #ids == 0 then
+            return failure("INVALID_ARGUMENT", "At least one numeric object id is required.")
+        end
+        local commands, skipped = {}, {}
+        for _, id in ipairs(ids) do
+            local item = inv.items and inv.items.getItem and inv.items.getItem(id) or nil
+            local stats = item and item.stats or nil
+            if not stats then
+                table.insert(skipped, { id = id, code = "NOT_FOUND" })
+            else
+                local location = tostring(stats[invStatFieldLocation] or "")
+                local container = inv.items.normalizeContainerId(stats[invStatFieldContainer])
+                    or inv.items.normalizeContainerId(location)
+                if container and isCarriedContainer(container) then
+                    table.insert(commands, "get " .. id .. " " .. container)
+                elseif container then
+                    table.insert(skipped, { id = id, code = "NOT_IN_CARRIED_CONTAINER" })
+                elseif location ~= tostring(invItemLocInventory or "inventory") then
+                    table.insert(skipped, { id = id, code = "NOT_IN_CARRIED_CONTAINER" })
+                end
+            end
+        end
+        local response = startObservedCommands(options.label or "DINV retrieve", commands, options)
+        response.ids = ids
+        response.skipped = skipped
+        return response
+    end)
+end
+
+function actions.hold(objId, options)
+    options = options or {}
+    return invoke("actions.hold", options, function()
+        local ids = normalizeActionIds(objId)
+        if #ids ~= 1 then
+            return failure("INVALID_ARGUMENT", "Exactly one numeric object id is required.")
+        end
+        local id = ids[1]
+        local item = inv.items and inv.items.getItem and inv.items.getItem(id) or nil
+        if not item or not item.stats then
+            return failure("NOT_FOUND", "Item was not found in DINV.", { id = id })
+        end
+        if not inv.items.isStaveType(item.stats[invStatFieldType]) then
+            return failure("WRONG_TYPE", "Item is not a stave.", { id = id })
+        end
+        local commands = {}
+        local location = tostring(item.stats[invStatFieldLocation] or "")
+        local container = inv.items.normalizeContainerId(item.stats[invStatFieldContainer])
+            or inv.items.normalizeContainerId(location)
+        if container and not isCarriedContainer(container) then
+            return failure("NOT_IN_CARRIED_CONTAINER",
+                "The stave's container is not currently carried.", { id = id, container = container })
+        end
+        if container then table.insert(commands, "get " .. id .. " " .. container) end
+        local worn = tostring(item.stats[invStatFieldWorn] or "")
+        if worn ~= tostring(invWearLocHold or "hold") and location ~= tostring(invWearLocHold or "hold") then
+            table.insert(commands, "hold " .. id)
+        end
+        local response = startObservedCommands(options.label or "DINV hold stave", commands, options)
+        response.id = id
+        return response
+    end)
+end
+
+function actions.remove(objIds, options)
+    options = options or {}
+    return invoke("actions.remove", options, function()
+        local ids = normalizeActionIds(objIds)
+        if #ids == 0 then
+            return failure("INVALID_ARGUMENT", "At least one numeric object id is required.")
+        end
+        local commands = {}
+        for _, id in ipairs(ids) do
+            local item = inv.items and inv.items.getItem and inv.items.getItem(id) or nil
+            if item and isWornItem(item) then table.insert(commands, "remove " .. id) end
+        end
+        local response = startObservedCommands(options.label or "DINV remove", commands, options)
+        response.ids = ids
+        return response
+    end)
+end
+
+function actions.reserveStaveUse(objId, options)
+    options = options or {}
+    return invoke("actions.reserveStaveUse", options, function()
+        if not inv or not inv.items or not inv.items.reserveStaveChargeUse then
+            return failure("NOT_READY", "DINV stave charge tracking is not ready.")
+        end
+        local state, code, message = inv.items.reserveStaveChargeUse(
+            objId, options.floor, options.expectedRevision)
+        return chargeActionResult("actions.reserveStaveUse", state, code, message)
+    end)
+end
+
+function actions.observeStaveCharges(objId, charges, options)
+    options = options or {}
+    return invoke("actions.observeStaveCharges", options, function()
+        if not inv or not inv.items or not inv.items.observeStaveCharges then
+            return failure("NOT_READY", "DINV stave charge tracking is not ready.")
+        end
+        local state, code, message = inv.items.observeStaveCharges(
+            objId, charges, options.source, options.expectedRevision)
+        return chargeActionResult("actions.observeStaveCharges", state, code, message)
+    end)
+end
+
+function actions.cancelStaveUse(objId, token, options)
+    options = options or {}
+    return invoke("actions.cancelStaveUse", options, function()
+        if not inv or not inv.items or not inv.items.cancelStaveChargeUse then
+            return failure("NOT_READY", "DINV stave charge tracking is not ready.")
+        end
+        local state, code, message = inv.items.cancelStaveChargeUse(
+            objId, token, options.markUnknown == true, options.source)
+        return chargeActionResult("actions.cancelStaveUse", state, code, message)
+    end)
+end
+
+function actions.markStaveChargesUnknown(objId, options)
+    options = options or {}
+    return invoke("actions.markStaveChargesUnknown", options, function()
+        if not inv or not inv.items or not inv.items.markStaveChargesUnknown then
+            return failure("NOT_READY", "DINV stave charge tracking is not ready.")
+        end
+        local state, code, message = inv.items.markStaveChargesUnknown(objId, options.source)
+        return chargeActionResult("actions.markStaveChargesUnknown", state, code, message)
+    end)
+end
+
+local disabledActionEndpointNames = {
+    "ensureIdentified", "ensureInInventory", "moveToContainer", "restoreToHome",
+    "wear", "usePortal", "useConsumable", "selectWeapon",
 }
 
 local function disabledAction(endpointName)
     return function()
-        return failure("UNSUPPORTED", "DINV API is read-only; action endpoints cannot send commands.", {
+        return failure("UNSUPPORTED", "This DINV action is not exposed by the controlled API.", {
             endpoint = endpointName,
             mode = api.mode,
         })
     end
 end
 
-for _, endpointName in ipairs(actionEndpointNames) do
+for _, endpointName in ipairs(disabledActionEndpointNames) do
     actions[endpointName] = disabledAction(endpointName)
     api[endpointName] = nil
 end

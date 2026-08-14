@@ -58,15 +58,21 @@ local DYNAMIC_TEMPLATE_FIELDS = {
     __dinvLocationSource = true,
     __dinvLocationSession = true,
     __dinvLocationConfirmedAt = true,
+    charges = true,
+    chargeknown = true,
+    chargedirty = true,
+    chargesource = true,
+    chargeobservedat = true,
+    chargerevision = true,
 }
 
 local CONSUMABLE_TYPES = {
     potion = true,
     pill = true,
     food = true,
+    drink = true,
     scroll = true,
     wand = true,
-    stave = true,
 }
 
 local LEGACY_MODULES = {
@@ -400,8 +406,16 @@ local function normalizeName(value)
     return text:lower():gsub(",", ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
 end
 
+local function normalizeConsumableType(value)
+    local typeName = tostring(value or ""):lower()
+    if typeName == "drink container" then
+        return "drink"
+    end
+    return typeName
+end
+
 local function isConsumableType(value)
-    return CONSUMABLE_TYPES[tostring(value or ""):lower()] == true
+    return CONSUMABLE_TYPES[normalizeConsumableType(value)] == true
 end
 
 local function templateKey(item)
@@ -411,7 +425,7 @@ local function templateKey(item)
     if not isConsumableType(typeName) or itemName == "" then
         return nil
     end
-    return typeName:lower() .. "\31" .. itemName, typeName, itemName
+    return normalizeConsumableType(typeName) .. "\31" .. itemName, typeName, itemName
 end
 
 local function fingerprintValue(value)
@@ -2096,7 +2110,7 @@ function database.finishBuild(buildId)
     end
 
     local templatesCursor = query("SELECT obj_id FROM items WHERE lower(type_name) IN " ..
-        "('potion','pill','food','scroll','wand','stave') AND identify_level='full'")
+        "('potion','pill','food','scroll','wand') AND identify_level='full'")
     if templatesCursor then
         local ids = {}
         local row = templatesCursor:fetch({}, "a")

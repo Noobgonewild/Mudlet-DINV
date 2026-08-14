@@ -18,6 +18,12 @@ inv.items.keepSync = inv.items.keepSync or {
     pending = false,
 }
 
+-- Increment when the persisted representation of a consumable's complete
+-- spell list changes.  Older single-spell cache entries are re-identified
+-- once instead of being mistaken for complete multi-spell appraisals.
+inv.items.consumableSpellListVersion = 1
+inv.items.consumableDrinkDataVersion = 1
+
 ----------------------------------------------------------------------------------------------------
 -- Shared Item Effect Detection
 ----------------------------------------------------------------------------------------------------
@@ -58,12 +64,323 @@ local function normalizeEffectText(value)
     return text
 end
 
+local spellConsumableTypes = {
+    pill = true,
+    potion = true,
+    scroll = true,
+    stave = true,
+    staff = true,
+    wand = true,
+}
+
+function inv.items.normalizeItemType(itemType)
+    local value = tostring(itemType or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local lowered = value:lower()
+    if lowered == "staff" or lowered == "stave" then
+        return invItemTypeStave or "Stave"
+    end
+    return value
+end
+
+function inv.items.isStaveType(itemType)
+    return inv.items.normalizeItemType(itemType):lower() == "stave"
+end
+
+local function hasExactFlag(flags, wanted)
+    wanted = tostring(wanted or ""):lower()
+    for token in tostring(flags or ""):lower():gmatch("[^,%s]+") do
+        if token == wanted then return true end
+    end
+    return false
+end
+
+function inv.items.isKeyItem(itemOrId)
+    local item = itemOrId
+    if type(itemOrId) ~= "table" then
+        item = inv.items.getItem and inv.items.getItem(itemOrId) or nil
+    end
+    local stats = item and item.stats or nil
+    if not stats then return false end
+    return inv.items.normalizeItemType(stats[invStatFieldType]):lower() == "key"
+        or hasExactFlag(stats[invStatFieldFlags], "iskey")
+end
+
+function inv.items.isSpellConsumableType(itemType)
+    return spellConsumableTypes[tostring(itemType or ""):lower()] == true
+end
+
+function inv.items.isDrinkType(itemType)
+    local typeName = tostring(itemType or ""):lower()
+    return typeName == "drink" or typeName == "drink container"
+end
+
+local function trimSpellText(value)
+    return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function encodeIdentifiedSpell(uses, level, name)
+    local useCount = math.max(0, math.floor(tonumber(uses) or 0))
+    local spellLevel = math.max(0, math.floor(tonumber(level) or 0))
+    local spellName = trimSpellText(name)
+    if spellName == "" then
+        return nil
+    end
+    return string.format("%d %s of level %d '%s'",
+        useCount,
+        useCount == 1 and "use" or "uses",
+        spellLevel,
+        spellName)
+end
+
+function inv.items.addIdentifiedSpell(item, uses, level, name)
+    local stats = item and item.stats
+    if not stats then
+        return false
+    end
+
+    local record = encodeIdentifiedSpell(uses, level, name)
+    if not record then
+        return false
+    end
+
+    local existing = tostring(stats[invStatFieldSpells] or "")
+    stats[invStatFieldSpells] = existing == "" and record or (existing .. "\n" .. record)
+    stats[invStatFieldSpellUses] = math.max(0, math.floor(tonumber(uses) or 0))
+    stats[invStatFieldSpellLevel] = math.max(0, math.floor(tonumber(level) or 0))
+    stats[invStatFieldSpellName] = trimSpellText(name)
+    stats[invStatFieldSpellListVersion] = inv.items.consumableSpellListVersion
+    if inv.items.isStaveType(stats[invStatFieldType]) then
+        local chargeCount = math.max(0, math.floor(tonumber(uses) or 0))
+        stats[invStatFieldCharges] = chargeCount
+        stats[invStatFieldChargeKnown] = true
+        stats[invStatFieldChargeDirty] = false
+        stats[invStatFieldChargeSource] = "identify"
+        stats[invStatFieldChargeObservedAt] = os.time()
+        stats[invStatFieldChargeRevision] = (tonumber(stats[invStatFieldChargeRevision]) or 0) + 1
+    end
+    return true
+end
+
+function inv.items.getIdentifiedSpells(itemOrStats)
+    local stats = itemOrStats and (itemOrStats.stats or itemOrStats) or {}
+    local spells = {}
+    local stored = tostring(stats[invStatFieldSpells] or "")
+
+    for record in (stored .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+        local uses, level, name = record:match("^%s*(%d+)%s+uses?%s+of%s+level%s+(%d+)%s+'(.*)'%s*$")
+        name = trimSpellText(name)
+        if uses and level and name ~= "" then
+            table.insert(spells, {
+                uses = tonumber(uses) or 0,
+                level = tonumber(level) or 0,
+                name = name,
+            })
+        end
+    end
+
+    -- Backward compatibility for records created before complete spell lists
+    -- were collected.  These are still reportable while their cache entry is
+    -- waiting to be refreshed.
+    if #spells == 0 then
+        local legacyName = trimSpellText(stats[invStatFieldSpellName])
+        if legacyName ~= "" then
+            table.insert(spells, {
+                uses = tonumber(stats[invStatFieldSpellUses]) or 0,
+                level = tonumber(stats[invStatFieldSpellLevel]) or 0,
+                name = legacyName,
+            })
+        end
+    end
+
+
+    -- The encoded spell list describes what the stave casts. Its use count is
+    -- only a compatibility representation; current charges live separately.
+    if inv.items.isStaveType(stats[invStatFieldType] or stats.type)
+        and stats[invStatFieldChargeKnown] == true
+        and tonumber(stats[invStatFieldCharges]) ~= nil then
+        for _, spell in ipairs(spells) do
+            spell.uses = math.max(0, math.floor(tonumber(stats[invStatFieldCharges]) or 0))
+        end
+    end
+
+    return spells
+end
+
+----------------------------------------------------------------------------------------------------
+-- Per-object stave charge state
+----------------------------------------------------------------------------------------------------
+
+inv.items.chargeReservations = inv.items.chargeReservations or {}
+inv.items.nextChargeReservationId = tonumber(inv.items.nextChargeReservationId) or 0
+
+local function chargeBoolean(value)
+    return value == true or value == 1 or tostring(value):lower() == "true"
+end
+
+local function rewriteStaveSpellUses(stats, chargeCount)
+    local records = {}
+    for _, spell in ipairs(inv.items.getIdentifiedSpells(stats)) do
+        local record = encodeIdentifiedSpell(chargeCount, spell.level, spell.name)
+        if record then table.insert(records, record) end
+    end
+    if #records > 0 then
+        stats[invStatFieldSpells] = table.concat(records, "\n")
+    end
+    stats[invStatFieldSpellUses] = chargeCount
+end
+
+function inv.items.getStaveChargeState(objId)
+    local key = tostring(objId or "")
+    local item = key ~= "" and inv.items.getItem(key) or nil
+    if not item or not item.stats then
+        return nil, "NOT_FOUND", "Item was not found in DINV."
+    end
+    local stats = item.stats
+    if not inv.items.isStaveType(stats[invStatFieldType]) then
+        return nil, "WRONG_TYPE", "Item is not a stave."
+    end
+
+    local reservation = inv.items.chargeReservations[key]
+    local known = chargeBoolean(stats[invStatFieldChargeKnown])
+        and tonumber(stats[invStatFieldCharges]) ~= nil
+    local charges = known and math.max(0, math.floor(tonumber(stats[invStatFieldCharges]) or 0)) or nil
+    return {
+        id = key,
+        charges = charges,
+        known = known,
+        dirty = chargeBoolean(stats[invStatFieldChargeDirty]),
+        source = tostring(stats[invStatFieldChargeSource] or ""),
+        observedAt = tonumber(stats[invStatFieldChargeObservedAt]),
+        revision = tonumber(stats[invStatFieldChargeRevision]) or 0,
+        pending = reservation ~= nil,
+        reservationToken = reservation and reservation.token or nil,
+        floor = reservation and reservation.floor or nil,
+    }
+end
+
+function inv.items.observeStaveCharges(objId, charges, source, expectedRevision)
+    local key = tostring(objId or "")
+    local item = key ~= "" and inv.items.getItem(key) or nil
+    if not item or not item.stats then
+        return nil, "NOT_FOUND", "Item was not found in DINV."
+    end
+    if not inv.items.isStaveType(item.stats[invStatFieldType]) then
+        return nil, "WRONG_TYPE", "Item is not a stave."
+    end
+
+    local count = tonumber(charges)
+    if count == nil or count < 0 or count ~= math.floor(count) then
+        return nil, "INVALID_ARGUMENT", "charges must be a non-negative integer."
+    end
+    local currentRevision = tonumber(item.stats[invStatFieldChargeRevision]) or 0
+    if expectedRevision ~= nil and tonumber(expectedRevision) ~= currentRevision then
+        return nil, "STALE_VERSION", "Stave charge state changed before this observation was applied."
+    end
+
+    item.stats[invStatFieldCharges] = count
+    item.stats[invStatFieldChargeKnown] = true
+    item.stats[invStatFieldChargeDirty] = false
+    item.stats[invStatFieldChargeSource] = tostring(source or "observed-output")
+    item.stats[invStatFieldChargeObservedAt] = os.time()
+    item.stats[invStatFieldChargeRevision] = currentRevision + 1
+    rewriteStaveSpellUses(item.stats, count)
+    inv.items.chargeReservations[key] = nil
+    inv.items.setItem(key, item)
+    inv.items.save()
+    return inv.items.getStaveChargeState(key)
+end
+
+function inv.items.markStaveChargesUnknown(objId, source)
+    local key = tostring(objId or "")
+    local item = key ~= "" and inv.items.getItem(key) or nil
+    if not item or not item.stats then
+        return nil, "NOT_FOUND", "Item was not found in DINV."
+    end
+    if not inv.items.isStaveType(item.stats[invStatFieldType]) then
+        return nil, "WRONG_TYPE", "Item is not a stave."
+    end
+    item.stats[invStatFieldChargeKnown] = false
+    item.stats[invStatFieldChargeDirty] = true
+    item.stats[invStatFieldChargeSource] = tostring(source or "unknown")
+    item.stats[invStatFieldChargeObservedAt] = os.time()
+    item.stats[invStatFieldChargeRevision] = (tonumber(item.stats[invStatFieldChargeRevision]) or 0) + 1
+    inv.items.chargeReservations[key] = nil
+    inv.items.setItem(key, item)
+    inv.items.save()
+    return inv.items.getStaveChargeState(key)
+end
+
+function inv.items.reserveStaveChargeUse(objId, floor, expectedRevision)
+    local key = tostring(objId or "")
+    local state, code, message = inv.items.getStaveChargeState(key)
+    if not state then return nil, code, message end
+    if not state.known or state.dirty then
+        return nil, "UNKNOWN_CHARGES", "Stave charges are unknown or require identification."
+    end
+    if state.pending then
+        return nil, "USE_ALREADY_PENDING", "A brandish result is already pending for this stave."
+    end
+    if expectedRevision ~= nil and tonumber(expectedRevision) ~= state.revision then
+        return nil, "STALE_VERSION", "Stave charge state changed before use was reserved."
+    end
+
+    local minimum = math.max(0, math.floor(tonumber(floor) or 1))
+    if state.charges <= minimum then
+        return nil, "AT_CHARGE_FLOOR", "Stave is already at the configured charge floor."
+    end
+
+    inv.items.nextChargeReservationId = inv.items.nextChargeReservationId + 1
+    local token = string.format("stave-%s-%d", key, inv.items.nextChargeReservationId)
+    inv.items.chargeReservations[key] = {
+        token = token,
+        floor = minimum,
+        revision = state.revision,
+        createdAt = os.time(),
+    }
+    state.pending = true
+    state.reservationToken = token
+    state.floor = minimum
+    return state
+end
+
+function inv.items.cancelStaveChargeUse(objId, token, markUnknown, source)
+    local key = tostring(objId or "")
+    local reservation = inv.items.chargeReservations[key]
+    if not reservation then
+        return nil, "NOT_ACTIVE", "No pending stave use exists."
+    end
+    if token ~= nil and tostring(token) ~= tostring(reservation.token) then
+        return nil, "STALE_VERSION", "Reservation token does not match the pending stave use."
+    end
+    inv.items.chargeReservations[key] = nil
+    if markUnknown == true then
+        return inv.items.markStaveChargesUnknown(key, source or "missing-brandish-result")
+    end
+    return inv.items.getStaveChargeState(key)
+end
+
+function inv.items.hasCurrentConsumableData(itemOrStats)
+    local stats = itemOrStats and (itemOrStats.stats or itemOrStats) or {}
+    local itemType = stats[invStatFieldType]
+    if inv.items.isSpellConsumableType(itemType) then
+        return tonumber(stats[invStatFieldSpellListVersion]) == inv.items.consumableSpellListVersion
+    end
+    if inv.items.isDrinkType(itemType) then
+        return tonumber(stats[invStatFieldDrinkDataVersion]) == inv.items.consumableDrinkDataVersion
+    end
+    return true
+end
+
 function inv.items.getEffectTextFromStats(itemStats)
     local stats = itemStats or {}
+    local equipmentSpellText = ""
+    if not inv.items.isSpellConsumableType(stats[invStatFieldType] or stats.type) then
+        equipmentSpellText = tostring(stats[invStatFieldSpells] or stats.spells or "")
+    end
     local parts = {
         tostring(stats[invStatFieldAffects] or stats.affects or ""),
         tostring(stats[invStatFieldAffectMods] or stats.affectMods or ""),
-        tostring(stats[invStatFieldSpells] or stats.spells or ""),
+        equipmentSpellText,
         tostring(stats[invStatFieldFlags] or stats.flags or ""),
     }
 
@@ -146,6 +463,7 @@ inv.items.refreshIdentifyPartials = inv.items.refreshIdentifyPartials or false
 inv.items.partialIdentifyMode = inv.items.partialIdentifyMode or false
 inv.items.identifyPartialOnly = inv.items.identifyPartialOnly or false
 inv.items.deferredIdentifyQueue = inv.items.deferredIdentifyQueue or {}
+inv.items.identifyReturnToKeyring = inv.items.identifyReturnToKeyring or nil
 inv.items.eventSequence = inv.items.eventSequence or 0
 inv.items.refreshGeneration = inv.items.refreshGeneration or 0
 inv.items.databaseBuildId = inv.items.databaseBuildId or nil
@@ -387,18 +705,99 @@ function sendSilent(cmd)
     end
 end
 
-function inv.items.runReportFromLink(objId)
+local function normalizeReportPopupChannel(channel)
+    local normalized = tostring(channel or "echo"):gsub("^%s+", ""):gsub("%s+$", "")
+    local lower = normalized:lower()
+    if normalized == "" or lower == "default" or lower == "echo" then
+        return "echo"
+    end
+    if lower == "group" then
+        return "gtell"
+    end
+    return normalized
+end
+
+local function reportPopupChannelLabel(channel)
+    local normalized = normalizeReportPopupChannel(channel)
+    local lower = normalized:lower()
+    if lower == "echo" then
+        return "Echo"
+    end
+    if lower == "gtell" then
+        return "Group"
+    end
+    return normalized:gsub("^%l", string.upper)
+end
+
+function inv.items.echoReportChannelPopup(triggerText, reporter, tooltipPrefix, leftClickAction, leftClickHint)
+    if type(cechoPopup) ~= "function" or type(reporter) ~= "function" then
+        return false
+    end
+
+    local configuredChannel = inv.report and inv.report.getChannel and inv.report.getChannel() or "echo"
+    configuredChannel = normalizeReportPopupChannel(configuredChannel)
+    local defaultLabel = reportPopupChannelLabel(configuredChannel)
+    local label = tostring(triggerText or "")
+    local plainLabel = label:gsub("<%a[^>]*>", "")
+    local primaryAction = leftClickAction or function()
+        reporter(configuredChannel)
+    end
+    local primaryHint = leftClickHint or
+        (tostring(tooltipPrefix or "Left-click: report this via ") .. defaultLabel)
+
+    cechoPopup(
+        label,
+        {
+            primaryAction,
+            "",
+            function() reporter(configuredChannel) end,
+            "",
+            function() reporter("clan") end,
+            "",
+            function() reporter("say") end,
+            "",
+            function() reporter("gtell") end,
+        },
+        {
+            primaryHint .. "\nRight-click for other channels",
+            plainLabel,
+            "",
+            defaultLabel,
+            "",
+            "Clan",
+            "",
+            "Say",
+            "",
+            "Group",
+        },
+        true
+    )
+    return true
+end
+
+function inv.items.runReportFromLink(objId, channel)
     local itemId = tostring(objId or "")
     if itemId == "" then
         return
     end
 
     if inv.report and inv.report.reportItemIds then
-        return inv.report.reportItemIds({ itemId })
+        local targetChannel = channel ~= nil and normalizeReportPopupChannel(channel) or nil
+        return inv.report.reportItemIds({ itemId }, targetChannel)
     else
         dbot.warn("inv.items.runReportFromLink: report module is unavailable")
         return DRL_RET_UNINITIALIZED
     end
+end
+
+function inv.items.runReportLineFromLink(line, channel)
+    if inv.report and inv.report.sendLine then
+        local targetChannel = channel ~= nil and normalizeReportPopupChannel(channel) or nil
+        return inv.report.sendLine(tostring(line or ""), targetChannel)
+    end
+
+    dbot.warn("inv.items.runReportLineFromLink: report module is unavailable")
+    return DRL_RET_UNINITIALIZED
 end
 
 -- Item type lookup table (numeric ID -> string name)
@@ -474,6 +873,7 @@ inv.items.identifyQueue = {}
 inv.items.identifyInProgress = false
 inv.items.identifyCurrentId = nil
 inv.items.identifyCurrentContainer = nil
+inv.items.identifyReturnToKeyring = nil
 inv.items.identifyWaitForInvmon = nil
 inv.items.identifyWaitForFence = nil
 inv.items.identifyResetId = nil
@@ -539,6 +939,32 @@ function inv.items.ensureKeywordsField(item)
     -- No normalization or name-derived fallback should happen here.
 end
 
+function inv.items.resetIdentifySpellFields(item)
+    if not item or not item.stats then
+        return
+    end
+
+    item.stats[invStatFieldSpells] = nil
+    item.stats[invStatFieldSpellUses] = nil
+    item.stats[invStatFieldSpellLevel] = nil
+    item.stats[invStatFieldSpellName] = nil
+    item.stats[invStatFieldSpellListVersion] = nil
+    if inv.items.isStaveType(item.stats[invStatFieldType]) then
+        item.stats[invStatFieldCharges] = nil
+        item.stats[invStatFieldChargeKnown] = false
+        item.stats[invStatFieldChargeDirty] = true
+        item.stats[invStatFieldChargeSource] = "identify-pending"
+        item.stats[invStatFieldChargeObservedAt] = nil
+    else
+        item.stats[invStatFieldCharges] = nil
+        item.stats[invStatFieldChargeKnown] = nil
+        item.stats[invStatFieldChargeDirty] = nil
+        item.stats[invStatFieldChargeSource] = nil
+        item.stats[invStatFieldChargeObservedAt] = nil
+        item.stats[invStatFieldChargeRevision] = nil
+    end
+end
+
 function inv.items.resetIdentifyStats(item)
     if not item or not item.stats then
         return
@@ -547,6 +973,11 @@ function inv.items.resetIdentifyStats(item)
     for _, field in ipairs(inv.items.identifyAdditiveFields) do
         item.stats[field] = 0
     end
+
+    item.stats[invStatFieldServings] = nil
+    item.stats[invStatFieldLiquid] = nil
+    item.stats[invStatFieldDrinkDataVersion] = nil
+    inv.items.resetIdentifySpellFields(item)
 end
 
 function inv.items.resetIdentifyEnchantFields(item)
@@ -712,6 +1143,11 @@ function inv.items.normalizePersistentItem(item)
     local stats = item and item.stats
     if not stats then return false end
     local changed = false
+    local normalizedType = inv.items.normalizeItemType(stats[invStatFieldType])
+    if normalizedType ~= tostring(stats[invStatFieldType] or "") then
+        stats[invStatFieldType] = normalizedType
+        changed = true
+    end
     local loc = tostring(stats[invStatFieldLocation] or "")
     local wornLoc = tostring(stats[invStatFieldWorn] or "")
 
@@ -742,6 +1178,33 @@ function inv.items.normalizePersistentItem(item)
         stats[invStatFieldLocation] = invItemLocKeyring or "keyring"
         stats[invStatFieldContainer] = invItemLocKeyring or "keyring"
         changed = true
+    end
+    if stats.identifyLevel == invIdLevelFull
+        and not inv.items.hasCurrentConsumableData(stats) then
+        stats.identifyLevel = invIdLevelPartial
+        changed = true
+    end
+    if inv.items.isStaveType(stats[invStatFieldType]) then
+        local chargeCount = tonumber(stats[invStatFieldCharges])
+        if chargeBoolean(stats[invStatFieldChargeKnown]) and chargeCount ~= nil then
+            local normalizedCharges = math.max(0, math.floor(chargeCount))
+            if stats[invStatFieldCharges] ~= normalizedCharges then
+                stats[invStatFieldCharges] = normalizedCharges
+                changed = true
+            end
+            if stats[invStatFieldChargeKnown] ~= true then
+                stats[invStatFieldChargeKnown] = true
+                changed = true
+            end
+        elseif stats[invStatFieldChargeKnown] ~= false
+            or stats[invStatFieldChargeDirty] ~= true then
+            -- Legacy stave entries may have inherited spelluses from a
+            -- same-name cache template. Do not treat that value as exact.
+            stats[invStatFieldChargeKnown] = false
+            stats[invStatFieldChargeDirty] = true
+            stats[invStatFieldChargeSource] = "legacy-unverified"
+            changed = true
+        end
     end
     return changed
 end
@@ -1691,7 +2154,7 @@ function inv.items.build(endTag)
     cecho("<white>  1. Scan all worn equipment (eqdata)\n")
     cecho("<white>  2. Scan main inventory (invdata)\n")
     cecho("<white>  3. Scan all containers and keyring data\n")
-    cecho("<white>  4. Identify each non-keyring item (get from container if needed)\n")
+    cecho("<white>  4. Identify non-keyring items, then partial keyring items as one batch\n")
     cecho("\n")
     cecho("<yellow>  Please wait... This may take several minutes.\n")
     cecho("<yellow>  To abort: dinv build abort\n")
@@ -2054,12 +2517,21 @@ function inv.items.processDeferredIdentifyQueue(source)
     inv.items.deferredIdentifyQueue = inv.items.deferredIdentifyQueue or {}
     while #inv.items.deferredIdentifyQueue > 0 do
         local queuedObjId = table.remove(inv.items.deferredIdentifyQueue, 1)
-        if inv.items.getItem(queuedObjId) then
+        local queuedItem = inv.items.getItem(queuedObjId)
+        local identifyLevel = queuedItem and queuedItem.stats
+            and queuedItem.stats.identifyLevel or nil
+        if queuedItem and identifyLevel ~= invIdLevelFull then
             local retval = inv.items.buildSingleItem(queuedObjId, tostring(source or "deferred"))
             if retval == DRL_RET_BUSY or retval == DRL_RET_IN_COMBAT then
                 table.insert(inv.items.deferredIdentifyQueue, 1, queuedObjId)
+                return retval
+            elseif retval ~= DRL_RET_SUCCESS then
+                dbot.debug("processDeferredIdentifyQueue: unable to queue objId="
+                    .. tostring(queuedObjId) .. " retval=" .. tostring(retval), "inv.items")
             end
-            return retval
+        elseif queuedItem then
+            dbot.debug("processDeferredIdentifyQueue: skipping already full objId="
+                .. tostring(queuedObjId), "inv.items")
         end
     end
 
@@ -2083,6 +2555,28 @@ function inv.items.scheduleDeferredIdentifyProcessing(source)
         processQueue()
     end
     return DRL_RET_SUCCESS
+end
+
+function inv.items.queueKeyIdentificationIfNeeded(objId, source)
+    local normalizedObjId = tostring(objId or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if normalizedObjId == "" then return false end
+    local item = inv.items.getItem(normalizedObjId)
+    local stats = item and item.stats or nil
+    if not stats or stats.identifyLevel == invIdLevelFull then return false end
+    if not inv.items.isKeyItem(item) and not inv.items.isKeyringItem(item) then return false end
+    if inv.items.identifyInProgress
+        and tostring(inv.items.identifyCurrentId or "") == normalizedObjId then
+        return true
+    end
+
+    inv.items.enqueueDeferredIdentify(normalizedObjId, source or "automatic key identify")
+    if not inv.items.buildInProgress and not inv.items.refreshInProgress
+        and not inv.items.identifyInProgress then
+        inv.items.scheduleDeferredIdentifyProcessing(source or "automatic key identify")
+    end
+    dbot.debug("Queued full key identify objId=" .. normalizedObjId
+        .. " source=" .. tostring(source), "inv.items")
+    return true
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -2652,6 +3146,8 @@ inv.items.statSearchFieldKinds = {
     [invStatFieldDisease] = "numeric",
     [invStatFieldPoison] = "numeric",
     [invStatFieldAveDam] = "numeric",
+    [invStatFieldServings] = "numeric",
+    [invStatFieldLiquid] = "text",
     [invStatFieldIlluminate] = "enchant",
     [invStatFieldResonate] = "enchant",
     [invStatFieldSolidify] = "enchant",
@@ -2830,13 +3326,20 @@ function inv.items.parseStatSearchQuery(query)
             return nil, tokenError
         end
 
+        if tokens[1] and tostring(tokens[1].value or ""):lower() == "stat" then
+            table.remove(tokens, 1)
+        end
+        if #tokens == 0 then
+            return nil, "Each 'stat' marker must be followed by a stat expression."
+        end
+
         local predicates = {}
         local index = 1
         while index <= #tokens do
             local keyToken = tokens[index]
             local key = tostring(keyToken.value or ""):lower()
             if key == "stat" then
-                return nil, "'stat' is the search mode and should appear only once, immediately after 'dinv search'."
+                return nil, "Use '|| stat' between alternative stat expressions."
             end
             if key:sub(1, 1) == "~" then
                 return nil, "Negation is not supported in stat mode; use an explicit comparison instead."
@@ -2881,14 +3384,25 @@ function inv.items.parseStatSearchQuery(query)
                 local nextToken = tokens[index]
                 if nextToken then
                     local nextKey = tostring(nextToken.value or ""):lower()
-                    if nextToken.quoted then
+                    local comparison, nextIndex, comparisonError, comparisonSeen =
+                        consumeStatSearchComparison(tokens, index, key)
+                    if comparisonError then
+                        return nil, comparisonError
+                    elseif comparisonSeen then
+                        predicate.comparison = comparison
+                        index = nextIndex
+                    elseif nextKey == "stat" then
+                        return nil, "Use '|| stat' between alternative stat expressions."
+                    elseif nextToken.quoted
+                        or not inv.items.statSearchFieldKinds[nextKey]
+                        or inv.items.statSearchFieldKinds[nextKey] == "numeric" then
                         predicate.selector = trimStatSearchText(nextToken.value):lower()
                         if predicate.selector == "" then
                             return nil, "The text selector for stat '" .. key .. "' cannot be empty."
                         end
                         index = index + 1
 
-                        local comparison, nextIndex, comparisonError, comparisonSeen =
+                        comparison, nextIndex, comparisonError, comparisonSeen =
                             consumeStatSearchComparison(tokens, index, key)
                         if comparisonError then
                             return nil, comparisonError
@@ -2900,22 +3414,8 @@ function inv.items.parseStatSearchQuery(query)
                             return nil, "Unexpected value '" .. tostring(tokens[index].value) ..
                                 "' after selector for stat '" .. key .. "'."
                         end
-                    elseif inv.items.statSearchFieldKinds[nextKey] then
-                        -- An unquoted following stat key starts another bare predicate.
-                    elseif nextKey == "stat" then
-                        return nil, "'stat' is the search mode and should not be repeated inside the query."
                     else
-                        local comparison, nextIndex, comparisonError, comparisonSeen =
-                            consumeStatSearchComparison(tokens, index, key)
-                        if comparisonError then
-                            return nil, comparisonError
-                        elseif comparisonSeen then
-                            predicate.comparison = comparison
-                            index = nextIndex
-                        else
-                            return nil, "Text selectors for stat '" .. key ..
-                                "' must be quoted, for example: " .. key .. " \"hit roll\"."
-                        end
+                        -- A following enchant field starts another bare predicate.
                     end
                 end
             end
@@ -3125,15 +3625,30 @@ function inv.items.applyCachedStats(item)
         [invStatFieldLastStored] = true,
         [invStatFieldKeepflag] = true,
         [invStatFieldTimer] = true,
+        [invStatFieldCharges] = true,
+        [invStatFieldChargeKnown] = true,
+        [invStatFieldChargeDirty] = true,
+        [invStatFieldChargeSource] = true,
+        [invStatFieldChargeObservedAt] = true,
+        [invStatFieldChargeRevision] = true,
+    }
+    local exactObjectFields = {
+        [invStatFieldCharges] = true,
+        [invStatFieldChargeKnown] = true,
+        [invStatFieldChargeDirty] = true,
+        [invStatFieldChargeSource] = true,
+        [invStatFieldChargeObservedAt] = true,
+        [invStatFieldChargeRevision] = true,
     }
 
     -- A resumed full build may reuse a full record for the exact same object ID.
     -- This is staged build recovery, not a cross-object stat template.
     local staged = itemId and inv.items.buildResumeItems
         and inv.items.buildResumeItems[tostring(itemId)] or nil
-    if staged and staged.stats and staged.stats.identifyLevel == invIdLevelFull then
+    if staged and staged.stats and staged.stats.identifyLevel == invIdLevelFull
+        and inv.items.hasCurrentConsumableData(staged.stats) then
         for key, value in pairs(staged.stats) do
-            if not dynamicFields[key] then
+            if not dynamicFields[key] or exactObjectFields[key] then
                 item.stats[key] = value
             end
         end
@@ -3148,7 +3663,8 @@ function inv.items.applyCachedStats(item)
 
     if DINV and DINV.database and DINV.database.loadConsumableTemplate then
         local template = DINV.database.loadConsumableTemplate(item)
-        if template and template.stats and template.stats.identifyLevel == invIdLevelFull then
+        if template and template.stats and template.stats.identifyLevel == invIdLevelFull
+            and inv.items.hasCurrentConsumableData(template.stats) then
             for key, value in pairs(template.stats) do
                 if not dynamicFields[key] then
                     item.stats[key] = value
@@ -3165,7 +3681,8 @@ function inv.items.applyCachedStats(item)
 
     if itemId then
         local cached = inv.cache.get("recent", tostring(itemId))
-        if cached and cached.stats and cached.stats.identifyLevel == invIdLevelFull then
+        if cached and cached.stats and cached.stats.identifyLevel == invIdLevelFull
+            and inv.items.hasCurrentConsumableData(cached.stats) then
             dbot.debug("Cache hit (recent) for ID: " .. tostring(itemId), "inv.items")
             for k, v in pairs(cached.stats) do
                 if k ~= invStatFieldId then
@@ -3190,7 +3707,8 @@ function inv.items.applyCachedStats(item)
                 local cached = inv.cache.get("frequent", nameKey)
                 if cached and cached.stats then
                     local cachedIdentify = cached.stats.identifyLevel or invIdLevelNone
-                    if cachedIdentify == invIdLevelFull then
+                    if cachedIdentify == invIdLevelFull
+                        and inv.items.hasCurrentConsumableData(cached.stats) then
                         dbot.debug("Cache hit (frequent) for: " .. nameKey, "inv.items")
                         for k, v in pairs(cached.stats) do
                             if k ~= invStatFieldId then
@@ -3248,6 +3766,9 @@ function inv.items.getFrequentCacheKeys(item)
         end
     end
     local typeName = tostring(item.stats[invStatFieldType] or ""):lower()
+    if typeName == "drink container" then
+        typeName = "drink"
+    end
     if typeName == "" then
         return nil
     end
@@ -3274,8 +3795,9 @@ function inv.items.isFrequentCacheType(itemType)
     return typeName == "potion"
         or typeName == "pill"
         or typeName == "food"
+        or typeName == "drink"
+        or typeName == "drink container"
         or typeName == "wand"
-        or typeName == "stave"
         or typeName == "scroll"
 end
 
@@ -3659,7 +4181,13 @@ function inv.items.onKeyringData(dataLine)
         dbot.debug("Skipping keyring data during identify phase", "inv.items")
         return DRL_RET_SUCCESS
     end
-    return inv.items._parseDataLine(dataLine, "keyring")
+    local workflowActive = inv.items.buildInProgress or inv.items.refreshInProgress
+    local result = inv.items._parseDataLine(dataLine, "keyring")
+    local objId = tostring(dataLine or ""):match("^(%d+),")
+    if workflowActive and result == DRL_RET_SUCCESS and objId then
+        inv.items.queueKeyIdentificationIfNeeded(objId, "keyring data")
+    end
+    return result
 end
 
 function inv.items.onInvitem(dataLine)
@@ -3691,15 +4219,10 @@ function inv.items.onInvitem(dataLine)
         end
     end
 
-    if objId then
-        local item = inv.items.getItem(objId)
-        local idLevel = item and item.stats and item.stats.identifyLevel
-        if idLevel ~= invIdLevelFull then
-            dbot.debug("onInvitem: stored partial item data; full identify deferred to build/refresh", "inv.items")
-        end
-    end
-
     inv.items.scheduleSaveFromInvmon()
+    if result == DRL_RET_SUCCESS and objId and raiseEvent then
+        raiseEvent("DINV.itemObserved", tostring(objId))
+    end
     return result
 end
 
@@ -4561,12 +5084,19 @@ function inv.items.startIdentification()
     for objId, item in pairs(inv.items.table or {}) do
         local idLevel = item.stats and item.stats.identifyLevel
         local isKeyringItem = inv.items.isKeyringItem(item)
+        local isDirtyStave = item.stats and inv.items.isStaveType(item.stats[invStatFieldType])
+            and (not chargeBoolean(item.stats[invStatFieldChargeKnown])
+                or chargeBoolean(item.stats[invStatFieldChargeDirty]))
 
-        -- Keyring data is the terminal level of detail for keyring members.
-        -- They remain queryable as partial records but are never retrieved or
-        -- identified by mass build/refresh workflows.
+        -- Keyring members are excluded from this main pass. The keyring scan
+        -- stages its partial IDs in the deferred queue, which runs as one
+        -- get/identify/put batch after build/refresh completes.
         if not isKeyringItem then
-            if inv.items.forceIdentify then
+            if isDirtyStave then
+                -- Charge state is per object. A full-but-dirty stave must be
+                -- appraised again during the next DINV identification pass.
+                table.insert(inv.items.identifyQueue, objId)
+            elseif inv.items.forceIdentify then
                 table.insert(inv.items.identifyQueue, objId)
             elseif inv.items.identifyPartialOnly then
                 if idLevel == invIdLevelPartial then
@@ -4630,6 +5160,7 @@ function inv.items.identifyNext()
 
     inv.items.identifyWaitForInvmon = nil
     inv.items.identifyWaitForFence = nil
+    inv.items.identifyReturnToKeyring = nil
 
     local queue = inv.items.identifyQueue or {}
     local nextIndex = (inv.items.identifyIndex or 0) + 1
@@ -4733,7 +5264,12 @@ function inv.items.identifyNext()
     end
 
     local normalizedContainerId = inv.items.normalizeContainerId(containerId)
-    if normalizedContainerId then
+    if inv.items.isKeyringItem(item) then
+        -- Keyring objects must be retrieved before Aardwolf will expose a full
+        -- identify, then restored after the identify fence completes.
+        inv.items.identifyCurrentContainer = nil
+        inv.items.identifyFromKeyring(objId)
+    elseif normalizedContainerId then
         -- Item is in a container
         inv.items.identifyCurrentContainer = normalizedContainerId
         inv.items.identifyFromContainer(objId, normalizedContainerId)
@@ -4746,6 +5282,40 @@ function inv.items.identifyNext()
         inv.items.identifyCurrentContainer = nil
         inv.items.identifyDirect(objId, false)
     end
+end
+
+function inv.items.identifyFromKeyring(objId)
+    objId = tostring(objId or "")
+    if objId == "" then
+        tempTimer(0.1, function()
+            if inv.items.buildInProgress and inv.items.identifyInProgress then
+                inv.items.identifyNext()
+            end
+        end)
+        return
+    end
+
+    inv.items.identifyReturnToKeyring = true
+    inv.items.identifyWaitForInvmon = {
+        objId = objId,
+        action = invmonActionGetFromKeyring,
+        nextStep = "identify",
+        returnToKeyring = true,
+    }
+
+    dbot.debug("Identify from keyring: keyring get " .. objId, "inv.items")
+    sendSilent("keyring get " .. objId)
+
+    local expectedObjId = objId
+    tempTimer(2.0, function()
+        local waitState = inv.items.identifyWaitForInvmon
+        if not waitState or tostring(waitState.objId or "") ~= expectedObjId
+            or tonumber(waitState.action) ~= tonumber(invmonActionGetFromKeyring) then
+            return
+        end
+        dbot.debug("identifyFromKeyring timeout: retrieval was not confirmed", "inv.items")
+        inv.items.handleIdentifyGetFailure("keyring retrieval timeout")
+    end)
 end
 
 function inv.items.identifyDirect(objId, isWorn, containerId)
@@ -4761,6 +5331,7 @@ function inv.items.identifyDirect(objId, isWorn, containerId)
     inv.items.identifyWaitForFence = {
         objId = objId,
         containerId = containerId,
+        returnToKeyring = inv.items.identifyReturnToKeyring == true,
         nextStep = "advance"
     }
 
@@ -4777,6 +5348,7 @@ function inv.items.prepareIdentify(objId)
     item.stats = item.stats or {}
     item.stats.identifyLevel = invIdLevelNone
     inv.items.resetIdentifyEnchantFields(item)
+    inv.items.resetIdentifySpellFields(item)
 
     local resetFields = {
         invStatFieldStr,
@@ -4905,6 +5477,7 @@ function inv.items.handleIdentifyGetFailure(reason)
     -- Remember the container for putting back later
     local containerId = inv.items.normalizeContainerId(waitState.containerId)
     inv.items.identifyCurrentContainer = containerId
+    inv.items.identifyReturnToKeyring = waitState.returnToKeyring == true
 
     dbot.debug("handleIdentifyGetFailure: Falling back to direct identify for objId=" .. tostring(objId), "inv.items")
 
@@ -4944,6 +5517,8 @@ function inv.items.handleIdentifyFence(fallbackObjId)
     inv.items.identifyWaitForFence = nil
 
     local objId = tostring(waitState.objId or "")
+    local returnToKeyring = waitState.returnToKeyring == true
+        or inv.items.identifyReturnToKeyring == true
     local targetContainer = inv.items.normalizeContainerId(waitState.containerId)
         or inv.items.normalizeContainerId(inv.items.identifyCurrentContainer)
 
@@ -4979,6 +5554,12 @@ function inv.items.handleIdentifyFence(fallbackObjId)
             inv.items.identifySawOutput[objId] = nil
         end
         dbot.debug("handleIdentifyFence: no identify output for hydrated objId=" .. tostring(objId) .. "; keeping invdata only", "inv.items")
+    elseif returnToKeyring and not sawIdentifyOutput then
+        if item and item.stats then
+            item.stats.identifyLevel = invIdLevelPartial
+            inv.items.setItem(objId, item)
+        end
+        dbot.debug("handleIdentifyFence: keyring item produced no identify output; keeping it partial", "inv.items")
     elseif item and item.stats then
         item.stats.identifyLevel = invIdLevelFull
         inv.items.ensureKeywordsField(item)
@@ -5007,6 +5588,42 @@ function inv.items.handleIdentifyFence(fallbackObjId)
         if inv.items.cacheIdentifiedItem then
             inv.items.cacheIdentifiedItem(item)
         end
+    end
+
+    -- If the item came from the keyring, restore it there before completing
+    -- the targeted identify operation.
+    if returnToKeyring then
+        dbot.debug("handleIdentifyFence: Returning item to keyring", "inv.items")
+        tempTimer(0.3, function()
+            if not inv.items.buildInProgress or not inv.items.identifyInProgress then
+                return
+            end
+
+            inv.items.identifyWaitForInvmon = {
+                objId = objId,
+                action = invmonActionPutIntoKeyring,
+                nextStep = "advance",
+            }
+            sendSilent("keyring put " .. objId)
+
+            local expectedObjId = objId
+            tempTimer(2.0, function()
+                local putWaitState = inv.items.identifyWaitForInvmon
+                if not putWaitState or tostring(putWaitState.objId or "") ~= expectedObjId
+                    or tonumber(putWaitState.action) ~= tonumber(invmonActionPutIntoKeyring) then
+                    return
+                end
+                dbot.debug("handleIdentifyFence: keyring put timeout, advancing", "inv.items")
+                inv.items.identifyWaitForInvmon = nil
+                inv.items.identifyReturnToKeyring = nil
+                tempTimer(0.1, function()
+                    if inv.items.buildInProgress and inv.items.identifyInProgress then
+                        inv.items.identifyNext()
+                    end
+                end)
+            end)
+        end)
+        return
     end
 
     -- If the item came from a container, put it back
@@ -5049,6 +5666,7 @@ function inv.items.handleIdentifyFence(fallbackObjId)
                 dbot.debug("handleIdentifyFence: Put timeout, advancing anyway", "inv.items")
                 inv.items.identifyWaitForInvmon = nil
                 inv.items.identifyCurrentContainer = nil
+                inv.items.identifyReturnToKeyring = nil
 
                 tempTimer(0.1, function()
                     if inv.items.buildInProgress and inv.items.identifyInProgress then
@@ -5063,6 +5681,7 @@ function inv.items.handleIdentifyFence(fallbackObjId)
     -- Item was not from container, or no container - advance immediately
     dbot.debug("handleIdentifyFence: No container, advancing to next item", "inv.items")
     inv.items.identifyCurrentContainer = nil
+    inv.items.identifyReturnToKeyring = nil
 
     tempTimer(0.1, function()
         if inv.items.buildInProgress and inv.items.identifyInProgress then
@@ -5129,6 +5748,17 @@ function inv.items.buildComplete()
     inv.items.finalizeInlineProgress()
     if inv.items.singleIdentifyMode then
         local singleId = inv.items.singleIdentifyId
+        local completedIds, completedSeen = {}, {}
+        for _, queuedId in ipairs(inv.items.identifyQueue or {}) do
+            local normalizedId = tostring(queuedId or "")
+            if normalizedId ~= "" and not completedSeen[normalizedId] then
+                completedSeen[normalizedId] = true
+                table.insert(completedIds, normalizedId)
+            end
+        end
+        if singleId and not completedSeen[tostring(singleId)] then
+            table.insert(completedIds, tostring(singleId))
+        end
         inv.items.singleIdentifyMode = false
         inv.items.singleIdentifyId = nil
         inv.items.buildInProgress = false
@@ -5154,16 +5784,19 @@ function inv.items.buildComplete()
         if inv.items.save then
             inv.items.save()
         end
-        if raiseEvent and singleId then
-            raiseEvent("DINV.identifyComplete", tostring(singleId))
-        end
-        if DINV and DINV.api and DINV.api._onIdentifyComplete and singleId then
-            pcall(DINV.api._onIdentifyComplete, tostring(singleId))
+        for _, completedId in ipairs(completedIds) do
+            if raiseEvent then
+                raiseEvent("DINV.identifyComplete", completedId)
+            end
+            if DINV and DINV.api and DINV.api._onIdentifyComplete then
+                pcall(DINV.api._onIdentifyComplete, completedId)
+            end
         end
         if inv.consumeWindow and inv.consumeWindow.scheduleRefresh then
             inv.consumeWindow.scheduleRefresh()
         end
-        dbot.debug("buildComplete: single-item identify complete for objId=" .. tostring(singleId), "inv.items")
+        dbot.debug("buildComplete: targeted identify batch complete for objIds="
+            .. table.concat(completedIds, ","), "inv.items")
         inv.items.scheduleDeferredIdentifyProcessing("buildComplete")
         inv.items.maybeStartKeepFlagSync()
         return
@@ -5341,6 +5974,7 @@ function inv.items.buildAbort(options)
     inv.items.eqdataSeen = {}
     inv.items.identifyCurrentId = nil
     inv.items.identifyCurrentContainer = nil
+    inv.items.identifyReturnToKeyring = nil
     inv.items.identifyIndex = nil
     inv.items.forceIdentify = false
     inv.items.partialIdentifyMode = false
@@ -5552,12 +6186,14 @@ function inv.items.onInvmon(dataLine)
                 -- Set up fence wait state
                 inv.items.identifyWaitForFence = {
                     objId = objId,
-                containerId = containerId,
-                nextStep = "put"
-            }
+                    containerId = waitState.returnToKeyring == true and nil or containerId,
+                    returnToKeyring = waitState.returnToKeyring == true,
+                    nextStep = "put"
+                }
 
                 -- Store the current container for putting back later
-                inv.items.identifyCurrentContainer = containerId
+                inv.items.identifyCurrentContainer = waitState.returnToKeyring == true and nil or containerId
+                inv.items.identifyReturnToKeyring = waitState.returnToKeyring == true
 
                 -- Send identify command and fence marker
                 sendSilent("identify " .. objId)
@@ -5568,6 +6204,7 @@ function inv.items.onInvmon(dataLine)
 
                 -- Item was put back, advance to next
                 inv.items.identifyCurrentContainer = nil
+                inv.items.identifyReturnToKeyring = nil
                 tempTimer(0.1, function()
                     if inv.items.buildInProgress and inv.items.identifyInProgress then
                         inv.items.identifyNext()
@@ -5809,6 +6446,7 @@ function inv.items.onInvmon(dataLine)
             ),
             "invmon"
         )
+
     end
 
     if forceImmediateSave and not inv.items.buildInProgress
@@ -6059,7 +6697,8 @@ function inv.items.matchesParsedQuery(objId, clauses)
             local match = false
 
             if key == "type" then
-                match = string.lower(itemType) == string.lower(value)
+                match = inv.items.normalizeItemType(itemType):lower()
+                    == inv.items.normalizeItemType(value):lower()
             elseif key == "name" then
                 local relativeIndex, relativeName = inv.items.convertRelative(value)
                 local target = relativeIndex and relativeName or value
@@ -6328,7 +6967,8 @@ function inv.items.matchesStatSearch(objId, spec)
 end
 
 function inv.items.searchStats(spec, options)
-    local candidates, retval = inv.items.search("", nil, options)
+    options = options or {}
+    local candidates, retval = inv.items.search(options.query or "", nil, options)
     if retval ~= DRL_RET_SUCCESS then
         return {}, retval
     end
@@ -6492,11 +7132,40 @@ function inv.items.displayItem(objId, displayMode, options)
                 if location == "auction" and remainder:sub(1, #auctionLabelPrefix) == auctionLabelPrefix then
                     local linkCommand = string.format("send([[lbid %s]])", tostring(objId))
                     local tooltip = "Run: lbid " .. tostring(objId)
-                    cechoLink(idMudletColor .. formattedId .. "<reset>", linkCommand, tooltip, true)
+                    local frozenReportLine = options and options.reportLine
+                    local popupShown = inv.items.echoReportChannelPopup(
+                        idMudletColor .. formattedId .. "<reset>",
+                        function(channel)
+                            if frozenReportLine then
+                                inv.items.runReportLineFromLink(frozenReportLine, channel)
+                            else
+                                inv.items.runReportFromLink(objId, channel)
+                            end
+                        end,
+                        "Left-click: report this item via ",
+                        function()
+                            if send then
+                                send("lbid " .. tostring(objId))
+                            end
+                        end,
+                        tooltip
+                    )
+                    if not popupShown then
+                        cechoLink(idMudletColor .. formattedId .. "<reset>", linkCommand, tooltip, true)
+                    end
                 elseif location ~= "auction" then
                     local linkCommand = string.format("inv.items.runReportFromLink(%q)", tostring(objId))
                     local tooltip = "Run: dinv report " .. tostring(objId)
-                    cechoLink(idMudletColor .. formattedId .. "<reset>", linkCommand, tooltip, true)
+                    local popupShown = inv.items.echoReportChannelPopup(
+                        idMudletColor .. formattedId .. "<reset>",
+                        function(channel)
+                            inv.items.runReportFromLink(objId, channel)
+                        end,
+                        "Left-click: report this item via "
+                    )
+                    if not popupShown then
+                        cechoLink(idMudletColor .. formattedId .. "<reset>", linkCommand, tooltip, true)
+                    end
                 else
                     cecho(idMudletColor .. formattedId .. "<reset>")
                 end
@@ -6662,55 +7331,98 @@ function inv.items.displayItem(objId, displayMode, options)
         local line
 
         if channelFormat then
-            local levelText = string.format(" [@Wlv%s@w]", tostring(level))
-            local wearBracket = wearableLoc ~= "" and (" [" .. wearableLoc .. "]") or ""
-            local weaponType = ""
-            local weaponDam = ""
-            local weaponDamType = ""
-            if tostring(itemType):lower() == "weapon" then
-                local wType = inv.items.getStatField(objId, invStatFieldWeaponType) or ""
-                if wType ~= "" then
-                    weaponType = " [" .. wType .. "]"
+            local normalizedItemType = tostring(itemType):lower()
+            local identifiedSpells = inv.items.getIdentifiedSpells(item)
+            if inv.items.isDrinkType(normalizedItemType) then
+                local servings = tonumber(inv.items.getStatField(objId, invStatFieldServings))
+                local liquid = dbot.stripColors(tostring(
+                    inv.items.getStatField(objId, invStatFieldLiquid) or ""))
+                liquid = liquid:gsub("[\r\n]", " "):gsub("^%s+", ""):gsub("%s+$", "")
+                local drinkPayload
+                if servings ~= nil and liquid ~= "" then
+                    drinkPayload = string.format("@G%dx @W%s@w", servings, liquid)
+                elseif servings ~= nil then
+                    drinkPayload = string.format("@G%dx@w", servings)
+                elseif liquid ~= "" then
+                    drinkPayload = "@W" .. liquid .. "@w"
+                else
+                    drinkPayload = "@Wcontents unknown@w"
                 end
-                local aveDam = tonumber(inv.items.getStatField(objId, invStatFieldAveDam)) or 0
-                if aveDam ~= 0 then
-                    weaponDam = " [" .. string.format("@G%d@Ddam@w", aveDam) .. "]"
-                end
-                local damType = inv.items.getStatField(objId, invStatFieldDamtype) or ""
-                if damType ~= "" then
-                    weaponDamType = " [" .. damType .. "]"
-                end
-            end
-            local weightBracket = ""
-            if weightText ~= "" then
-                weightBracket = weightText
-            end
-            local scoreBracket = " [@C" .. tostring(score) .. "@W Score@w]"
-            local hrDrBracket = rollText ~= "" and rollText or ""
-            local hpMvMn = buildStatBlock(resourceStats)
-            local risChannel = ""
-            if enchantFlags ~= "" then
-                local risOrder = table.concat({
-                    hasIlluminated, "I@w",
-                    hasResonated, "R@w",
-                    hasSolidified, "S@w",
+                line = table.concat({
+                    "@w", nameText, "@w (@WL", tostring(level),
+                    "@w) @D- ", drinkPayload
                 }, "")
-                risChannel = " [" .. risOrder .. "]"
+            elseif inv.items.isSpellConsumableType(normalizedItemType) and #identifiedSpells > 0 then
+                local spellText = {}
+                for _, spell in ipairs(identifiedSpells) do
+                    table.insert(spellText, string.format(
+                        "@G%s@W(%d)@w",
+                        tostring(spell.name),
+                        tonumber(spell.level) or 0
+                    ))
+                end
+                line = table.concat({
+                    "@w", nameText, "@w (@C", normalizedItemType,
+                    " @WL", tostring(level), "@w) @D- @Wspells: ",
+                    table.concat(spellText, ", ")
+                }, "")
+                if inv.items.isStaveType(normalizedItemType) then
+                    local chargeState = inv.items.getStaveChargeState(objId)
+                    local chargeText = chargeState and chargeState.known and not chargeState.dirty
+                        and tostring(chargeState.charges) or "unknown"
+                    line = line .. " @D| @Wcharges: @G" .. chargeText .. "@w"
+                end
+            else
+                local levelText = string.format(" [@Wlv%s@w]", tostring(level))
+                local wearBracket = wearableLoc ~= "" and (" [" .. wearableLoc .. "]") or ""
+                local weaponType = ""
+                local weaponDam = ""
+                local weaponDamType = ""
+                if tostring(itemType):lower() == "weapon" then
+                    local wType = inv.items.getStatField(objId, invStatFieldWeaponType) or ""
+                    if wType ~= "" then
+                        weaponType = " [" .. wType .. "]"
+                    end
+                    local aveDam = tonumber(inv.items.getStatField(objId, invStatFieldAveDam)) or 0
+                    if aveDam ~= 0 then
+                        weaponDam = " [" .. string.format("@G%d@Ddam@w", aveDam) .. "]"
+                    end
+                    local damType = inv.items.getStatField(objId, invStatFieldDamtype) or ""
+                    if damType ~= "" then
+                        weaponDamType = " [" .. damType .. "]"
+                    end
+                end
+                local weightBracket = ""
+                if weightText ~= "" then
+                    weightBracket = weightText
+                end
+                local scoreBracket = " [@C" .. tostring(score) .. "@W Score@w]"
+                local hrDrBracket = rollText ~= "" and rollText or ""
+                local hpMvMn = buildStatBlock(resourceStats)
+                local risChannel = ""
+                if enchantFlags ~= "" then
+                    local risOrder = table.concat({
+                        hasIlluminated, "I@w",
+                        hasResonated, "R@w",
+                        hasSolidified, "S@w",
+                    }, "")
+                    risChannel = " [" .. risOrder .. "]"
+                end
+                line = table.concat({
+                    "@w", nameText,
+                    levelText,
+                    wearBracket,
+                    weaponType,
+                    weaponDam,
+                    weaponDamType,
+                    weightBracket,
+                    scoreBracket,
+                    statText,
+                    hrDrBracket,
+                    hpMvMn,
+                    risChannel
+                }, "")
             end
-            line = table.concat({
-                "@w", nameText,
-                levelText,
-                wearBracket,
-                weaponType,
-                weaponDam,
-                weaponDamType,
-                weightBracket,
-                scoreBracket,
-                statText,
-                hrDrBracket,
-                hpMvMn,
-                risChannel
-            }, "")
         else
             local function padColored(value, width)
                 local raw = tostring(value or "")
@@ -7156,15 +7868,16 @@ function inv.items.displayStatSearchResults(itemIds, spec)
     local nameWidth = 24
     local displayNames = {}
     for _, objId in ipairs(itemIds) do
-        local rawName = tostring(inv.items.getStatField(objId, invStatFieldColorName)
+        local colorName = tostring(inv.items.getStatField(objId, invStatFieldColorName)
             or inv.items.getStatField(objId, invStatFieldName)
             or "Unknown")
-        rawName = rawName:gsub("[\r\n]", " ")
-        rawName = rawName:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%).*", "")
-        rawName = truncateStatSearchColorName(rawName, 40)
-        local visibleWidth = #dbot.stripColors(rawName)
+        colorName = colorName:gsub("[\r\n]", " ")
+        colorName = colorName:gsub("%s+[A-Z][a-z]+%s+%+?%-?%d+%s*%(removable[^%)]*%).*", "")
+        local displayName = truncateStatSearchColorName(colorName, 40)
+        local visibleWidth = #dbot.stripColors(displayName)
         displayNames[tostring(objId)] = {
-            raw = rawName,
+            raw = displayName,
+            report = colorName,
             width = visibleWidth,
         }
         nameWidth = math.max(nameWidth, visibleWidth)
@@ -7187,17 +7900,29 @@ function inv.items.displayStatSearchResults(itemIds, spec)
                 formatStatSearchDisplayValue(rawValue, kind))
         end
 
-        if cechoLink then
-            local linkCommand = string.format("inv.items.runReportFromLink(%q)", normalizedId)
-            local tooltip = "Run: dinv report " .. normalizedId
-            cechoLink("<yellow>" .. formattedId .. "<reset>", linkCommand, tooltip, true)
-        else
-            cecho("<yellow>" .. formattedId .. "<reset>")
-        end
         local displayName = displayNames[normalizedId]
         local namePadding = string.rep(" ", math.max(0, nameWidth - displayName.width))
         local rowText = displayName.raw .. "@w" .. namePadding ..
             "  " .. table.concat(pairsText, " @D|@w ")
+        local reportLine = displayName.report .. "@w   " ..
+            table.concat(pairsText, " @D|@w ")
+
+        if cechoLink then
+            local linkCommand = string.format("inv.items.runReportLineFromLink(%q)", reportLine)
+            local tooltip = "Report these item stats"
+            local popupShown = inv.items.echoReportChannelPopup(
+                "<yellow>" .. formattedId .. "<reset>",
+                function(channel)
+                    inv.items.runReportLineFromLink(reportLine, channel)
+                end,
+                "Left-click: report these stats via "
+            )
+            if not popupShown then
+                cechoLink("<yellow>" .. formattedId .. "<reset>", linkCommand, tooltip, true)
+            end
+        else
+            cecho("<yellow>" .. formattedId .. "<reset>")
+        end
         cecho(" " .. dbot.convertColors(rowText) .. "\n")
     end
 

@@ -109,6 +109,12 @@ local function invSetResolveTargetLevel(level)
         or 1
 end
 
+local function invSetResolveBaseLevel(targetLevel)
+    local tier = (dbot.gmcp and dbot.gmcp.getTier and tonumber(dbot.gmcp.getTier())) or 0
+    local projectedBase = (tonumber(targetLevel) or invSetResolveTargetLevel(nil)) - (tier * 10)
+    return math.max(1, math.min(201, projectedBase))
+end
+
 function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, baseLevelOverride)
     if priorityName == nil or priorityName == "" then
         dbot.warn("inv.set.create: Missing priority name")
@@ -1429,6 +1435,43 @@ local function invSetGetMissingCachedItems(setData)
     return missing
 end
 
+function inv.set.reportMissingCache(priorityName, level)
+    local targetLevel = tostring(invSetResolveTargetLevel(level))
+    dbot.info("No cached '@G" .. tostring(priorityName) .. "@W' set exists for wearable level @G" ..
+        targetLevel .. "@W.")
+end
+
+function inv.set.getCachedChangeCount(priorityName, level)
+    local targetLevel = tostring(invSetResolveTargetLevel(level))
+    local setData = inv.set.table[priorityName] and inv.set.table[priorityName][targetLevel] or nil
+    if setData == nil or setData.equipment == nil then
+        return nil, targetLevel
+    end
+
+    local wornByLoc = {}
+    for objId, _ in pairs(inv.items.table or {}) do
+        local location = tostring(inv.items.getStatField(objId, invStatFieldLocation) or "")
+        local resolvedSlot = inv.items.resolveWearSlot(location)
+        local wornLoc = (resolvedSlot ~= invItemLocWorn) and resolvedSlot or nil
+        if wornLoc then
+            wornByLoc[wornLoc] = tostring(objId)
+        end
+    end
+
+    local changes = 0
+    for _, loc in ipairs(inv.set.wearableLocations or {}) do
+        local desiredObjId = setData.equipment[loc]
+        if desiredObjId then
+            local currentObjId = wornByLoc[loc]
+            if tostring(desiredObjId) ~= tostring(currentObjId or "") then
+                changes = changes + 1
+            end
+        end
+    end
+
+    return changes, targetLevel, setData
+end
+
 function inv.set.wearCached(priorityName, level, endTag)
     if priorityName == nil or priorityName == "" then
         dbot.warn("Usage: dinv set wear cache [priority] [level]")
@@ -1441,9 +1484,11 @@ function inv.set.wearCached(priorityName, level, endTag)
     local targetLevel = tostring(invSetResolveTargetLevel(level))
     local setData = inv.set.table[priorityName] and inv.set.table[priorityName][targetLevel] or nil
     if setData == nil or setData.equipment == nil then
-        dbot.info("No cached set for priority @Y'" .. priorityName .. "'@W at level @G" ..
-            targetLevel .. "@W; calculating it now.")
-        return inv.set.createAndWear(priorityName, tonumber(targetLevel), nil, endTag)
+        inv.set.reportMissingCache(priorityName, targetLevel)
+        if endTag then
+            return inv.tags.stop(invTagsSet, endTag, DRL_RET_MISSING_ENTRY)
+        end
+        return DRL_RET_MISSING_ENTRY
     end
 
     local missing = invSetGetMissingCachedItems(setData)
@@ -1486,71 +1531,35 @@ function inv.set.test(priorityName, mode, endTag)
     local wearableLevel = tonumber((dbot.gmcp.getWearableLevel and dbot.gmcp.getWearableLevel())
         or (dbot.gmcp.getLevel and dbot.gmcp.getLevel()) or 1) or 1
     local baseLevel = tonumber((dbot.gmcp.getLevel and dbot.gmcp.getLevel()) or wearableLevel) or wearableLevel
-    local testLevel = baseLevel
     local debugEnabled = inv.levelup and inv.levelup.getDebug and inv.levelup.getDebug()
 
     local count = nil
     local effectiveMode = normalizedMode
-    local fallbackNote = nil
 
     if debugEnabled then
         dbot.printRaw(string.format(
             "@D[DINV DEBUG] set test: priority='@Y%s@D', mode='@W%s@D', testLevel=@Y%d@D, wearableLevel=@Y%d@D, baseLevel=@Y%d@D.@w",
-            tostring(priorityName), tostring(normalizedMode), tonumber(testLevel) or 0, tonumber(wearableLevel) or 0, tonumber(baseLevel) or 0))
+            tostring(priorityName), tostring(normalizedMode), tonumber(baseLevel) or 0, tonumber(wearableLevel) or 0, tonumber(baseLevel) or 0))
     end
 
     if normalizedMode == "cache" then
-        local analysisData = inv.analyze and inv.analyze.table and inv.analyze.table[priorityName]
-        local levels = analysisData and analysisData.levels or nil
-        local staleReason = inv.analyze and inv.analyze.getStaleReason and inv.analyze.getStaleReason(priorityName) or nil
+        local targetLevel = tostring(wearableLevel)
+        local staleReason = inv.set.getStaleReason(priorityName, targetLevel)
         if staleReason then
-            dbot.warn("Analysis '" .. priorityName .. "' is stale: " .. staleReason .. ". Continuing with cached results.")
+            dbot.warn("Cached set for '" .. priorityName .. "' is stale: " .. staleReason .. ". Continuing with cached results.")
         end
         if debugEnabled then
-            if analysisData then
-                dbot.printRaw(string.format(
-                    "@D[DINV DEBUG] set test cache: using analysis for '@Y%s@D' at level @Y%d@D.@w",
-                    tostring(priorityName), tonumber(testLevel) or 0))
-                dbot.printRaw(string.format(
-                    "@D[DINV DEBUG] set test cache: reference delta levels @Y%d@D->@Y%d@D (debug only).@w",
-                    tonumber(testLevel - 1) or 0, tonumber(testLevel) or 0))
-            else
-                dbot.printRaw(string.format(
-                    "@D[DINV DEBUG] set test cache: no analysis for '@Y%s@D' (see 'dinv analyze list').@w",
-                    tostring(priorityName)))
-            end
+            dbot.printRaw(string.format(
+                "@D[DINV DEBUG] set test cache: using saved set for '@Y%s@D' at wearable level @Y%d@D.@w",
+                tostring(priorityName), tonumber(targetLevel) or 0))
         end
-        if effectiveMode == "cache" and levels and levels[tostring(testLevel)] and levels[tostring(testLevel)].equipment then
-            local targetEquipment = levels[tostring(testLevel)].equipment or {}
-            local wornByLoc = inv.analyze.getCurrentWornByLoc()
-            local changes = 0
-            for _, loc in ipairs(inv.set.wearableLocations or {}) do
-                local desiredObjId = targetEquipment[loc]
-                if desiredObjId then
-                    local currentObjId = wornByLoc[loc]
-                    if tostring(desiredObjId) ~= tostring(currentObjId or "") then
-                        changes = changes + 1
-                    end
-                end
+        count = inv.set.getCachedChangeCount(priorityName, targetLevel)
+        if count == nil then
+            inv.set.reportMissingCache(priorityName, targetLevel)
+            if endTag then
+                return inv.tags.stop(invTagsSet, endTag, DRL_RET_MISSING_ENTRY)
             end
-            count = changes
-        elseif effectiveMode == "cache" then
-            if debugEnabled then
-                dbot.printRaw(string.format(
-                    "@D[DINV DEBUG] set test cache: missing level @Y%d@D snapshot/equipment.@w",
-                    tonumber(testLevel) or 0))
-            end
-            local armed = inv.levelup and inv.levelup.isArmed and inv.levelup.isArmed()
-            if armed then
-                effectiveMode = "live"
-                fallbackNote = "cache missing; used live fallback"
-            else
-                dbot.warn("No analysis cache found for '" .. priorityName .. "' at current level.")
-                if endTag then
-                    return inv.tags.stop(invTagsSet, endTag, DRL_RET_MISSING_ENTRY)
-                end
-                return DRL_RET_MISSING_ENTRY
-            end
+            return DRL_RET_MISSING_ENTRY
         end
     end
 
@@ -1566,15 +1575,14 @@ function inv.set.test(priorityName, mode, endTag)
         end
     end
 
-    local extra = fallbackNote and (" @W(" .. fallbackNote .. ")") or ""
     if tonumber(count) and tonumber(count) > 0 then
         dbot.info(string.format(
-            "New item upgrades are available for '@G%s@W' (@G%s@W): @Y%d@W pieces ready to equip.%s",
-            priorityName, effectiveMode, tonumber(count) or 0, extra))
+            "New item upgrades are available for '@G%s@W' (@G%s@W): @Y%d@W pieces ready to equip.",
+            priorityName, effectiveMode, tonumber(count) or 0))
     else
         dbot.info(string.format(
-            "No additional item upgrades available for '@G%s@W' (@G%s@W).%s",
-            priorityName, effectiveMode, extra))
+            "No additional item upgrades available for '@G%s@W' (@G%s@W).",
+            priorityName, effectiveMode))
     end
 
     if endTag then
@@ -1588,7 +1596,8 @@ end
 ----------------------------------------------------------------------------------------------------
 
 function inv.set.createAndWear(priorityName, level, intensity, endTag, wearOptions)
-    local retval = inv.set.create(priorityName, level, nil, intensity)
+    local targetLevel = invSetResolveTargetLevel(level)
+    local retval = inv.set.create(priorityName, targetLevel, nil, intensity)
     if retval ~= DRL_RET_SUCCESS then
         if endTag then
             return inv.tags.stop(invTagsSet, endTag, retval)
@@ -1596,7 +1605,15 @@ function inv.set.createAndWear(priorityName, level, intensity, endTag, wearOptio
         return retval
     end
 
-    return inv.set.wear(priorityName, level, endTag, wearOptions)
+    local setData = inv.set.table[priorityName] and inv.set.table[priorityName][tostring(targetLevel)] or nil
+    if setData and inv.analyze and inv.analyze.recordSet then
+        local analysisRetval = inv.analyze.recordSet(priorityName, invSetResolveBaseLevel(targetLevel), setData)
+        if analysisRetval ~= DRL_RET_SUCCESS then
+            dbot.warn("Live set was created, but its analysis entry could not be saved.")
+        end
+    end
+
+    return inv.set.wear(priorityName, targetLevel, endTag, wearOptions)
 end
 
 ----------------------------------------------------------------------------------------------------

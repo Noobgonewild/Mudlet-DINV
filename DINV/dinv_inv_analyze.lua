@@ -38,6 +38,41 @@ function inv.analyze.save()
     return DINV.database.saveModuleTable("analyze", inv.analyze.table)
 end
 
+function inv.analyze.recordSet(priorityName, baseLevel, setData)
+    local normalizedBase = tonumber(baseLevel)
+    if priorityName == nil or priorityName == "" or normalizedBase == nil or setData == nil or setData.equipment == nil then
+        return DRL_RET_INVALID_PARAM
+    end
+
+    inv.analyze.table = inv.analyze.table or {}
+    local analysisData = inv.analyze.table[priorityName]
+    if analysisData == nil then
+        analysisData = {
+            levels = {},
+            context = inv.context and inv.context.copy and inv.context.copy(setData.context) or setData.context,
+        }
+        inv.analyze.table[priorityName] = analysisData
+    end
+    analysisData.levels = analysisData.levels or {}
+
+    local equipment = {}
+    for loc, objId in pairs(setData.equipment or {}) do
+        if not analysisData.positions or analysisData.positions[loc] then
+            equipment[loc] = objId
+        end
+    end
+
+    analysisData.levels[tostring(normalizedBase)] = {
+        created = setData.created,
+        score = setData.score,
+        equipment = equipment,
+        wearableLevel = tonumber(setData.level),
+        context = inv.context and inv.context.copy and inv.context.copy(setData.context) or setData.context,
+    }
+
+    return inv.analyze.save()
+end
+
 function inv.analyze.load()
     local value, retval = DINV.database.loadModuleTable("analyze", inv.analyze.reset)
     if value then inv.analyze.table = value end
@@ -551,23 +586,31 @@ function inv.analyze.onLevelGained(newLevel)
         return DRL_RET_SUCCESS
     end
 
-    local staleReason = inv.analyze.getStaleReason(priorityName)
-    if staleReason then
-        local warningKey = tostring(priorityName) .. "|" .. tostring(staleReason)
-        if inv.analyze._lastLevelupStaleWarning ~= warningKey then
-            dbot.warn("Analysis '" .. priorityName .. "' is stale: " .. staleReason .. ". Level-up check is continuing with cached results.")
-            inv.analyze._lastLevelupStaleWarning = warningKey
+    local tier = (dbot.gmcp and dbot.gmcp.getTier and tonumber(dbot.gmcp.getTier())) or 0
+    local wearableLevel = level + (tier * 10)
+    local upgradeCount = inv.set and inv.set.getCachedChangeCount
+        and inv.set.getCachedChangeCount(priorityName, wearableLevel) or nil
+    if upgradeCount == nil then
+        if inv.set and inv.set.reportMissingCache then
+            inv.set.reportMissingCache(priorityName, wearableLevel)
         end
-    end
-
-    local upgradeSlots = inv.analyze.getUpgradeSlotsForLevel(priorityName, level)
-    if #upgradeSlots == 0 then
         inv.analyze.lastAnnouncedLevel = level
         return DRL_RET_SUCCESS
     end
 
-    dbot.printRaw(string.format("@c[DINV] You can wear @Y%d@c new equipment piece(s) for priority '@G%s@c'.",
-        #upgradeSlots, priorityName))
+    local staleReason = inv.set and inv.set.getStaleReason and inv.set.getStaleReason(priorityName, wearableLevel) or nil
+    if staleReason then
+        local warningKey = tostring(priorityName) .. "|" .. tostring(staleReason)
+        if inv.analyze._lastLevelupStaleWarning ~= warningKey then
+            dbot.warn("Cached set for '" .. priorityName .. "' is stale: " .. staleReason .. ". Level-up check is continuing with cached results.")
+            inv.analyze._lastLevelupStaleWarning = warningKey
+        end
+    end
+
+    if upgradeCount > 0 then
+        dbot.printRaw(string.format("@c[DINV] You can wear @Y%d@c new equipment piece(s) for priority '@G%s@c'.",
+            upgradeCount, priorityName))
+    end
     inv.analyze.lastAnnouncedLevel = level
 
     return DRL_RET_SUCCESS
@@ -707,22 +750,25 @@ function inv.analyze.onLevelStatus(currentBaseLevel, forceConfirm)
         effectiveMode = "off"
         disabledReason = "no priority"
     elseif mode == "cache" then
-        local analysisData = inv.analyze.table and inv.analyze.table[priorityName]
-        local levels = analysisData and analysisData.levels or nil
-        local staleReason = inv.analyze.getStaleReason(priorityName)
-        if staleReason then
-            local warningKey = tostring(priorityName) .. "|" .. tostring(staleReason)
-            if inv.analyze._lastLevelupStaleWarning ~= warningKey then
-                dbot.warn("Analysis '" .. priorityName .. "' is stale: " .. staleReason .. ". Level-up check is continuing with cached results.")
-                inv.analyze._lastLevelupStaleWarning = warningKey
+        local cachedCount = inv.set and inv.set.getCachedChangeCount
+            and inv.set.getCachedChangeCount(priorityName, wearableLevel) or nil
+        if cachedCount == nil then
+            if inv.set and inv.set.reportMissingCache then
+                inv.set.reportMissingCache(priorityName, wearableLevel)
             end
-        end
-        if not levels or not levels[tostring(newBase)] or not levels[tostring(newBase - 1)] then
             effectiveMode = "off"
-            disabledReason = "no analysis"
+            disabledReason = "no cached set"
         else
-            local upgradeSlots = inv.analyze.getUpgradeSlotsForLevel(priorityName, newBase)
-            upgradeCount = #upgradeSlots
+            local staleReason = inv.set and inv.set.getStaleReason
+                and inv.set.getStaleReason(priorityName, wearableLevel) or nil
+            if staleReason then
+                local warningKey = tostring(priorityName) .. "|" .. tostring(staleReason)
+                if inv.analyze._lastLevelupStaleWarning ~= warningKey then
+                    dbot.warn("Cached set for '" .. priorityName .. "' is stale: " .. staleReason .. ". Level-up check is continuing with cached results.")
+                    inv.analyze._lastLevelupStaleWarning = warningKey
+                end
+            end
+            upgradeCount = cachedCount
         end
     elseif mode == "live" then
         upgradeCount, disabledReason = inv.analyze.getLiveUpgradeCount(priorityName, newBase, wearableLevel)

@@ -1031,6 +1031,29 @@ function DINV.discovery.registerIdentifyTriggers()
         end
     )
 
+    -- Keyring identification temporarily retrieves and restores each object.
+    -- These are DINV workflow messages, not useful inventory activity for the
+    -- player, so keep them out of the main console while identify is active.
+    DINV.discovery.identifyTriggerIds.keyringGetMsg = tempRegexTrigger(
+        "^\\s*You remove .+ from your keyring\\.?\\s*$",
+        function()
+            dbot.debug("@YTrigger fired: identify.keyringGetMsg@W", "discovery")
+            if shouldSuppressIdentifyOutput() then
+                deleteLine()
+            end
+        end
+    )
+
+    DINV.discovery.identifyTriggerIds.keyringPutMsg = tempRegexTrigger(
+        "^\\s*You put .+ on your keyring\\.?\\s*$",
+        function()
+            dbot.debug("@YTrigger fired: identify.keyringPutMsg@W", "discovery")
+            if shouldSuppressIdentifyOutput() then
+                deleteLine()
+            end
+        end
+    )
+
     -- Handle "already carrying" error
     DINV.discovery.identifyTriggerIds.alreadyCarrying = tempRegexTrigger(
         "^\\s*You are already carrying that",

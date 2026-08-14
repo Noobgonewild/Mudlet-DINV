@@ -16,13 +16,12 @@ local mudChannels = {
     ["gt"] = true, ["say"] = true, ["tell"] = true, ["clan"] = true,
 }
 
-function inv.compare.onDeltaClick(deltaLine)
+function inv.compare.onDeltaClick(deltaLine, requestedChannel)
     local lineToReport = tostring(deltaLine or "")
     lineToReport = lineToReport:gsub(" +", " "):gsub("%s+$", "")
-    if copy2decho then
-        copy2decho(lineToReport)
-    end
-    local channel = (inv and inv.report and inv.report.getChannel and inv.report.getChannel()) or "echo"
+    local channel = requestedChannel
+        or (inv and inv.report and inv.report.getChannel and inv.report.getChannel())
+        or "echo"
     if channel == "echo" then
         if dbot and dbot.print then dbot.print(lineToReport) end
         return DRL_RET_SUCCESS
@@ -328,6 +327,9 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels, opts)
     end
 
     local targetName = inv.items.getStatField(targetId, invStatFieldName) or ("Auction #" .. tostring(targetId))
+    local targetReportName = opts.targetReportName
+        or inv.items.getStatField(targetId, invStatFieldColorName)
+        or targetName
     local targetAuctionLabel = opts.targetLabel or ("Auction #" .. tostring(targetId))
     local resultsTitle = opts.title or "@WCovet Results:@w"
     local targetLocs = inv.compare._expandWearLocations(targetId)
@@ -549,7 +551,21 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels, opts)
         local oldColorName = inv.items.getStatField(targetId, invStatFieldColorName)
         inv.items.setStatField(targetId, invStatFieldName, targetAuctionLabel)
         inv.items.setStatField(targetId, invStatFieldColorName, targetAuctionLabel)
-        inv.items.displayItem(targetId, "itemid", displayOptions)
+
+        -- Covet/discover auction items are transient and are removed as soon as
+        -- this report is rendered.  Freeze the report payload now so the
+        -- right-click channel actions still work after cleanup.
+        local _, reportLine = inv.items.displayItem(targetId, "itemid", {
+            suppress = true,
+            useRawColors = true,
+            channelFormat = true,
+        })
+        local targetDisplayOptions = {}
+        for key, value in pairs(displayOptions) do
+            targetDisplayOptions[key] = value
+        end
+        targetDisplayOptions.reportLine = reportLine
+        inv.items.displayItem(targetId, "itemid", targetDisplayOptions)
         inv.items.setStatField(targetId, invStatFieldName, oldName)
         inv.items.setStatField(targetId, invStatFieldColorName, oldColorName)
     end
@@ -629,6 +645,69 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels, opts)
         return table.concat(cells, "")
     end
 
+    local function renderDeltaReportLine(diff, againstId)
+        local d = diff or {}
+        local targetLocation = tostring(inv.items.getStatField(targetId, invStatFieldLocation) or "")
+        local targetReference
+        if targetLocation == "auction" then
+            targetReference = "@W (lbid @Y" .. tostring(targetId) .. "@W)"
+        else
+            targetReference = "@W (item @Y" .. tostring(targetId) .. "@W)"
+        end
+
+        local function formatItemName(value)
+            local name = tostring(value or "Unknown item"):gsub("[\r\n]", " ")
+            if not name:find("@", 1, true) then
+                name = "@W" .. name
+            end
+            return name .. "@w"
+        end
+
+        local marketName = formatItemName(targetReportName)
+        local comparedName = inv.items.getStatField(againstId, invStatFieldColorName)
+            or inv.items.getStatField(againstId, invStatFieldName)
+            or tostring(againstId or "Unknown item")
+        comparedName = formatItemName(comparedName)
+
+        local function reportCell(value, suffix)
+            local n = roundInt(value)
+            if n > 0 then
+                return string.format("@G+%d@D%s@w", n, suffix)
+            elseif n < 0 then
+                return string.format("@R%d@D%s@w", n, suffix)
+            end
+            return string.format("@D0%s@w", suffix)
+        end
+
+        local cells = {}
+        if anyWeapon then
+            local weaponDamDelta = d.weaponAveDelta
+            if weaponDamDelta == nil then
+                weaponDamDelta = d.ave
+            end
+            cells[#cells + 1] = reportCell(weaponDamDelta, "dam")
+        end
+        local statCells = {
+            { d.str,  "str" },
+            { d.int,  "int" },
+            { d.wis,  "wis" },
+            { d.dex,  "dex" },
+            { d.con,  "con" },
+            { d.lck,  "luc" },
+            { d.hr,   "hr" },
+            { d.dr,   "dr" },
+            { d.hp,   "hp" },
+            { d.mana, "mn" },
+            { d.move, "mv" },
+        }
+        for _, cell in ipairs(statCells) do
+            cells[#cells + 1] = reportCell(cell[1], cell[2])
+        end
+
+        return "@WEquip @w" .. marketName .. targetReference .. " vs @w" .. comparedName
+            .. "@W: @w" .. table.concat(cells, " ")
+    end
+
     local function diffSignature(row)
         local d = row.diff or {}
         return table.concat({
@@ -689,13 +768,24 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels, opts)
         displayAuctionTargetRow()
         inv.items.displayItem(headRow.againstId, "itemid", displayOptions)
         local deltaLine = renderDeltaLine(d)
+        local deltaReportLine = renderDeltaReportLine(d, headRow.againstId)
         if cecho and cechoLink then
             local clickableLine = tostring(deltaLine)
-            local reportCmd = string.format("inv.compare.onDeltaClick([[%s]])", clickableLine:gsub("%]%]", "] ]"))
+            local reportCmd = string.format("inv.compare.onDeltaClick(%q)", deltaReportLine)
             local prefix, suffix = clickableLine:match("^(.-)@WDelta:@w(.*)$")
             if prefix then
                 cecho((dbot and dbot.convertColors and dbot.convertColors(prefix) or prefix))
-                cechoLink("<white>Delta:<reset>", reportCmd, "Copy and report this delta line", true)
+                local popupShown = inv.items and inv.items.echoReportChannelPopup
+                    and inv.items.echoReportChannelPopup(
+                        "<white>Delta:<reset>",
+                        function(channel)
+                            inv.compare.onDeltaClick(deltaReportLine, channel)
+                        end,
+                        "Left-click: report this delta via "
+                    )
+                if not popupShown then
+                    cechoLink("<white>Delta:<reset>", reportCmd, "Report this delta", true)
+                end
                 cecho((dbot and dbot.convertColors and dbot.convertColors(suffix) or suffix) .. "\n")
             else
                 dbot.print(deltaLine)

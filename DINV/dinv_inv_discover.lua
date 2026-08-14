@@ -364,8 +364,24 @@ local function emitScoredRow(entry)
         return string.format("%s(+%d over %d levels)", pr, math.abs(score), levelCount)
     end
 
+    local priorities = entry.betterFor or {}
+    local summaryParts = {}
+    local coloredSummaryParts = {}
+    for _, priorityName in ipairs(priorities) do
+        local part = prioritySummaryPart(priorityName)
+        summaryParts[#summaryParts + 1] = part
+        coloredSummaryParts[#coloredSummaryParts + 1] = "@C" .. part .. "@w"
+    end
+    local summary = (#summaryParts > 0) and table.concat(summaryParts, " / ") or "-"
+    local coloredSummary = (#coloredSummaryParts > 0)
+        and table.concat(coloredSummaryParts, "@W / @w") or "@W-@w"
+    local timeLeft = tostring(entry.timeLeft or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local reportTimingSuffix = timeLeft ~= "" and ("@W Auction will end in " .. timeLeft .. "@w") or ""
+    local reportIdColor = entry.isWinningBid and "@G" or "@Y"
+    local reportLine = string.format("@C[%s%s@C]@w @W%s@w %s%s",
+        reportIdColor, tostring(entry.num), tostring(entry.name), coloredSummary, reportTimingSuffix)
+
     local function appendAuctionTimingText()
-        local timeLeft = tostring(entry.timeLeft or ""):gsub("^%s+", ""):gsub("%s+$", "")
         if timeLeft ~= "" then
             cecho("<white> Auction will end in " .. timeLeft .. "<reset>")
         end
@@ -376,15 +392,28 @@ local function emitScoredRow(entry)
         local lbidCmd = "lbid " .. tostring(entry.num)
         local idColor = entry.isWinningBid and "<green>" or "<yellow>"
         local visible = idColor .. tostring(entry.num) .. "<reset>"
-        if cechoLink then
+        local popupShown = inv.items and inv.items.echoReportChannelPopup
+            and inv.items.echoReportChannelPopup(
+                visible,
+                function(channel)
+                    inv.items.runReportLineFromLink(reportLine, channel)
+                end,
+                "Left-click: report this market result via ",
+                function()
+                    if send then
+                        send(lbidCmd)
+                    end
+                end,
+                "Run: " .. lbidCmd
+            )
+        if not popupShown and cechoLink then
             cechoLink(visible, "send([[" .. lbidCmd .. "]])", "Run: " .. lbidCmd, true)
-        else
+        elseif not popupShown then
             cecho(visible)
         end
         cecho("<cyan>]<reset> ")
         cecho("<white>" .. tostring(entry.name) .. "<reset> ")
 
-        local priorities = entry.betterFor or {}
         if #priorities > 0 and cechoLink then
             for i, priorityName in ipairs(priorities) do
                 if i > 1 then
@@ -399,29 +428,14 @@ local function emitScoredRow(entry)
             appendAuctionTimingText()
             cecho("\n")
         elseif #priorities > 0 then
-            local parts = {}
-            for _, priorityName in ipairs(priorities) do
-                parts[#parts + 1] = prioritySummaryPart(priorityName)
-            end
-            cecho("<white>" .. table.concat(parts, " / ") .. "<reset>")
+            cecho("<white>" .. summary .. "<reset>")
             appendAuctionTimingText()
             cecho("\n")
         else
             cecho("-\n")
         end
     else
-        local parts = {}
-        for _, priorityName in ipairs(entry.betterFor or {}) do
-            parts[#parts + 1] = prioritySummaryPart(priorityName)
-        end
-        local summary = (#parts > 0) and table.concat(parts, " / ") or "-"
-        local timingSuffix = ""
-        local timeLeft = tostring(entry.timeLeft or ""):gsub("^%s+", ""):gsub("%s+$", "")
-        if timeLeft ~= "" then
-            timingSuffix = " Auction will end in " .. timeLeft
-        end
-        local idColor = entry.isWinningBid and "@G" or "@Y"
-        dbot.print(string.format("@C[%s%s@C]@w %s @M%s@w%s", idColor, tostring(entry.num), tostring(entry.name), summary, timingSuffix))
+        dbot.print(reportLine)
     end
     return nil
 end
@@ -475,7 +489,9 @@ function inv.discover.showPriorityAnalysis(auctionNum, priorityName)
     setTransientItem(key, tempItem)
 
     local ok, retval = pcall(function()
-        return inv.compare.covetAnalyze(pr, tonumber(key) or key, 1)
+        return inv.compare.covetAnalyze(pr, tonumber(key) or key, 1, {
+            targetReportName = entry.name,
+        })
     end)
 
     restoreTransientItem(key, previous)
@@ -1277,7 +1293,7 @@ Notes:
   - Scan output is quiet and only prints scored items with @Gscore > 0@W.
   - Delta values are computed against max-stat caps for your setup.
   - Because caps are considered, replacing a @G6str@W item with a @G7str@W item can still show @D0str@W delta.
-  - Market numbers are clickable and run @Glbid <num>@W.
+  - Left-click a market number to run @Glbid <num>@W; right-click it to report the summary over a channel.
   - Results are cached in-memory only and are not saved across client restarts.
 ]])
 end
