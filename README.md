@@ -46,9 +46,11 @@ DINV consumables, buying potions/pills
 
 added inline progress bar
 
-
 https://github.com/user-attachments/assets/22d4788e-7308-4326-8d5f-48e00175275b
 
+added dinv history for item tracking:
+
+<img width="774" height="545" alt="2026-08-24 19_24_12-Aardwolf - Mudlet 4 22 0" src="https://github.com/user-attachments/assets/a30694d5-b1a9-43df-82d9-be1e9d1b60bd" />
 
 
 
