@@ -148,6 +148,16 @@ function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, ba
         end
     end
 
+    if inv.score and inv.score.getSanctuarySkipReason then
+        local sanctuarySkipReason = inv.score.getSanctuarySkipReason(targetLevel)
+        if sanctuarySkipReason then
+            dbot.debug(
+                string.format("Sanctuary priority override active for level %d (%s)", tonumber(targetLevel) or 0, sanctuarySkipReason),
+                "inv.set"
+            )
+        end
+    end
+
     local baseLevel
     if baseLevelOverride ~= nil then
         baseLevel = tonumber(baseLevelOverride) or 1
@@ -267,6 +277,7 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
     local equipment = {}
     local usedItems = {}
     local weaponArray = {}
+    local forcedLocations = {}
     local function debug(message)
         if debugEnabled then
             dbot.debug(message, "inv.set")
@@ -291,12 +302,132 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
         return base == 200 or base == 201
     end
 
+    local priority = inv.priority.get and inv.priority.get(priorityName, targetLevel) or nil
+    local forcedEffects = inv.priority.getForcedEffects
+        and inv.priority.getForcedEffects(priority, targetLevel) or {}
+    local forcedEffectSet = {}
+    for _, effectName in ipairs(forcedEffects) do
+        forcedEffectSet[effectName] = true
+    end
+
+    local function forcedCandidateEligible(objId, item, loc)
+        if usedItems[objId] then return false end
+        if inv.items.isKeyringItem and inv.items.isKeyringItem(item) then return false end
+
+        local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
+        if not inv.set.canWearAt(wearable, loc) then return false end
+
+        local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
+        if container ~= "" and inv.config.isIgnored(container) then return false end
+
+        local itemLevel = tonumber(inv.items.getStatField(objId, invStatFieldLevel)) or 0
+        if itemLevel > targetLevel or not heroOnlyOk(objId) then return false end
+
+        if inv.priority.locIsAllowed
+            and not inv.priority.locIsAllowed(loc, priorityName, targetLevel) then
+            return false
+        end
+        return true
+    end
+
+    local function forcedCandidateCoverage(objId, satisfied)
+        local coverage = 0
+        for effectName in pairs(forcedEffectSet) do
+            if not satisfied[effectName] and itemHasEffect(objId, effectName) then
+                coverage = coverage + 1
+            end
+        end
+        return coverage
+    end
+
+    ---------------------------------------------------------------------------
+    -- PHASE 0: Reserve providers for effect rows marked "force"
+    ---------------------------------------------------------------------------
+
+    local satisfiedForcedEffects = {}
+    if #forcedEffects > 0 then
+        local scarcity = {}
+        for _, effectName in ipairs(forcedEffects) do
+            local candidateItems = {}
+            for objId, item in pairs(inv.items.table or {}) do
+                if itemHasEffect(objId, effectName) then
+                    for _, loc in ipairs(inv.set.wearableLocations) do
+                        if loc ~= "wielded" and loc ~= "second"
+                            and forcedCandidateEligible(objId, item, loc) then
+                            candidateItems[tostring(objId)] = true
+                            break
+                        end
+                    end
+                end
+            end
+            table.insert(scarcity, { effect = effectName, count = dbot.table.getNumEntries(candidateItems) })
+        end
+        table.sort(scarcity, function(a, b)
+            if a.count ~= b.count then return a.count < b.count end
+            return a.effect < b.effect
+        end)
+
+        for _, required in ipairs(scarcity) do
+            local effectName = required.effect
+            if not satisfiedForcedEffects[effectName] then
+                local best = nil
+                for objId, item in pairs(inv.items.table or {}) do
+                    if itemHasEffect(objId, effectName) then
+                        for _, loc in ipairs(inv.set.wearableLocations) do
+                            if loc ~= "wielded" and loc ~= "second" and equipment[loc] == nil
+                                and forcedCandidateEligible(objId, item, loc) then
+                                local candidate = {
+                                    id = objId,
+                                    loc = loc,
+                                    coverage = forcedCandidateCoverage(objId, satisfiedForcedEffects),
+                                    score = scoreItem(objId),
+                                    level = tonumber(inv.items.getStatField(objId, invStatFieldLevel)) or 0,
+                                    name = inv.items.getStatField(objId, invStatFieldName) or "Unknown",
+                                }
+                                if best == nil
+                                    or candidate.coverage > best.coverage
+                                    or (candidate.coverage == best.coverage and candidate.score > best.score)
+                                    or (candidate.coverage == best.coverage and candidate.score == best.score
+                                        and candidate.level > best.level)
+                                    or (candidate.coverage == best.coverage and candidate.score == best.score
+                                        and candidate.level == best.level
+                                        and tostring(candidate.id) > tostring(best.id)) then
+                                    best = candidate
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if best then
+                    equipment[best.loc] = best.id
+                    usedItems[best.id] = true
+                    forcedLocations[best.loc] = true
+                    for forcedEffect in pairs(forcedEffectSet) do
+                        if itemHasEffect(best.id, forcedEffect) then
+                            satisfiedForcedEffects[forcedEffect] = true
+                        end
+                    end
+                    debug(string.format(
+                        "Phase 0: Forced effect %s -> %s at %s (score=%.1f)",
+                        effectName, best.name, best.loc, best.score
+                    ))
+                elseif debugEnabled then
+                    dbot.warn(string.format(
+                        "Priority '%s' forces effect '%s' at level %d, but no compatible owned item can provide it.",
+                        tostring(priorityName), effectName, tonumber(targetLevel) or 0
+                    ))
+                end
+            end
+        end
+    end
+
     ---------------------------------------------------------------------------
     -- PHASE 1: Find best item for each non-weapon slot
     ---------------------------------------------------------------------------
 
     for _, loc in ipairs(inv.set.wearableLocations) do
-        if loc ~= "wielded" and loc ~= "second" then
+        if loc ~= "wielded" and loc ~= "second" and equipment[loc] == nil then
             local bestItem = nil
             local bestScore = -999999
             local bestLevel = 0
@@ -602,7 +733,13 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
     debug(string.format("Phase 6: Single(%.1f + %.1f + %.1f = %.1f) vs Dual(%.1f)",
           scorePrimary, scoreShield, scoreHold, singleWeaponTotal, dualWieldTotal))
 
-    if dualWieldAvailable and bestWeaponSet.primary and dualWieldTotal > singleWeaponTotal then
+    local forceRequiresSingleWeapon = forcedLocations.shield or forcedLocations.hold
+    if forceRequiresSingleWeapon then
+        debug("Phase 6: Forced shield/hold effect requires single-weapon equipment")
+    end
+
+    if dualWieldAvailable and bestWeaponSet.primary and dualWieldTotal > singleWeaponTotal
+        and not forceRequiresSingleWeapon then
         equipment.wielded = bestWeaponSet.primary.id
         equipment.second = bestWeaponSet.offhand.id
         equipment.shield = nil

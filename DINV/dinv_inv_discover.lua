@@ -21,7 +21,6 @@ inv.discover.state = inv.discover.state or {
     priorityFilter = nil,
     cachedResults = {},
     cachedAt = nil,
-    itemCache = {},
     parsedCount = 0,
     totalToInspect = 0,
     scoreProgressStep = 10,
@@ -154,7 +153,6 @@ local function clearRuntime(keepCache)
     if not keepCache then
         st.cachedResults = {}
         st.cachedAt = nil
-        st.itemCache = {}
         st.resultContext = nil
     end
     unregisterTriggers()
@@ -472,7 +470,7 @@ function inv.discover.showPriorityAnalysis(auctionNum, priorityName)
 
     local st = inv.discover.state
     local key = tostring(auctionNum or "")
-    local sourceItem = (st.itemCache and st.itemCache[key]) or entry.itemData
+    local sourceItem = entry.itemData
     if not sourceItem then
         dbot.warn("No cached market item payload found for auction #" .. tostring(auctionNum))
         return DRL_RET_MISSING_ENTRY
@@ -782,18 +780,6 @@ local function startNextBid()
         return
     end
 
-    local cached = st.itemCache and st.itemCache[tostring(nextNum)]
-    if cached then
-        st.collected[tostring(nextNum)] = copyTable(cached)
-        debug("startNextBid: cache hit for lbid " .. tostring(nextNum))
-        st.parsedCount = (st.parsedCount or 0) + 1
-        if st.totalToInspect > 0 and ((st.parsedCount % 10 == 0) or st.parsedCount == st.totalToInspect) then
-            infoProgress(string.format("inspect progress: %d/%d", st.parsedCount, st.totalToInspect))
-        end
-        startNextBid()
-        return
-    end
-
     st.currentNum = tostring(nextNum)
     st.itemBuffering = true
     st.itemWork = st.collected[st.currentNum] or { num = st.currentNum, stats = {}, resists = {} }
@@ -844,7 +830,6 @@ function inv.discover.onListRow(num, desc, lvl, typ, lastBid, bids, timeLeft)
     end
 
     local n = tostring(num)
-    local cached = st.itemCache and st.itemCache[n]
     st.collected[n] = st.collected[n] or { num = n, stats = {}, resists = {} }
     local it = st.collected[n]
     it.desc = trim(desc)
@@ -855,12 +840,7 @@ function inv.discover.onListRow(num, desc, lvl, typ, lastBid, bids, timeLeft)
     it.is_winning_bid = rawLastBid:find("%*$") ~= nil
     it.bids = tonumber(bids) or 0
     it.time_left = trim(timeLeft)
-    if cached then
-        st.collected[n] = copyTable(cached)
-        debug("onListRow: cache hit for lbid " .. n .. " (skipping fetch)")
-    else
-        push(st.pendingNums, n)
-    end
+    push(st.pendingNums, n)
 
     if deleteLine then deleteLine() end
 end
@@ -1000,7 +980,24 @@ function inv.discover.onCurrentBid(v)
     if not st.itemBuffering or not st.currentNum then
         return
     end
-    st.itemWork.current_bid = stripBorder(v)
+    local currentBid = stripBorder(v)
+    st.itemWork.current_bid = currentBid
+
+    -- The market list marker is useful as a fallback, but lbid is the
+    -- authoritative source for the current bidder.  A discover scan fetches
+    -- every item, so use its fresh bidder value whenever the character name
+    -- is available through GMCP.
+    local currentBidder = trim(currentBid:match("%(([^()]*)%)%s*$") or "")
+    if currentBidder ~= "" then
+        st.itemWork.current_bidder = currentBidder
+        local characterName = dbot and dbot.gmcp and dbot.gmcp.getName
+            and trim(dbot.gmcp.getName() or "") or ""
+        if characterName ~= "" then
+            st.itemWork.is_winning_bid = lower(currentBidder) == lower(characterName)
+        end
+    else
+        st.itemWork.current_bidder = nil
+    end
 
     local parsed = readTempIdentifyParse(st.currentNum)
     if parsed and parsed.stats then
@@ -1011,13 +1008,12 @@ function inv.discover.onCurrentBid(v)
     end
 
     st.collected[tostring(st.currentNum)] = st.itemWork
-    st.itemCache[tostring(st.currentNum)] = copyTable(st.itemWork)
     st.parsedCount = (st.parsedCount or 0) + 1
     if deleteLine then deleteLine() end
     if st.totalToInspect > 0 and ((st.parsedCount % 10 == 0) or st.parsedCount == st.totalToInspect) then
         infoProgress(string.format("inspect progress: %d/%d", st.parsedCount, st.totalToInspect))
     end
-    debug("onCurrentBid: cached lbid " .. tostring(st.currentNum))
+    debug("onCurrentBid: inspected lbid " .. tostring(st.currentNum))
     clearTempIdentifyParse(st.currentNum)
 
     st.itemWork = nil
@@ -1182,16 +1178,16 @@ function inv.discover.scan(priorityFilter)
     end
 
     clearRuntime(true)
+    -- Results remain available to `dinv discover show`, but every new scan
+    -- rebuilds all item payloads from fresh lbid output. Clear the retired
+    -- per-item cache as well when upgrading an already-loaded session.
+    st.itemCache = nil
     st.busy = true
     st.priorityFilter = priorityFilter
     st.eligiblePriorities = priorities
     st.activeContext = inv.context and inv.context.capture and inv.context.capture() or nil
 
-    local itemCacheSize = 0
-    for _ in pairs(st.itemCache or {}) do
-        itemCacheSize = itemCacheSize + 1
-    end
-    debug("scan: type='" .. tostring(st.marketType) .. "' priorityFilter='" .. tostring(priorityFilter) .. "' eligible=" .. tostring(#priorities) .. " itemCacheSize=" .. tostring(itemCacheSize))
+    debug("scan: type='" .. tostring(st.marketType) .. "' priorityFilter='" .. tostring(priorityFilter) .. "' eligible=" .. tostring(#priorities) .. " fullRescan=true")
 
     local triggerRet = inv.discover.registerTriggers()
     if triggerRet ~= DRL_RET_SUCCESS then
@@ -1226,7 +1222,7 @@ function inv.discover.clearType()
     st.marketType = ""
     st.cachedResults = {}
     st.cachedAt = nil
-    st.itemCache = {}
+    st.itemCache = nil
     st.activeContext = nil
     st.resultContext = nil
     dbot.info("Discover type and cached results cleared.")
@@ -1238,11 +1234,7 @@ function inv.discover.status()
     local typeLabel = (st.marketType ~= "" and st.marketType) or "(not set)"
     local busyLabel = st.busy and "yes" or "no"
     local cacheCount = st.cachedResults and #st.cachedResults or 0
-    local itemCacheCount = 0
-    for _ in pairs(st.itemCache or {}) do
-        itemCacheCount = itemCacheCount + 1
-    end
-    dbot.info(string.format("Discover status: type=%s, running=%s, cached_results=%d, cached_items=%d", typeLabel, busyLabel, cacheCount, itemCacheCount))
+    dbot.info(string.format("Discover status: type=%s, running=%s, cached_results=%d", typeLabel, busyLabel, cacheCount))
     return DRL_RET_SUCCESS
 end
 
@@ -1293,7 +1285,7 @@ Notes:
   - Scan output is quiet and only prints scored items with @Gscore > 0@W.
   - Delta values are computed against max-stat caps for your setup.
   - Because caps are considered, replacing a @G6str@W item with a @G7str@W item can still show @D0str@W delta.
-  - Left-click a market number to run @Glbid <num>@W; right-click it to report the summary over a channel.
+  - Left-click a market number to run @Glbid <num>@W; right-click it to report the summary or copy its colored text.
   - Results are cached in-memory only and are not saved across client restarts.
 ]])
 end
@@ -1302,7 +1294,7 @@ function inv.discover.init.atInstall()
     local st = inv.discover.state
     st.marketType = st.marketType or ""
     st.cachedResults = st.cachedResults or {}
-    st.itemCache = st.itemCache or {}
+    st.itemCache = nil
     return DRL_RET_SUCCESS
 end
 

@@ -8,7 +8,7 @@ DINV.database = DINV.database or {}
 
 local database = DINV.database
 
-database.schemaVersion = 4
+database.schemaVersion = 5
 database.env = database.env or nil
 database.conn = database.conn or nil
 database.isOpen = database.isOpen or false
@@ -280,6 +280,16 @@ local SCHEMA = {
         observed_at INTEGER NOT NULL,
         session_id TEXT NOT NULL
     )]],
+    [[CREATE TABLE IF NOT EXISTS inventory_history_items (
+        obj_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        color_name TEXT,
+        normalized_name TEXT NOT NULL,
+        type_name TEXT,
+        level REAL,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL
+    )]],
     [[CREATE TABLE IF NOT EXISTS module_state_entries (
         namespace TEXT NOT NULL,
         node_id INTEGER NOT NULL,
@@ -303,6 +313,8 @@ local SCHEMA = {
     [[CREATE INDEX IF NOT EXISTS idx_detached_root ON detached_items(detached_root)]],
     [[CREATE INDEX IF NOT EXISTS idx_pending_removed_purge ON pending_removed_items(purge_after)]],
     [[CREATE INDEX IF NOT EXISTS idx_events_obj_seq ON inventory_events(obj_id, event_seq)]],
+    [[CREATE INDEX IF NOT EXISTS idx_history_items_name
+        ON inventory_history_items(normalized_name, obj_id)]],
     [[CREATE INDEX IF NOT EXISTS idx_module_state_parent
         ON module_state_entries(namespace, parent_id, ordinal)]],
 }
@@ -404,6 +416,272 @@ local function normalizeName(value)
         text = dbot.stripColors(text)
     end
     return text:lower():gsub(",", ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+end
+
+
+local ITEM_HISTORY_COLUMN_ADDITIONS = {
+    name = "TEXT",
+    color_name = "TEXT",
+    type_name = "TEXT",
+    type_num = "INTEGER",
+    level = "REAL",
+    identify_level = "TEXT",
+    protocol_flags = "TEXT",
+    unique_value = "TEXT",
+    location = "TEXT",
+    container_id = "TEXT",
+    last_stored = "TEXT",
+    worn = "TEXT",
+    wearable = "TEXT",
+    keep_flag = "INTEGER",
+    timer = "REAL",
+    presence = "TEXT NOT NULL DEFAULT 'active'",
+    detached_root = "TEXT",
+    refresh_generation = "INTEGER NOT NULL DEFAULT 0",
+    last_event_seq = "INTEGER NOT NULL DEFAULT 0",
+    location_source = "TEXT",
+    location_session = "TEXT",
+    location_confirmed_at = "INTEGER",
+    updated_at = "INTEGER NOT NULL DEFAULT 0",
+}
+
+
+local function tableColumns(tableName)
+    local cursor, queryErr = query("PRAGMA table_info(" .. tableName .. ")")
+    if not cursor then return nil, queryErr end
+    local columns = {}
+    local row = cursor:fetch({}, "a")
+    while row do
+        columns[tostring(row.name)] = true
+        row = cursor:fetch(row, "a")
+    end
+    closeCursor(cursor)
+    return columns
+end
+
+
+local function addMissingColumns(tableName, requiredKey, additions)
+    local columns, columnErr = tableColumns(tableName)
+    if not columns then return false, columnErr end
+    if requiredKey and not columns[requiredKey] then
+        return false, "existing table " .. tableName .. " is missing required key column " .. requiredKey
+    end
+    local names = {}
+    for columnName, _ in pairs(additions or {}) do table.insert(names, columnName) end
+    table.sort(names)
+    for _, columnName in ipairs(names) do
+        if not columns[columnName] then
+            local altered, alterErr = execute("ALTER TABLE " .. tableName .. " ADD COLUMN " ..
+                columnName .. " " .. additions[columnName])
+            if not altered then
+                return false, "unable to add " .. tableName .. "." .. columnName .. ": " ..
+                    tostring(alterErr)
+            end
+        end
+    end
+    return true
+end
+
+
+local function eventColumnExpression(columns, columnName, fallback)
+    if columns[columnName] then
+        return "COALESCE(" .. columnName .. "," .. fallback .. ")"
+    end
+    return fallback
+end
+
+
+local function hardenInventoryEventsTable()
+    local columns, columnErr = tableColumns("inventory_events")
+    if not columns then return false, columnErr end
+    if not columns.obj_id then
+        return false, "existing table inventory_events is missing required object ID column obj_id"
+    end
+    local expected = {
+        "id", "event_seq", "obj_id", "action", "reason", "container_id",
+        "wear_location", "observed_at", "session_id",
+    }
+    local complete = true
+    for _, columnName in ipairs(expected) do
+        if not columns[columnName] then complete = false; break end
+    end
+    if complete then return true end
+
+    local droppedOldTemp, dropOldTempErr = execute(
+        "DROP TABLE IF EXISTS inventory_events_v5_rebuild"
+    )
+    if not droppedOldTemp then return false, dropOldTempErr end
+    local created, createErr = execute([[CREATE TABLE inventory_events_v5_rebuild (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_seq INTEGER NOT NULL,
+        obj_id TEXT NOT NULL,
+        action INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        container_id TEXT,
+        wear_location TEXT,
+        observed_at INTEGER NOT NULL,
+        session_id TEXT NOT NULL
+    )]])
+    if not created then return false, createErr end
+
+    local idExpression = columns.id and "id" or "rowid"
+    local copied, copyErr = execute(
+        "INSERT INTO inventory_events_v5_rebuild(" ..
+        "id,event_seq,obj_id,action,reason,container_id,wear_location,observed_at,session_id) " ..
+        "SELECT " .. table.concat({
+            idExpression,
+            eventColumnExpression(columns, "event_seq", idExpression),
+            "CAST(obj_id AS TEXT)",
+            eventColumnExpression(columns, "action", "0"),
+            eventColumnExpression(columns, "reason", "'legacy'"),
+            columns.container_id and "container_id" or "NULL",
+            columns.wear_location and "wear_location" or "NULL",
+            eventColumnExpression(columns, "observed_at", "0"),
+            eventColumnExpression(columns, "session_id", "'legacy'"),
+        }, ",") .. " FROM inventory_events"
+    )
+    if not copied then return false, copyErr end
+    local dropped, dropErr = execute("DROP TABLE inventory_events")
+    if not dropped then return false, dropErr end
+    local renamed, renameErr = execute(
+        "ALTER TABLE inventory_events_v5_rebuild RENAME TO inventory_events"
+    )
+    if not renamed then return false, renameErr end
+    return true
+end
+
+
+local function hardenLegacySchema()
+    for _, tableName in ipairs({ "items", "detached_items", "pending_removed_items", "build_items" }) do
+        local additions = {}
+        for columnName, definition in pairs(ITEM_HISTORY_COLUMN_ADDITIONS) do
+            additions[columnName] = definition
+        end
+        if tableName == "detached_items" then
+            additions.presence = "TEXT NOT NULL DEFAULT 'detached'"
+        elseif tableName == "pending_removed_items" then
+            additions.presence = "TEXT NOT NULL DEFAULT 'pending-removal'"
+            additions.removed_at = "INTEGER NOT NULL DEFAULT 0"
+            additions.purge_after = "INTEGER NOT NULL DEFAULT 0"
+            additions.removal_action = "INTEGER"
+            additions.removal_reason = "TEXT"
+        end
+        local hardened, hardenErr = addMissingColumns(tableName, "obj_id", additions)
+        if not hardened then return false, hardenErr end
+    end
+
+    local statAdditions = {
+        stat_key = "TEXT", value_type = "TEXT NOT NULL DEFAULT 'string'", text_value = "TEXT",
+        numeric_value = "REAL", boolean_value = "INTEGER",
+    }
+    for _, tableName in ipairs({
+        "item_stats", "detached_item_stats", "pending_removed_item_stats", "build_item_stats",
+    }) do
+        local hardened, hardenErr = addMissingColumns(tableName, "obj_id", statAdditions)
+        if not hardened then return false, hardenErr end
+    end
+
+    local pendingHardened, pendingErr = addMissingColumns(
+        "pending_removed_items", "obj_id", { purge_after = "INTEGER NOT NULL DEFAULT 0" }
+    )
+    if not pendingHardened then return false, pendingErr end
+    local moduleHardened, moduleErr = addMissingColumns("module_state_entries", "namespace", {
+        parent_id = "INTEGER", ordinal = "INTEGER NOT NULL DEFAULT 0",
+    })
+    if not moduleHardened then return false, moduleErr end
+    local historyHardened, historyErr = addMissingColumns("inventory_history_items", "obj_id", {
+        name = "TEXT NOT NULL DEFAULT ''",
+        color_name = "TEXT",
+        normalized_name = "TEXT NOT NULL DEFAULT ''",
+        type_name = "TEXT",
+        level = "REAL",
+        first_seen_at = "INTEGER NOT NULL DEFAULT 0",
+        last_seen_at = "INTEGER NOT NULL DEFAULT 0",
+    })
+    if not historyHardened then return false, historyErr end
+    return hardenInventoryEventsTable()
+end
+
+
+local function seedInventoryHistoryItems(startedAt)
+    local known = {}
+    local eventTimes = {}
+    local eventCursor, eventErr = query(
+        "SELECT obj_id,MIN(observed_at) AS first_seen,MAX(observed_at) AS last_seen " ..
+        "FROM inventory_events GROUP BY obj_id"
+    )
+    if not eventCursor then return false, eventErr end
+    local eventRow = eventCursor:fetch({}, "a")
+    while eventRow do
+        eventTimes[tostring(eventRow.obj_id)] = {
+            firstSeenAt = tonumber(eventRow.first_seen),
+            lastSeenAt = tonumber(eventRow.last_seen),
+        }
+        eventRow = eventCursor:fetch(eventRow, "a")
+    end
+    closeCursor(eventCursor)
+
+    local sourceTables = { "items", "detached_items", "pending_removed_items", "build_items" }
+    for _, tableName in ipairs(sourceTables) do
+        local cursor, queryErr = query("SELECT obj_id,name,color_name,type_name,level FROM " .. tableName)
+        if not cursor then
+            return false, queryErr
+        end
+        local row = cursor:fetch({}, "a")
+        while row do
+            local objId = tostring(row.obj_id or "")
+            if objId ~= "" and known[objId] == nil then
+                known[objId] = {
+                    name = row.name,
+                    colorName = row.color_name,
+                    typeName = row.type_name,
+                    level = tonumber(row.level),
+                }
+            end
+            row = cursor:fetch(row, "a")
+        end
+        closeCursor(cursor)
+    end
+
+    for objId, item in pairs(known) do
+        local plainName = tostring(item.name or "")
+        if plainName == "" and item.colorName then
+            plainName = dbot and dbot.stripColors and dbot.stripColors(item.colorName)
+                or tostring(item.colorName)
+        end
+        local normalized = normalizeName(plainName)
+        local normalizedType = tostring(item.typeName or ""):lower()
+        if normalizedType == "drink container" then normalizedType = "drink" end
+        if normalized ~= "" and not CONSUMABLE_TYPES[normalizedType] then
+            local times = eventTimes[objId] or {}
+            local firstSeenAt = times.firstSeenAt or startedAt
+            local lastSeenAt = math.max(tonumber(startedAt) or 0, times.lastSeenAt or 0)
+            local inserted, insertErr = execute(
+                "INSERT OR IGNORE INTO inventory_history_items(" ..
+                "obj_id,name,color_name,normalized_name,type_name,level,first_seen_at,last_seen_at) VALUES(" ..
+                table.concat({
+                    sqlQuote(objId), sqlQuote(plainName), sqlQuote(item.colorName), sqlQuote(normalized),
+                    sqlQuote(item.typeName), sqlQuote(item.level), sqlQuote(firstSeenAt), sqlQuote(lastSeenAt),
+                }, ",") .. ")"
+            )
+            if not inserted then
+                return false, insertErr
+            end
+            local updated, updateErr = execute(
+                "UPDATE inventory_history_items SET " ..
+                "name=" .. sqlQuote(plainName) ..
+                ",color_name=COALESCE(" .. sqlQuote(item.colorName) .. ",color_name)" ..
+                ",normalized_name=" .. sqlQuote(normalized) ..
+                ",type_name=COALESCE(" .. sqlQuote(item.typeName) .. ",type_name)" ..
+                ",level=COALESCE(" .. sqlQuote(item.level) .. ",level)" ..
+                ",first_seen_at=MIN(first_seen_at," .. sqlQuote(firstSeenAt) .. ")" ..
+                ",last_seen_at=MAX(last_seen_at," .. sqlQuote(lastSeenAt) .. ")" ..
+                " WHERE obj_id=" .. sqlQuote(objId)
+            )
+            if not updated then return false, updateErr end
+        end
+    end
+    return true
 end
 
 local function normalizeConsumableType(value)
@@ -560,16 +838,52 @@ function database.resetRuntimeState()
 end
 
 local function ensureSchema(character)
+    local previousSchemaVersion = tonumber(getMeta("schema_version")) or 0
+    if previousSchemaVersion > database.schemaVersion then
+        return false, "database schema " .. tostring(previousSchemaVersion) ..
+            " is newer than supported schema " .. tostring(database.schemaVersion)
+    end
     local txOk, txErr = beginTransaction()
     if not txOk then
         return false, txErr
     end
+    -- Create tables first, repair additive legacy differences second, and only
+    -- then create indexes that may reference columns absent from older schemas.
     for _, statement in ipairs(SCHEMA) do
-        local schemaOk, schemaErr = execute(statement)
-        if not schemaOk then
-            rollback()
-            return false, "schema creation failed: " .. tostring(schemaErr)
+        if not statement:match("^%s*CREATE INDEX") then
+            local schemaOk, schemaErr = execute(statement)
+            if not schemaOk then
+                rollback()
+                return false, "schema table creation failed: " .. tostring(schemaErr)
+            end
         end
+    end
+    local hardened, hardenErr = hardenLegacySchema()
+    if not hardened then
+        rollback()
+        return false, "schema compatibility repair failed: " .. tostring(hardenErr)
+    end
+    for _, statement in ipairs(SCHEMA) do
+        if statement:match("^%s*CREATE INDEX") then
+            local schemaOk, schemaErr = execute(statement)
+            if not schemaOk then
+                rollback()
+                return false, "schema index creation failed: " .. tostring(schemaErr)
+            end
+        end
+    end
+    local historyMigrated = previousSchemaVersion < 5
+    local historyStartedAt = tonumber(getMeta("inventory_history_started_at")) or now()
+    if historyMigrated and not getMeta("inventory_history_started_at") then
+        if not setMeta("inventory_history_started_at", tostring(historyStartedAt)) then
+            rollback()
+            return false, "unable to persist inventory history start time"
+        end
+    end
+    local seeded, seedErr = seedInventoryHistoryItems(historyStartedAt)
+    if not seeded then
+        rollback()
+        return false, "unable to seed inventory history identities: " .. tostring(seedErr)
     end
     if not setMeta("schema_version", tostring(database.schemaVersion))
         or not setMeta("character_name", character) then
@@ -965,6 +1279,59 @@ local function itemColumns(objId, item)
     }
 end
 
+
+local function deleteInventoryHistoryIdentity(objId)
+    local keySql = sqlQuote(tostring(objId))
+    local itemDeleted, itemErr = execute(
+        "DELETE FROM inventory_history_items WHERE obj_id=" .. keySql
+    )
+    if not itemDeleted then return false, itemErr end
+    return true
+end
+
+
+local function saveInventoryHistoryIdentity(objId, item, observedAt)
+    local stats = item and item.stats or {}
+    if isConsumableType(stats.type) then
+        return deleteInventoryHistoryIdentity(objId)
+    end
+
+    local plainName = tostring(stats.name or "")
+    local colorName = stats.colorname or stats.colorName
+    if plainName == "" and colorName then
+        plainName = dbot and dbot.stripColors and dbot.stripColors(colorName)
+            or tostring(colorName)
+    end
+    local normalized = normalizeName(plainName)
+    if normalized == "" then
+        return true
+    end
+
+    local seenAt = tonumber(observedAt) or now()
+    local inserted, insertErr = execute(
+        "INSERT OR IGNORE INTO inventory_history_items(" ..
+        "obj_id,name,color_name,normalized_name,type_name,level,first_seen_at,last_seen_at) VALUES(" ..
+        table.concat({
+            sqlQuote(tostring(objId)), sqlQuote(plainName), sqlQuote(colorName), sqlQuote(normalized),
+            sqlQuote(stats.type), sqlQuote(tonumber(stats.level)), sqlQuote(seenAt), sqlQuote(seenAt),
+        }, ",") .. ")"
+    )
+    if not inserted then return false, insertErr end
+
+    local updated, updateErr = execute(
+        "UPDATE inventory_history_items SET " ..
+        "name=" .. sqlQuote(plainName) ..
+        ",color_name=COALESCE(" .. sqlQuote(colorName) .. ",color_name)" ..
+        ",normalized_name=" .. sqlQuote(normalized) ..
+        ",type_name=COALESCE(" .. sqlQuote(stats.type) .. ",type_name)" ..
+        ",level=COALESCE(" .. sqlQuote(tonumber(stats.level)) .. ",level)" ..
+        ",last_seen_at=MAX(last_seen_at," .. sqlQuote(seenAt) .. ")" ..
+        " WHERE obj_id=" .. sqlQuote(tostring(objId))
+    )
+    if not updated then return false, updateErr end
+    return true
+end
+
 local ITEM_COLUMN_ORDER = {
     "obj_id", "name", "color_name", "type_name", "type_num", "level", "identify_level",
     "protocol_flags", "unique_value", "location", "container_id", "last_stored", "worn",
@@ -1004,7 +1371,7 @@ local function insertItem(tableName, statsTableName, objId, item)
             end
         end
     end
-    return true
+    return saveInventoryHistoryIdentity(objId, item)
 end
 
 local function saveConsumableTemplate(objId, item)
@@ -1393,6 +1760,18 @@ local function inventoryEventSql(event)
         }, ",") .. ")"
 end
 
+
+local function inventoryHistorySnapshot(item)
+    local stats = item and item.stats or nil
+    if not stats then return nil end
+    return { stats = {
+        name = stats.name,
+        colorname = stats.colorname or stats.colorName,
+        type = stats.type,
+        level = stats.level,
+    } }
+end
+
 function database.flush(target, options)
     if not database.isOpen then
         local opened, openErr = database.open()
@@ -1417,6 +1796,7 @@ function database.flush(target, options)
     end
 
     local count = 0
+    local historyExcludedIds = {}
     for objId, _ in pairs(bucket.deletes) do
         local ok, err = execute("DELETE FROM " .. tableName .. " WHERE obj_id=" .. sqlQuote(objId))
         if not ok then
@@ -1426,6 +1806,9 @@ function database.flush(target, options)
         count = count + 1
     end
     for objId, item in pairs(bucket.upserts) do
+        if isConsumableType(item and item.stats and item.stats.type) then
+            historyExcludedIds[tostring(objId)] = true
+        end
         local ok, err = insertItem(tableName, statsTableName, objId, item)
         if not ok then
             rollback()
@@ -1483,10 +1866,27 @@ function database.flush(target, options)
         end
     end
     for _, event in ipairs(database.pendingEvents) do
-        local eventOk, eventErr = execute(inventoryEventSql(event))
-        if not eventOk then
-            rollback()
-            return false, eventErr
+        local snapshot = event.historyItem
+        local isConsumable = snapshot and snapshot.stats
+            and isConsumableType(snapshot.stats.type)
+        local isUnsearchableTerminal = (tonumber(event.action) == 3 or tonumber(event.action) == 7)
+            and not snapshot
+        if not historyExcludedIds[tostring(event.objId)]
+            and not isConsumable and not isUnsearchableTerminal then
+            if snapshot then
+                local identityOk, identityErr = saveInventoryHistoryIdentity(
+                    event.objId, snapshot, event.observedAt
+                )
+                if not identityOk then
+                    rollback()
+                    return false, identityErr
+                end
+            end
+            local eventOk, eventErr = execute(inventoryEventSql(event))
+            if not eventOk then
+                rollback()
+                return false, eventErr
+            end
         end
     end
 
@@ -1772,6 +2172,7 @@ function database.restoreLegacyStateDirectory(directory)
         "DELETE FROM pending_removed_item_stats", "DELETE FROM pending_removed_items",
         "DELETE FROM build_item_stats", "DELETE FROM build_items",
         "DELETE FROM build_sessions", "DELETE FROM inventory_events",
+        "DELETE FROM inventory_history_items",
         "DELETE FROM consumable_template_stats", "DELETE FROM consumable_templates",
     }
     for _, statement in ipairs(clears) do
@@ -2296,7 +2697,7 @@ function database.deletePendingRemovedItem(objId)
     return ok ~= nil, err
 end
 
-function database.recordTerminalRemoval(eventSeq, objId, action, reason, containerId, wearLocation)
+function database.recordTerminalRemoval(eventSeq, objId, action, reason, containerId, wearLocation, item)
     if not database.isOpen then
         return false, "database is not open"
     end
@@ -2316,13 +2717,28 @@ function database.recordTerminalRemoval(eventSeq, objId, action, reason, contain
         return false, txErr
     end
     local keySql = sqlQuote(objId)
+    local snapshot = inventoryHistorySnapshot(item)
+    local recordHistory = snapshot ~= nil and not isConsumableType(snapshot.stats.type)
+    if recordHistory then
+        local identityOk, identityErr = saveInventoryHistoryIdentity(objId, snapshot, event.observedAt)
+        if not identityOk then
+            rollback()
+            return false, identityErr
+        end
+    else
+        local cleared, clearErr = deleteInventoryHistoryIdentity(objId)
+        if not cleared then
+            rollback()
+            return false, clearErr
+        end
+    end
     local statements = {
         "DELETE FROM items WHERE obj_id=" .. keySql,
         "DELETE FROM detached_items WHERE obj_id=" .. keySql,
         "DELETE FROM pending_removed_items WHERE obj_id=" .. keySql,
         "DELETE FROM build_items WHERE obj_id=" .. keySql,
-        inventoryEventSql(event),
     }
+    if recordHistory then table.insert(statements, inventoryEventSql(event)) end
     for _, statement in ipairs(statements) do
         local ok, err = execute(statement)
         if not ok then
@@ -2347,7 +2763,7 @@ function database.recordTerminalRemoval(eventSeq, objId, action, reason, contain
     return true
 end
 
-function database.recordInventoryEvent(eventSeq, objId, action, reason, containerId, wearLocation)
+function database.recordInventoryEvent(eventSeq, objId, action, reason, containerId, wearLocation, item)
     if not database.isOpen then
         return false
     end
@@ -2360,6 +2776,7 @@ function database.recordInventoryEvent(eventSeq, objId, action, reason, containe
         wearLocation = wearLocation,
         observedAt = now(),
         sessionId = database.getSessionId(),
+        historyItem = inventoryHistorySnapshot(item),
     })
     return true
 end
@@ -2367,6 +2784,203 @@ end
 
 function database.getMaxEventSequence()
     return tonumber(scalar("SELECT COALESCE(MAX(event_seq), 0) FROM inventory_events")) or 0
+end
+
+
+local function prepareInventoryHistoryRead()
+    if not database.isOpen then
+        local initialized, initErr = database.initialize()
+        if not initialized then return false, initErr end
+    end
+    local flushed, flushErr = database.flush("active")
+    if not flushed then return false, flushErr end
+    return true
+end
+
+
+local function inventoryHistoryItemSelect(whereSql, limit)
+    local sql = "SELECT h.obj_id,h.name,h.color_name,h.normalized_name,h.type_name,h.level," ..
+        "h.first_seen_at,h.last_seen_at," ..
+        "(SELECT e.action FROM inventory_events e WHERE e.obj_id=h.obj_id " ..
+        "ORDER BY e.event_seq DESC,e.id DESC LIMIT 1) AS last_action," ..
+        "(SELECT e.reason FROM inventory_events e WHERE e.obj_id=h.obj_id " ..
+        "ORDER BY e.event_seq DESC,e.id DESC LIMIT 1) AS last_reason," ..
+        "(SELECT e.observed_at FROM inventory_events e WHERE e.obj_id=h.obj_id " ..
+        "ORDER BY e.event_seq DESC,e.id DESC LIMIT 1) AS last_event_at " ..
+        "FROM inventory_history_items h"
+    if whereSql and whereSql ~= "" then sql = sql .. " WHERE " .. whereSql end
+    sql = sql .. " ORDER BY h.normalized_name,h.obj_id"
+    if limit then sql = sql .. " LIMIT " .. tostring(tonumber(limit) or 101) end
+    return sql
+end
+
+
+local function loadInventoryHistoryItems(sql)
+    local cursor, queryErr = query(sql)
+    if not cursor then return nil, queryErr end
+    local result = {}
+    local row = cursor:fetch({}, "a")
+    while row do
+        table.insert(result, {
+            objId = tostring(row.obj_id),
+            name = row.name,
+            colorName = row.color_name,
+            normalizedName = row.normalized_name,
+            typeName = row.type_name,
+            level = tonumber(row.level),
+            firstSeenAt = tonumber(row.first_seen_at),
+            lastSeenAt = tonumber(row.last_seen_at),
+            lastAction = tonumber(row.last_action),
+            lastReason = row.last_reason,
+            lastEventAt = tonumber(row.last_event_at),
+        })
+        row = cursor:fetch(row, "a")
+    end
+    closeCursor(cursor)
+    return result
+end
+
+
+function database.findInventoryHistoryItems(name)
+    local ready, readyErr = prepareInventoryHistoryRead()
+    if not ready then return nil, readyErr end
+    local normalized = normalizeName(name)
+    if normalized == "" then return {}, nil, "none", false end
+
+    local rows, queryErr = loadInventoryHistoryItems(inventoryHistoryItemSelect(
+        "h.normalized_name=" .. sqlQuote(normalized), 101
+    ))
+    if not rows then return nil, queryErr end
+    local matchKind = "exact"
+    if #rows == 0 then
+        rows, queryErr = loadInventoryHistoryItems(inventoryHistoryItemSelect(
+            "instr(h.normalized_name," .. sqlQuote(normalized) .. ")>0", 101
+        ))
+        if not rows then return nil, queryErr end
+        matchKind = "partial"
+    end
+    local truncated = #rows > 100
+    if truncated then table.remove(rows) end
+    return rows, nil, matchKind, truncated
+end
+
+
+function database.getInventoryHistoryItem(objId)
+    local ready, readyErr = prepareInventoryHistoryRead()
+    if not ready then return nil, readyErr end
+    local rows, queryErr = loadInventoryHistoryItems(inventoryHistoryItemSelect(
+        "h.obj_id=" .. sqlQuote(tostring(objId)), 1
+    ))
+    if not rows then return nil, queryErr end
+    return rows[1]
+end
+
+
+function database.getInventoryHistoryEvents(objId)
+    local ready, readyErr = prepareInventoryHistoryRead()
+    if not ready then return nil, readyErr end
+    local cursor, queryErr = query(
+        "SELECT e.id,e.event_seq,e.obj_id,e.action,e.reason,e.container_id,e.wear_location," ..
+        "e.observed_at,e.session_id,c.name AS container_name " ..
+        "FROM inventory_events e LEFT JOIN inventory_history_items c ON c.obj_id=e.container_id " ..
+        "WHERE e.obj_id=" .. sqlQuote(tostring(objId)) ..
+        " ORDER BY e.event_seq,e.id"
+    )
+    if not cursor then return nil, queryErr end
+    local events = {}
+    local row = cursor:fetch({}, "a")
+    while row do
+        table.insert(events, {
+            id = tonumber(row.id),
+            eventSeq = tonumber(row.event_seq),
+            objId = tostring(row.obj_id),
+            action = tonumber(row.action),
+            reason = row.reason,
+            containerId = row.container_id,
+            containerName = row.container_name,
+            wearLocation = row.wear_location,
+            observedAt = tonumber(row.observed_at),
+            sessionId = row.session_id,
+        })
+        row = cursor:fetch(row, "a")
+    end
+    closeCursor(cursor)
+    return events
+end
+
+
+function database.getInventoryHistoryStartedAt()
+    local ready, readyErr = prepareInventoryHistoryRead()
+    if not ready then return nil, readyErr end
+    return tonumber(getMeta("inventory_history_started_at"))
+end
+
+
+function database.getInventoryHistoryRepairStatus()
+    local ready, readyErr = prepareInventoryHistoryRead()
+    if not ready then return nil, readyErr end
+    local cursor, queryErr = query([[SELECT
+        COUNT(*) AS total_events,
+        SUM(CASE WHEN EXISTS (
+            SELECT 1 FROM inventory_history_items h WHERE h.obj_id=inventory_events.obj_id
+        ) THEN 1 ELSE 0 END) AS linked_events,
+        SUM(CASE WHEN NOT EXISTS (
+            SELECT 1 FROM inventory_history_items h WHERE h.obj_id=inventory_events.obj_id
+        ) THEN 1 ELSE 0 END) AS unseeded_events,
+        MIN(CASE WHEN NOT EXISTS (
+            SELECT 1 FROM inventory_history_items h WHERE h.obj_id=inventory_events.obj_id
+        ) THEN observed_at END) AS unseeded_first_at,
+        MAX(CASE WHEN NOT EXISTS (
+            SELECT 1 FROM inventory_history_items h WHERE h.obj_id=inventory_events.obj_id
+        ) THEN observed_at END) AS unseeded_last_at
+        FROM inventory_events]])
+    if not cursor then return nil, queryErr end
+    local row = cursor:fetch({}, "a") or {}
+    closeCursor(cursor)
+    return {
+        totalEvents = tonumber(row.total_events) or 0,
+        linkedEvents = tonumber(row.linked_events) or 0,
+        unseededEvents = tonumber(row.unseeded_events) or 0,
+        unseededFirstAt = tonumber(row.unseeded_first_at),
+        unseededLastAt = tonumber(row.unseeded_last_at),
+    }
+end
+
+
+function database.repairInventoryHistory()
+    local ready, readyErr = prepareInventoryHistoryRead()
+    if not ready then return false, readyErr end
+    local txOk, txErr = beginTransaction()
+    if not txOk then return false, txErr end
+
+    local unseeded = tonumber(scalar([[SELECT COUNT(*) FROM inventory_events e
+        WHERE NOT EXISTS (
+            SELECT 1 FROM inventory_history_items h WHERE h.obj_id=e.obj_id
+        )]])) or 0
+    local deleted, deleteErr = execute([[DELETE FROM inventory_events
+        WHERE NOT EXISTS (
+            SELECT 1 FROM inventory_history_items h WHERE h.obj_id=inventory_events.obj_id
+        )]])
+    if not deleted then
+        rollback()
+        return false, deleteErr
+    end
+
+    local checkCursor, checkErr = query("PRAGMA quick_check")
+    if not checkCursor or type(checkCursor.fetch) ~= "function" then
+        closeCursor(checkCursor)
+        rollback()
+        return false, tostring(checkErr or "quick_check did not return a result")
+    end
+    local checkRow = checkCursor:fetch({}, "n")
+    closeCursor(checkCursor)
+    if tostring(checkRow and checkRow[1]) ~= "ok" then
+        rollback()
+        return false, tostring(checkRow and checkRow[1] or "quick_check failed")
+    end
+    local committed, commitErr = commit()
+    if not committed then return false, commitErr end
+    return true, unseeded
 end
 
 
@@ -2394,6 +3008,65 @@ end
 local function statValueExpression(alias)
     return "COALESCE(" .. alias .. ".text_value,CAST(" .. alias .. ".numeric_value AS TEXT)," ..
         "CAST(" .. alias .. ".boolean_value AS TEXT),'')"
+end
+
+local function querySetValues(value)
+    local values = {}
+    for token in tostring(value or ""):gmatch("[^,%s]+") do
+        table.insert(values, token:lower())
+    end
+    return values
+end
+
+local function tokenSql(expression, value)
+    return "instr(' '||lower(replace(COALESCE(" .. expression .. ",''),',',' '))||' '," ..
+        "' '||lower(" .. sqlQuote(value) .. ")||' ')>0"
+end
+
+local wornQueryGroups = {
+    ear = { "lear", "rear" },
+    neck = { "neck1", "neck2" },
+    wrist = { "lwrist", "rwrist" },
+    finger = { "lfinger", "rfinger" },
+    medal = { "medal1", "medal2", "medal3", "medal4" },
+}
+
+local wornQueryAliases = {
+    wield = "wielded",
+    ear1 = "lear",
+    ear2 = "rear",
+    wrist1 = "lwrist",
+    wrist2 = "rwrist",
+    finger1 = "lfinger",
+    finger2 = "rfinger",
+}
+
+local function wornCriterionSql(value)
+    local target = tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+    if target == "" or target == "any" or target == "true"
+        or target == "worn" or target == "equipped" or target == "*" then
+        return "COALESCE(i.worn,'') NOT IN ('','undefined','not-worn')"
+    end
+    if target == "false" or target == "none" or target == "not-worn"
+        or target == "unworn" then
+        return "COALESCE(i.worn,'') IN ('','undefined','not-worn')"
+    end
+
+    local numeric = tonumber(target)
+    if numeric and inv and inv.wearLoc and inv.wearLoc[numeric] then
+        target = tostring(inv.wearLoc[numeric]):lower()
+    end
+    target = wornQueryAliases[target] or target
+
+    local group = wornQueryGroups[target]
+    if group then
+        local values = {}
+        for _, worn in ipairs(group) do
+            table.insert(values, sqlQuote(worn))
+        end
+        return "lower(COALESCE(i.worn,'')) IN (" .. table.concat(values, ",") .. ")"
+    end
+    return "lower(COALESCE(i.worn,''))=" .. sqlQuote(target)
 end
 
 local function criterionSql(entry, statsTableName)
@@ -2434,7 +3107,7 @@ local function criterionSql(entry, statsTableName)
         local relativeLocation = value:match("^%d+%.(.+)$") or value
         condition = containsSql("i.location", relativeLocation)
     elseif key == "worn" then
-        condition = "COALESCE(i.worn,'') NOT IN ('','undefined','not-worn')"
+        condition = wornCriterionSql(value)
     elseif key == "minlevel" then
         local _, number = numericComparison(value, ">=")
         condition = number and "COALESCE(i.level,0)>=" .. sqlQuote(number) or "0"
@@ -2445,12 +3118,18 @@ local function criterionSql(entry, statsTableName)
         local operator, number = numericComparison(value, "=")
         condition = operator and "COALESCE(i.level,0)" .. operator .. sqlQuote(number) or "0"
     elseif key == "flag" or key == "flags" then
-        if value:lower() == "kept" then
-            condition = "COALESCE(i.keep_flag,0)=1"
-        else
-            condition = "EXISTS(SELECT 1 FROM " .. statsTableName .. " sf WHERE sf.obj_id=i.obj_id " ..
-                "AND lower(sf.stat_key)='flags' AND " .. containsSql(statValueExpression("sf"), value) .. ")"
+        local flagConditions = {}
+        for _, flag in ipairs(querySetValues(value)) do
+            if flag == "kept" then
+                table.insert(flagConditions, "COALESCE(i.keep_flag,0)=1")
+            else
+                table.insert(flagConditions,
+                    "EXISTS(SELECT 1 FROM " .. statsTableName .. " sf WHERE sf.obj_id=i.obj_id " ..
+                    "AND lower(sf.stat_key)='flags' AND " ..
+                    tokenSql(statValueExpression("sf"), flag) .. ")")
+            end
         end
+        condition = #flagConditions > 0 and table.concat(flagConditions, " AND ") or "0"
     else
         local operator, number = numericComparison(value, nil)
         local valueCondition

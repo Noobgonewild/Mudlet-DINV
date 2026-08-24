@@ -785,7 +785,8 @@ function inv.consume.displayType(typeName, isOwned)
         return numEntries
     end
 
-    local header = string.format("\n@W@C%-12s@W  Level  # Avail  Name", (typeName or "nil"))
+    local header = string.format("\n@W@C%-12s@W  Level  # Avail  @C%s@W",
+        "Buy", (typeName or "nil"))
     local didPrintHeader = false
 
     for entryIndex, entry in ipairs(inv.consume.table[typeName]) do
@@ -820,7 +821,7 @@ function inv.consume.displayType(typeName, isOwned)
                     "Travel to the vendor for " .. displayName, true)
                 cecho("\n")
             else
-                dbot.print(string.format("  x1  x10  x50    %3d     %4d  %s",
+                dbot.print(string.format("  x1 x10 x50    %3d     %4d  %s",
                     tonumber(entry.level) or 0, count, tostring(entry.name or "nil")))
             end
             numEntries = numEntries + 1

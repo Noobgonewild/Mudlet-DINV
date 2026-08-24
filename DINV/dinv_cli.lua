@@ -12,7 +12,7 @@ inv.cli = inv.cli or {}
 
 inv.cli.commands = {
     -- Inventory table access
-    "build", "refresh", "identify", "search", "query", "report",
+    "build", "refresh", "identify", "search", "query", "report", "history",
     -- Item management
     "get", "put", "store", "keyword", "organize",
     -- Equipment sets
@@ -147,7 +147,7 @@ Usage:
     dinv help           - Show full command list
     dinv help <command> - Show detailed help for a specific command
     
-Available topics: build, refresh, identify, search, query, set, priority, analyze,
+  Available topics: build, refresh, identify, search, query, history, set, priority, analyze,
                   report, progress, compare, covet, snapshot, weapon, portal, consume,
                   config, backup, notify, debug, levelup, unused, and more.
 ]])
@@ -358,6 +358,7 @@ function inv.cli.fullUsage()
     if inv.cli.search and inv.cli.search.usage then inv.cli.search.usage() end
     if inv.cli.query and inv.cli.query.usage then inv.cli.query.usage() end
     if inv.cli.report and inv.cli.report.usage then inv.cli.report.usage() end
+    if inv.cli.history and inv.cli.history.usage then inv.cli.history.usage() end
 
     dbot.printRaw("@CItem Management:@w")
     if inv.cli.get and inv.cli.get.usage then inv.cli.get.usage() end
@@ -528,6 +529,9 @@ function inv.cli.refresh.fn(name, line, wildcards)
         local retval = inv.items.refresh(0, invItemsRefreshLocDirty, nil, { identifyPartials = true })
         if retval ~= DRL_RET_SUCCESS then
             return inv.tags.stop(invTagsRefresh, endTag, retval)
+        end
+        if inv.items.refreshResetTimer then
+            inv.items.refreshResetTimer()
         end
         cecho("\n<green>[DINV] Refresh started (partial items, including the keyring backlog, will be fully identified).\n")
         return inv.tags.stop(invTagsRefresh, endTag, DRL_RET_SUCCESS)
@@ -748,8 +752,6 @@ function inv.cli.search.fn(name, line, wildcards)
     end
     local endTag = inv.tags.new(line)
 
-    local itemIds
-    local retval
     local statSpec
     if displayMode == "stat" then
         local statError
@@ -759,26 +761,51 @@ function inv.cli.search.fn(name, line, wildcards)
             dbot.info("Use '@Gdinv help search@W' for stat-search syntax and allowed fields.")
             return inv.tags.stop(invTagsSearch, endTag, DRL_RET_INVALID_PARAM)
         end
-        itemIds, retval = inv.items.searchStats(statSpec, { query = query })
-    else
-        itemIds, retval = inv.items.search(query)
     end
 
-    if retval == DRL_RET_SUCCESS then
-        if displayMode == "stat" then
-            inv.items.sortStatSearchResults(itemIds, statSpec)
-            inv.items.displayStatSearchResults(itemIds, statSpec)
-        else
-            inv.items.sort(itemIds)
-            local trimmed = tostring(query or ""):gsub("^%s*(.-)%s*$", "%1")
-            if (not explicitMode) and trimmed:match("^%d+$") then
-                displayMode = "itemid"
+    local completedRetval
+    local function executeResolvedSearch(clauses, resolutionRetval, hadRelativeReferences)
+        local retval = resolutionRetval
+        local itemIds = {}
+        if retval == DRL_RET_SUCCESS then
+            local searchOptions = {
+                parsedClauses = clauses,
+                skipRelativeFilter = hadRelativeReferences == true,
+            }
+            if displayMode == "stat" then
+                searchOptions.query = query
+                itemIds, retval = inv.items.searchStats(statSpec, searchOptions)
+            else
+                itemIds, retval = inv.items.search(query, nil, searchOptions)
             end
-            inv.items.displayResults(itemIds, displayMode)
         end
+
+        if retval == DRL_RET_SUCCESS then
+            if displayMode == "stat" then
+                inv.items.sortStatSearchResults(itemIds, statSpec)
+                inv.items.displayStatSearchResults(itemIds, statSpec)
+            else
+                inv.items.sort(itemIds)
+                local trimmed = tostring(query or ""):gsub("^%s*(.-)%s*$", "%1")
+                if (not explicitMode) and trimmed:match("^%d+$") then
+                    displayMode = "itemid"
+                end
+                inv.items.displayResults(itemIds, displayMode)
+            end
+        end
+
+        completedRetval = inv.tags.stop(invTagsSearch, endTag, retval)
+        return completedRetval
     end
-    
-    return inv.tags.stop(invTagsSearch, endTag, retval)
+
+    local retval, pending = inv.items.resolveSearchQuery(query, executeResolvedSearch)
+    if completedRetval ~= nil then
+        return completedRetval
+    end
+    if not pending then
+        return inv.tags.stop(invTagsSearch, endTag, retval)
+    end
+    return retval
 end
 
 function inv.cli.search.usage()
@@ -799,6 +826,81 @@ end
 function inv.cli.query.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s",
                pluginNameCmd .. " query", "Query syntax and searchable tags"))
+end
+
+----------------------------------------------------------------------------------------------------
+-- Inventory History Command
+----------------------------------------------------------------------------------------------------
+
+inv.cli.history = {}
+
+function inv.cli.history.fn(name, line, wildcards)
+    local subcommand = tostring(wildcards and wildcards[1] or ""):lower()
+    local targetParts = {}
+    for index = 2, #(wildcards or {}) do
+        table.insert(targetParts, tostring(wildcards[index]))
+    end
+    local target = table.concat(targetParts, " ")
+
+    if not (inv.history and inv.history.find and inv.history.displayShort
+        and inv.history.displayComplete and inv.history.repair) then
+        dbot.warn("Inventory history is not initialized")
+        return DRL_RET_UNINITIALIZED
+    end
+    if subcommand == "find" then
+        return inv.history.find(target)
+    elseif subcommand == "short" then
+        return inv.history.displayShort(target)
+    elseif subcommand == "complete" then
+        return inv.history.displayComplete(target)
+    elseif subcommand == "repair" then
+        local repairArgument = target:lower()
+        if repairArgument ~= "" and repairArgument ~= "confirm" then
+            dbot.warn("Usage: dinv history repair [confirm]")
+            return DRL_RET_INVALID_PARAM
+        end
+        return inv.history.repair(repairArgument == "confirm")
+    end
+
+    inv.cli.history.examples()
+    return DRL_RET_INVALID_PARAM
+end
+
+function inv.cli.history.usage()
+    dbot.printRaw(string.format("@W    %-50s @w- %s",
+        pluginNameCmd .. " history @G<find|short|complete|repair> ...", "View an item's history"))
+end
+
+function inv.cli.history.examples()
+    dbot.print([[@W
+@YInventory History@W
+
+  Consumables are excluded. Dates use your computer's local time.
+
+  @Gdinv history find <name>@W
+      Search by item name. A unique result shows its short history; multiple
+      results list their object IDs without showing any object's history.
+
+  @Gdinv history short <id|unique name>@W
+      Show acquisition, total possession time, and final/current status.
+
+  @Gdinv history complete <id|unique name>@W
+      Show every recorded movement for the selected object.
+
+  @Gdinv history repair@W
+      Preview events that have no matching item name. This command does not
+      remove anything. It explains exactly what a confirmed repair would do.
+
+  @Gdinv history repair confirm@W
+      Create a full SQLite backup, then remove only events that cannot be linked
+      to the searchable item-name catalog. Named history and inventory are kept.
+
+Examples:
+  @Gdinv history find winged helmet@W
+  @Gdinv history short 184922@W
+  @Gdinv history complete 184922@W
+  @Gdinv history repair@W
+]])
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -1020,7 +1122,7 @@ function inv.cli.report.fn(name, line, wildcards)
             dbot.info("@WBasic mode omits IDs. Use '@Gdinv report objid <query>@W' to show clickable IDs.")
         elseif displayMode ~= "itemid" then
             dbot.info("@WLeft-click an ID to report over the configured channel (@G" .. tostring(channel) ..
-                "@W), or right-click it to choose another channel.")
+                "@W), or right-click it to choose another channel or copy the report.")
         end
     end
 
@@ -2180,16 +2282,18 @@ If you want move all of your potions and pills into a container named "2.bag" yo
 with this command: "@Gdinv put 2.bag type potion || type pill@W".
 
 Most queries are in the form "someKey someValue". If you use an empty query (i.e., the query
-is "") then it will match everything in your inventory that is not currently equipped.
+is "") then it will match every persisted item, including currently equipped items.
 
 Search queries support both absolute and relative names and locations.  If you want to specify
 all weapons that have "axe" in their name, use "@Gtype weapon name axe@W".  If you want to
-specifically target the third axe in your main inventory, use "@Gtype weapon rname 3.axe@W" 
-(or you could just get by with "@Grname 3.axe@W" and skip the "@Gtype weapon@W" clause.)  The use
-of the key "rname" instead of "name" means that the search is relative to your main inventory
-and you can use the format [number].[name] to target a specific item.  Similarly, you can use
-"@Grlocation 3.bag@W" to target every item contained by the third bag in your main inventory
-(i.e., the third bag is their relative location.)
+specifically target the third axe in your main inventory, use "@Gtype weapon rname 3.axe@W"
+(or you could just get by with "@Grname 3.axe@W" and skip the "@Gtype weapon@W" clause.) DINV
+asks Aardwolf to identify that relative reference, captures and persists that one item, then
+searches by its exact object ID. Similarly, "@Grlocation 3.bag@W" resolves the bag through
+Aardwolf and searches already-persisted items whose exact container ID matches it. Relative
+location resolution never scans, identifies, retrieves, or persists the container or its
+contents. If the resolved container is not already persisted, the search warns and returns no
+matches for that clause.
 
 There are a few "one-off" query modes for convenience.  It is so common to search for just a
 name that the default is to assume you are searching within an item's name if no other data
@@ -2205,7 +2309,7 @@ moves, and the illuminated/resonated/solidified flags.  A full search adds store
 for every item.  Stat mode displays only object ID, item name, and requested stat values.  It accepts
 only real item stats, sorts descending by the first requested stat, and keeps missing sort values last.
 Basic results have no report links.  In objid and full modes, left-click an object ID to use the
-configured report channel or right-click it to choose a channel.  Stat mode uses the same object-ID
+configured report channel or right-click it to choose a channel or copy the report.  Stat mode uses the same object-ID
 menu, but its channel report omits the object ID and sends the same compact field/value sequence shown
 in the search row, using the item's colorName and the requested stat fields.
 
@@ -2338,6 +2442,10 @@ either from aard gloves or naturally via the skill and will base the set accordi
 also checks weapon weights to find the most optimal combination of weapons if dual wield
 is available and it is prioritized.
 
+An effect marked "@Mforce@W" in the priority is handled as a hard equipment requirement rather
+than a score. DINV reserves a compatible item providing that effect before filling the remaining
+slots. See "@Gdinv help priority@W" for syntax and conflict behavior.
+
 The key point is that we care about maximizing the total *usable* stats in an equipment
 set.  Finding pieces that are complementary without wasting points on overmaxed stats is
 a process that is well-suited for a plugin -- hence this plugin :)
@@ -2441,6 +2549,24 @@ The priority values can vary by level.  This is useful if you value different st
 points in your leveling experience.  For example, you might value haste highly at low levels but
 not care about it at high levels where you can cast it yourself.
 
+For an effect row, you may write "@Mforce@W" instead of a numeric weight in any level column.
+This requires DINV to include at least one compatible owned item that provides that effect,
+regardless of the item's score or competing equipment.  "@Mforce@W" is only valid for effects;
+it cannot be used for basic stats, combat stats, resources, resists, or max-stat bonuses.  A
+forced item must still be wearable at the target level and cannot come from an ignored container.
+If forced effects cannot all fit into the available wear locations, DINV warns which requirement
+could not be met.  Force also overrides the normal rule that ignores equipment effects your race
+or classes can already provide.
+
+Example priority file with two level ranges:
+  @Clevels       1-50     51-291@W
+  @Csanctuary    force    0.00@W
+  @Cregeneration 100.00   force@W
+
+Numeric sanctuary, dual wield, and flying weights are treated as zero whenever your race or any
+current/remort class already provides the effect at the target level.  Psionicist Biofeedback at
+level 51 counts as sanctuary for this purpose.
+
 Priority fields include:
   - Basic stats: str, int, wis, dex, con, luck
   - Combat: hit, dam, avedam, offhandDam
@@ -2473,9 +2599,9 @@ Examples:
 @C        hit@g   1.00   1.00   1.00   1.00   1.00   1.00@W  : @cValue placed on hitroll
 @C     avedam@G   3.50   3.50   3.50   3.50   3.50   3.50@W  : @cValue placed on average weapon damage
 @C offhandDam@G   2.50   2.50   2.50   2.50   2.50   2.50@W  : @cValue placed on offhand weapon's average damage
-@C  sanctuary@G  50.00  50.00   0.00   0.00   0.00   0.00@W  : @cValue of an item's sanctuary effect
+@C  sanctuary@M  FORCE@G  50.00   0.00   0.00   0.00   0.00@W  : @cValue of an item's sanctuary effect
 @C      haste@G  20.00   0.00   0.00   0.00   0.00   0.00@W  : @cValue of an item's haste effect
-@C  dualwield@G 300.00 300.00 300.00 300.00 300.00 300.00@W  : @cValue of an item's dual wield effect
+@C  dualwield@G 300.00 300.00 300.00@M  FORCE@G 300.00 300.00@W  : @cValue of an item's dual wield effect
 @C   irongrip@G 100.00 100.00 100.00 100.00 100.00 100.00@W  : @cValue of an item's irongrip effect
 
   3) Create a new priority from scratch.  This will export a text file that you can edit.
@@ -2562,11 +2688,14 @@ Supported query keys (case-insensitive):
   Weapon/armor: @Cavedam@W, @Cinflicts@W, @Cdamtype@W, @Cweapontype@W, @Cspecials@W, @Carmor@W
   Containers: @Ccapacity@W, @Cholding@W, @Cheaviestitem@W, @Citemsinside@W, @Ctotweight@W,
     @Citemburden@W, @Citemweight@W, @Creducedby@W
+  Enchants: @Cenchants@W, @Cilluminate@W, @Cresonate@W, @Csolidify@W,
+    @Cilluminateremoval@W, @Cresonateremoval@W, @Csolidifyremoval@W
+    (removal values: @Cenchanter@W or @Ctp@W)
   Item-specific: @Cduration@W, @Cnutrition@W, @Cfoodaffects@W, @Cservings@W, @Cliquid@W,
     @Cdestination@W, @Cleadsto@W,
     @Cspells@W, @Cspelluses@W, @Cspelllevel@W, @Cspellname@W, @Ccharges@W,
     @Cchargeknown@W, @Cchargedirty@W, @Cchargesource@W, @Cskills@W, @Caffects@W,
-    @Caffectmods@W, @Cabilmods@W, @Cenchants@W, @Cilluminate@W, @Cresonate@W, @Csolidify@W
+    @Caffectmods@W, @Cabilmods@W
   DINV metadata: @Corganize@W, @Cloctype@W, @Clocname@W
 
 Any additional property present in persisted item data can also be used as a query key.
@@ -2574,6 +2703,13 @@ Any additional property present in persisted item data can also be used as a que
 Operators:
   @C~key value@W   negates a match
   @C||@W           OR between clauses
+
+Set and equipment semantics:
+  @Cflag@W and @Cflags@W are aliases. Multiple flag values are exact, case-insensitive tokens
+  combined with AND, so "@Gflags resonated anti-evil@W" requires both flags.
+  "@Gworn head@W" and "@Gworn wielded@W" match the current equipment slot. "@Gworn any@W"
+  (or a bare "@Gworn@W") matches all equipped items; "@Gworn false@W" matches unequipped items.
+  Group values ear, neck, wrist, finger, and medal include their paired/numbered slots.
 
 Examples:
   "@Gdinv search clan From Crusaders of the Nameless One@W"
@@ -2583,6 +2719,7 @@ Examples:
   "@Gdinv search keywords hot searing@W"
   "@Gdinv search weight 5@W"
   "@Gdinv search flags resonated anti-evil@W"
+  "@Gdinv search illuminateremoval enchanter || resonateremoval enchanter || solidifyremoval enchanter@W"
   "@Gdinv search type weapon flag kept@W"
   "@Gdinv search type potion ~flag kept@W"
   "@Gdinv search type weapon minlevel 100 ~specials vorpal@W"
@@ -2595,6 +2732,10 @@ function inv.cli.get.examples()
     dbot.print(
 [[@W
 Move items matching the query from containers to your main inventory.
+
+Items already in main inventory are left in place. Worn items and keyring
+items are reported and skipped. Retrieval totals are confirmed from inventory
+events instead of being reported when commands are merely sent.
 
 Examples:
   1) Get all potions from all containers

@@ -369,6 +369,42 @@ function inv.priority.getWeight(priorityTable, fieldName, level)
     return 0
 end
 
+function inv.priority.getForce(priorityTable, fieldName, level)
+    if priorityTable == nil or fieldName == nil or not inv.priority.isEffect(fieldName) then
+        return false
+    end
+
+    level = tonumber(level) or 1
+    local data = priorityTable.effects and priorityTable.effects[fieldName]
+    if type(data) ~= "table" then
+        return tostring(data or ""):lower() == "force"
+    end
+
+    if data.levels and #data.levels > 0 then
+        for _, levelData in ipairs(data.levels) do
+            if level >= (levelData.min or 0) and level <= (levelData.max or 999) then
+                if levelData.force ~= nil then
+                    return levelData.force == true
+                end
+                return data.force == true
+            end
+        end
+    end
+
+    return data.force == true
+end
+
+function inv.priority.getForcedEffects(priorityTable, level)
+    local effects = {}
+    for _, effectName in ipairs(inv.priority.effectFields or {}) do
+        if inv.priority.getForce(priorityTable, effectName, level) then
+            table.insert(effects, effectName)
+        end
+    end
+    table.sort(effects)
+    return effects
+end
+
 function inv.priority.getLevelRanges(priorityTable)
     local levelRanges = {}
     local rangeSet = {}
@@ -741,22 +777,27 @@ function inv.priority.display(priorityName, endTag)
         local values = {}
 
         for _, range in ipairs(levelRanges) do
-            local weight = inv.priority.getWeight(priority, fieldName, range.min)
-            table.insert(values, weight)
-            if weight ~= 0 then
+            local isForced = inv.priority.getForce(priority, fieldName, range.min)
+            local value = isForced and "force" or inv.priority.getWeight(priority, fieldName, range.min)
+            table.insert(values, value)
+            if isForced or value ~= 0 then
                 hasValues = true
             end
         end
 
         if hasValues then
             local line = string.format("@C%12s", fieldName)
-            for _, weight in ipairs(values) do
-                local color = "@g"
-                if weight >= 1 then color = "@G" end
-                if weight >= 10 then color = "@Y" end
-                if weight >= 50 then color = "@R" end
-                if weight == 0 then color = "@r" end
-                line = line .. string.format("%s%7.2f", color, weight)
+            for _, value in ipairs(values) do
+                if value == "force" then
+                    line = line .. string.format("@M%7s", "FORCE")
+                else
+                    local color = "@g"
+                    if value >= 1 then color = "@G" end
+                    if value >= 10 then color = "@Y" end
+                    if value >= 50 then color = "@R" end
+                    if value == 0 then color = "@r" end
+                    line = line .. string.format("%s%7.2f", color, value)
+                end
             end
             line = line .. "@W  : @c" .. fieldInfo.desc .. "@w"
             dbot.print(line)
@@ -813,8 +854,12 @@ function inv.priority.compare(name1, name2)
     for effect in pairs(effects) do
         local w1 = p1.effects and p1.effects[effect] and p1.effects[effect].weight or 0
         local w2 = p2.effects and p2.effects[effect] and p2.effects[effect].weight or 0
-        if w1 ~= w2 then
-            dbot.print(string.format("  @Y%-12s@W: @G%d@W vs @C%d@W", effect, w1, w2))
+        local f1 = inv.priority.getForce(p1, effect, 1)
+        local f2 = inv.priority.getForce(p2, effect, 1)
+        if w1 ~= w2 or f1 ~= f2 then
+            local v1 = f1 and "force" or tostring(w1)
+            local v2 = f2 and "force" or tostring(w2)
+            dbot.print(string.format("  @Y%-12s@W: @G%s@W vs @C%s@W", effect, v1, v2))
         end
     end
     
@@ -883,52 +928,22 @@ function inv.priority.tableToColumnarString(priorityTable, priorityName)
     }
 
     for _, statName in ipairs(statFields) do
-        local statData = priorityTable[statName]
-        local effectData = priorityTable.effects and priorityTable.effects[statName]
-
         local hasValues = false
         local valueParts = { string.format("%-12s", statName) }
 
         for _, range in ipairs(sortedRanges) do
-            local weight = 0.00
+            local isForced = inv.priority.getForce(priorityTable, statName, range.min)
+            local weight = inv.priority.getWeight(priorityTable, statName, range.min)
 
-            if statData and type(statData) == "table" then
-                if statData.levels and #statData.levels > 0 then
-                    for _, levelData in ipairs(statData.levels) do
-                        if levelData.min == range.min and levelData.max == range.max then
-                            weight = levelData.weight or statData.weight or 0
-                            break
-                        end
-                    end
-                    if weight == 0 then
-                        weight = statData.weight or 0
-                    end
-                else
-                    weight = statData.weight or 0
-                end
-            end
-
-            if effectData and type(effectData) == "table" then
-                if effectData.levels and #effectData.levels > 0 then
-                    for _, levelData in ipairs(effectData.levels) do
-                        if levelData.min == range.min and levelData.max == range.max then
-                            weight = levelData.weight or effectData.weight or 0
-                            break
-                        end
-                    end
-                    if weight == 0 then
-                        weight = effectData.weight or 0
-                    end
-                else
-                    weight = effectData.weight or 0
-                end
-            end
-
-            if weight ~= 0 then
+            if isForced or weight ~= 0 then
                 hasValues = true
             end
 
-            table.insert(valueParts, string.format("%-8.2f", weight))
+            if isForced then
+                table.insert(valueParts, string.format("%-8s", "force"))
+            else
+                table.insert(valueParts, string.format("%-8.2f", weight))
+            end
         end
 
         local commonStats = {
@@ -985,20 +1000,36 @@ function inv.priority.columnarStringToTable(content)
             local levelWeights = {}
 
             for i = 2, #parts do
-                local weight = tonumber(parts[i])
-                if weight and levelRanges[i - 1] then
+                local rawValue = tostring(parts[i] or "")
+                local weight = tonumber(rawValue)
+                local isForced = rawValue:lower() == "force"
+                if isForced and not isEffect then
+                    dbot.warn("The 'force' priority value is only valid for effect rows, not '" .. fieldName .. "'.")
+                    return nil, DRL_RET_INVALID_PARAM
+                end
+                if weight == nil and not isForced then
+                    dbot.warn("Invalid priority value '" .. rawValue .. "' for '" .. fieldName .. "'.")
+                    return nil, DRL_RET_INVALID_PARAM
+                end
+                if levelRanges[i - 1] then
                     table.insert(levelWeights, {
                         min = levelRanges[i - 1].min,
                         max = levelRanges[i - 1].max,
-                        weight = weight
+                        weight = weight or 0,
+                        force = isForced,
                     })
                 end
             end
 
             local defaultWeight = levelWeights[1] and levelWeights[1].weight or 0
+            local defaultForce = levelWeights[1] and levelWeights[1].force or false
 
             if isEffect then
-                priorityTable.effects[fieldName] = { weight = defaultWeight, levels = levelWeights }
+                priorityTable.effects[fieldName] = {
+                    weight = defaultWeight,
+                    force = defaultForce,
+                    levels = levelWeights,
+                }
             else
                 priorityTable[fieldName] = { weight = defaultWeight, levels = levelWeights }
             end
@@ -1031,7 +1062,9 @@ function inv.priority.exportToFile(priorityName)
     end
 
     file:write("-- DINV Priority: " .. priorityName .. "\n")
-    file:write("-- After editing, run: dinv priority import " .. priorityName .. "\n\n")
+    file:write("-- After editing, run: dinv priority import " .. priorityName .. "\n")
+    file:write("-- Effect rows may use 'force' instead of a number to require that effect.\n")
+    file:write("-- 'force' is not valid for stat rows.\n\n")
 
     local header = string.format("%-12s", "levels")
     for _, range in ipairs(levelRanges) do
@@ -1042,8 +1075,12 @@ function inv.priority.exportToFile(priorityName)
     for _, fieldInfo in ipairs(inv.priority.allFields) do
         local line = string.format("%-12s", fieldInfo.name)
         for _, range in ipairs(levelRanges) do
-            local weight = inv.priority.getWeight(priority, fieldInfo.name, range.min)
-            line = line .. string.format(" %-7.2f", weight)
+            if inv.priority.getForce(priority, fieldInfo.name, range.min) then
+                line = line .. string.format(" %-7s", "force")
+            else
+                local weight = inv.priority.getWeight(priority, fieldInfo.name, range.min)
+                line = line .. string.format(" %-7.2f", weight)
+            end
         end
         file:write(line .. "\n")
     end
@@ -1095,6 +1132,7 @@ function inv.priority.importFromFile(priorityName, endTag)
     inv.priority.table[priorityName] = priorityEntry
     inv.priority.lastImported = priorityName
     inv.priority.save()
+    inv.priority.setDefault(priorityName)
 
     -- Invalidate any equipment set analysis based on this priority
     if inv.set and inv.set.table then
@@ -1128,7 +1166,7 @@ function inv.priority.tableToString(priorityTable, doDisplayUnused, doDisplayCol
     end
 
     local lines = {}
-    table.insert(lines, "# DINV priority format v1")
+    table.insert(lines, "# DINV priority format v2")
     table.insert(lines, "# Lines are formatted as key=value")
     table.insert(lines, "allowedDamTypes=" .. tostring(priorityTable.allowedDamTypes or "all"))
     table.insert(lines, "")
@@ -1153,11 +1191,13 @@ function inv.priority.tableToString(priorityTable, doDisplayUnused, doDisplayCol
     table.sort(effectNames)
     if #effectNames > 0 then
         table.insert(lines, "")
-        table.insert(lines, "# effects.<name>=weight")
+        table.insert(lines, "# effect.<name>=weight|force")
         for _, effectName in ipairs(effectNames) do
             local weight = effects[effectName] and effects[effectName].weight or 0
-            if doDisplayUnused or weight ~= 0 then
-                table.insert(lines, string.format("effect.%s=%d", effectName, weight))
+            local isForced = inv.priority.getForce(priorityTable, effectName, 1)
+            if doDisplayUnused or isForced or weight ~= 0 then
+                local value = isForced and "force" or tostring(weight)
+                table.insert(lines, string.format("effect.%s=%s", effectName, value))
             end
         end
     end
@@ -1186,9 +1226,25 @@ function inv.priority.stringToTable(priorityString, baseTable, keepMissing)
                     local effectName = key:sub(8)
                     priorityEntry.effects = priorityEntry.effects or {}
                     priorityEntry.effects[effectName] = priorityEntry.effects[effectName] or {}
-                    priorityEntry.effects[effectName].weight = tonumber(value) or 0
+                    local normalizedValue = trimString(value):lower()
+                    if normalizedValue == "force" then
+                        priorityEntry.effects[effectName].weight = 0
+                        priorityEntry.effects[effectName].force = true
+                    else
+                        local weight = tonumber(value)
+                        if weight == nil then
+                            dbot.warn("Invalid effect priority value '" .. tostring(value) .. "' for '" .. effectName .. "'.")
+                            return nil, DRL_RET_INVALID_PARAM
+                        end
+                        priorityEntry.effects[effectName].weight = weight
+                        priorityEntry.effects[effectName].force = false
+                    end
                     seenEffects[effectName] = true
                 else
+                    if trimString(value):lower() == "force" then
+                        dbot.warn("The 'force' priority value is only valid for effects, not '" .. key .. "'.")
+                        return nil, DRL_RET_INVALID_PARAM
+                    end
                     priorityEntry[key] = priorityEntry[key] or { weight = 0, levels = {} }
                     priorityEntry[key].weight = tonumber(value) or 0
                     seenStats[key] = true
@@ -1313,6 +1369,7 @@ function inv.priority.setEffectWeight(name, effect, weight)
     end
     
     priority.effects[effect].weight = tonumber(weight) or 0
+    priority.effects[effect].force = false
     dbot.info("Set " .. effect .. " weight to " .. priority.effects[effect].weight .. " in priority '" .. name .. "'")
     return DRL_RET_SUCCESS
 end

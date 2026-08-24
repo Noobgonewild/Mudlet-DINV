@@ -509,7 +509,11 @@ local function parseQuery(query, source)
             while index <= #tokens do
                 local key, negated = normalizeQueryKey(tokens[index])
                 if not tokens[index + 1] then
-                    table.insert(criteria, { key = "name", value = tokens[index], negated = negated })
+                    if key == "worn" then
+                        table.insert(criteria, { key = key, value = "any", negated = negated })
+                    else
+                        table.insert(criteria, { key = "name", value = tokens[index], negated = negated })
+                    end
                     break
                 end
 
@@ -557,11 +561,69 @@ local function hasFlag(item, value)
     end
     for flag in tostring(getRawField(item, "flags") or ""):gmatch("[^,%s]+") do
         local candidate = tostring(flag):lower()
-        if candidate == normalized or (normalized ~= "iskey" and contains(candidate, normalized)) then
+        if candidate == normalized then
             return true
         end
     end
     return false
+end
+
+local function hasFlags(item, value)
+    local found = false
+    for flag in tostring(value or ""):gmatch("[^,%s]+") do
+        found = true
+        if not hasFlag(item, flag) then
+            return false
+        end
+    end
+    return found
+end
+
+local apiWornGroups = {
+    ear = { lear = true, rear = true },
+    neck = { neck1 = true, neck2 = true },
+    wrist = { lwrist = true, rwrist = true },
+    finger = { lfinger = true, rfinger = true },
+    medal = { medal1 = true, medal2 = true, medal3 = true, medal4 = true },
+}
+
+local apiWornAliases = {
+    wield = "wielded",
+    ear1 = "lear",
+    ear2 = "rear",
+    wrist1 = "lwrist",
+    wrist2 = "rwrist",
+    finger1 = "lfinger",
+    finger2 = "rfinger",
+}
+
+local function matchesWornValue(item, value)
+    local target = trim(value):lower()
+    local isWorn = isWornItem(item)
+    if target == "" or target == "any" or target == "true"
+        or target == "worn" or target == "equipped" or target == "*" then
+        return isWorn
+    end
+    if target == "false" or target == "none" or target == "not-worn"
+        or target == "unworn" then
+        return not isWorn
+    end
+    if not isWorn then
+        return false
+    end
+
+    local numeric = tonumber(target)
+    if numeric and inv and inv.wearLoc and inv.wearLoc[numeric] then
+        target = tostring(inv.wearLoc[numeric]):lower()
+    end
+    target = apiWornAliases[target] or target
+
+    local worn = tostring(getRawField(item, "worn") or ""):lower()
+    local group = apiWornGroups[target]
+    if group then
+        return group[worn] == true
+    end
+    return worn == target
 end
 
 local function relativeParts(value)
@@ -599,7 +661,7 @@ local function matchesCriteria(objId, item, clauses)
             elseif key == "material" then
                 matched = contains(getRawField(item, "material"), value)
             elseif key == "flag" or key == "flags" then
-                matched = hasFlag(item, value)
+                matched = hasFlags(item, value)
             elseif key == "id" then
                 matched = tostring(objId) == tostring(value)
             elseif key == "container" then
@@ -613,7 +675,7 @@ local function matchesCriteria(objId, item, clauses)
                 local _, relativeLocation = relativeParts(value)
                 matched = contains(getRawField(item, "location"), relativeLocation or value)
             elseif key == "worn" then
-                matched = isWornItem(item)
+                matched = matchesWornValue(item, value)
             elseif key == "minlevel" then
                 matched = tonumber(value) ~= nil and level >= tonumber(value)
             elseif key == "maxlevel" then

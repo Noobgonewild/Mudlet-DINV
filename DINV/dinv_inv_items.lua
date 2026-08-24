@@ -24,6 +24,12 @@ inv.items.keepSync = inv.items.keepSync or {
 inv.items.consumableSpellListVersion = 1
 inv.items.consumableDrinkDataVersion = 1
 
+local enchantRemovalFields = {
+    [invStatFieldIlluminate] = invStatFieldIlluminateRemoval,
+    [invStatFieldResonate] = invStatFieldResonateRemoval,
+    [invStatFieldSolidify] = invStatFieldSolidifyRemoval,
+}
+
 ----------------------------------------------------------------------------------------------------
 -- Shared Item Effect Detection
 ----------------------------------------------------------------------------------------------------
@@ -369,6 +375,24 @@ function inv.items.hasCurrentConsumableData(itemOrStats)
         return tonumber(stats[invStatFieldDrinkDataVersion]) == inv.items.consumableDrinkDataVersion
     end
     return true
+end
+
+function inv.items.hasCurrentEnchantData(itemOrStats)
+    local stats = itemOrStats and (itemOrStats.stats or itemOrStats) or {}
+    for enchantField, removalField in pairs(enchantRemovalFields) do
+        if tostring(stats[enchantField] or "") ~= "" then
+            local removal = tostring(stats[removalField] or ""):lower()
+            if removal ~= "tp" and removal ~= "enchanter" then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+function inv.items.hasCurrentIdentifyData(itemOrStats)
+    return inv.items.hasCurrentConsumableData(itemOrStats)
+        and inv.items.hasCurrentEnchantData(itemOrStats)
 end
 
 function inv.items.getEffectTextFromStats(itemStats)
@@ -757,9 +781,11 @@ function inv.items.echoReportChannelPopup(triggerText, reporter, tooltipPrefix, 
             function() reporter("say") end,
             "",
             function() reporter("gtell") end,
+            "",
+            function() reporter("copy") end,
         },
         {
-            primaryHint .. "\nRight-click for other channels",
+            primaryHint .. "\nRight-click for channels or copy",
             plainLabel,
             "",
             defaultLabel,
@@ -769,6 +795,8 @@ function inv.items.echoReportChannelPopup(triggerText, reporter, tooltipPrefix, 
             "Say",
             "",
             "Group",
+            "",
+            "Copy",
         },
         true
     )
@@ -886,6 +914,7 @@ inv.items.identifyHydrateSource = inv.items.identifyHydrateSource or nil
 inv.items.identifyHydrateFound = inv.items.identifyHydrateFound or false
 inv.items.identifyHydratePreviousState = inv.items.identifyHydratePreviousState or nil
 inv.items.identifyHydrateTimerName = inv.items.identifyHydrateTimerName or nil
+inv.items.relativeQueryResolution = nil
 inv.items.discoveryStage = 0
 inv.items.discoveryContainers = {}
 inv.items.containerIndex = 0
@@ -989,6 +1018,9 @@ function inv.items.resetIdentifyEnchantFields(item)
     item.stats[invStatFieldIlluminate] = nil
     item.stats[invStatFieldResonate] = nil
     item.stats[invStatFieldSolidify] = nil
+    item.stats[invStatFieldIlluminateRemoval] = nil
+    item.stats[invStatFieldResonateRemoval] = nil
+    item.stats[invStatFieldSolidifyRemoval] = nil
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -1180,7 +1212,7 @@ function inv.items.normalizePersistentItem(item)
         changed = true
     end
     if stats.identifyLevel == invIdLevelFull
-        and not inv.items.hasCurrentConsumableData(stats) then
+        and not inv.items.hasCurrentIdentifyData(stats) then
         stats.identifyLevel = invIdLevelPartial
         changed = true
     end
@@ -1840,6 +1872,24 @@ function inv.items.abortInvalidRefresh(options)
     end
 end
 
+function inv.items.refreshResetTimer()
+    if not inv.config.isRefreshEnabled() then
+        return DRL_RET_SUCCESS
+    end
+
+    local periodMin = tonumber(inv.items.timer.refreshMin)
+        or tonumber(inv.config.getRefreshPeriod()) or 5
+    local intervalSec = periodMin * 60
+    inv.items.timer.refreshNextTs = os.time() + intervalSec
+
+    if tempTimer then
+        dbot.deleteTimer(inv.items.timer.name)
+        dbot.timers[inv.items.timer.name] = tempTimer(intervalSec, [[inv.items.refreshTick()]], true)
+    end
+
+    return DRL_RET_SUCCESS
+end
+
 function inv.items.refreshOn(periodMin, eagerSec)
     inv.items.timer.refreshMin = periodMin or 5
     inv.items.timer.refreshEagerSec = eagerSec or 0
@@ -1853,14 +1903,7 @@ function inv.items.refreshOn(periodMin, eagerSec)
     end
     
     -- Set up the timer
-    local intervalSec = inv.items.timer.refreshMin * 60
-    inv.items.timer.refreshNextTs = os.time() + intervalSec
-    if tempTimer then
-        dbot.deleteTimer(inv.items.timer.name)
-        dbot.timers[inv.items.timer.name] = tempTimer(intervalSec, [[inv.items.refreshTick()]], true)
-    end
-    
-    return DRL_RET_SUCCESS
+    return inv.items.refreshResetTimer()
 end
 
 function inv.items.refreshOff()
@@ -3017,7 +3060,11 @@ function inv.items._parseQuerySegment(segment)
         local nextToken = tokens[i + 1]
 
         if not nextToken then
-            table.insert(criteria, { key = "name", value = tokens[i], negated = negated })
+            if key == "worn" then
+                table.insert(criteria, { key = key, value = "any", negated = negated })
+            else
+                table.insert(criteria, { key = "name", value = tokens[i], negated = negated })
+            end
             break
         end
 
@@ -3104,6 +3151,397 @@ function inv.items.parseQuery(query)
     end
 
     return clauses
+end
+
+----------------------------------------------------------------------------------------------------
+-- Live Relative Query Resolution
+----------------------------------------------------------------------------------------------------
+
+local function copyRelativeQueryValue(value, seen)
+    if type(value) ~= "table" then
+        return value
+    end
+    seen = seen or {}
+    if seen[value] then
+        return seen[value]
+    end
+    local copied = {}
+    seen[value] = copied
+    for key, child in pairs(value) do
+        copied[copyRelativeQueryValue(key, seen)] = copyRelativeQueryValue(child, seen)
+    end
+    return copied
+end
+
+local function unresolvedRelativeCriterion(entry)
+    entry.key = "id"
+    entry.value = "__dinv_unresolved_relative_reference__"
+    entry.negated = false
+end
+
+local function clearRelativeResolutionTimer(state)
+    if not state or not state.timerName then
+        return
+    end
+    if dbot and dbot.deleteTimer then
+        dbot.deleteTimer(state.timerName)
+    elseif dbot and dbot.timers then
+        dbot.timers[state.timerName] = nil
+    end
+    state.timerName = nil
+end
+
+local function restoreRelativeResolvedItem(current)
+    if not current or not current.capture or not current.initialized or not current.objId then
+        return
+    end
+    if current.wasKnown then
+        inv.items.setItem(current.objId, current.originalItem, { silentApi = true })
+    elseif inv.items.removeItem then
+        inv.items.removeItem(current.objId, { silentApi = true })
+    elseif inv.items.table then
+        inv.items.table[tostring(current.objId)] = nil
+    end
+end
+
+local function cleanupRelativeQueryResolution(state)
+    clearRelativeResolutionTimer(state)
+    inv.items.relativeQueryResolution = nil
+    inv.items.identifyInProgress = false
+    inv.items.identifyCurrentId = nil
+    inv.items.currentIdentifyId = nil
+    inv.items.identifyResetId = nil
+    inv.items.identifyContinuationKey = nil
+    inv.items.identifyContinuation = nil
+    inv.items.identifyRidState = nil
+    inv.items.inIdentify = false
+    inv.state = state and state.previousState or invStateIdle
+    if DINV and DINV.discovery and DINV.discovery.unregisterIdentifyTriggers then
+        DINV.discovery.unregisterIdentifyTriggers()
+    end
+    if DINV and DINV.setBuildPhase then
+        DINV.setBuildPhase(0)
+    end
+    if sendGMCP then
+        sendGMCP("config prompt on")
+    end
+end
+
+local function finishRelativeQueryResolution(retval)
+    local state = inv.items.relativeQueryResolution
+    if not state then
+        return retval or DRL_RET_INVALID_PARAM
+    end
+
+    retval = retval or DRL_RET_SUCCESS
+    if retval == DRL_RET_SUCCESS and state.capturedItem and inv.items.save then
+        local saveRetval = inv.items.save()
+        if saveRetval ~= DRL_RET_SUCCESS then
+            dbot.warn("Unable to save the item resolved by rname to persistence.")
+            retval = saveRetval
+        end
+    end
+
+    local callback = state.callback
+    local clauses = state.clauses
+    cleanupRelativeQueryResolution(state)
+    if callback then
+        callback(clauses, retval, true)
+    end
+    return retval
+end
+
+local startNextRelativeReference
+
+local function completeRelativeReference()
+    local state = inv.items.relativeQueryResolution
+    local current = state and state.current or nil
+    if not state or not current then
+        return DRL_RET_INVALID_PARAM
+    end
+
+    clearRelativeResolutionTimer(state)
+    local objId = tostring(current.objId or "")
+    if current.error or objId == "" then
+        restoreRelativeResolvedItem(current)
+        unresolvedRelativeCriterion(current.entry)
+        if current.kind == "rname" then
+            dbot.warn("Relative item '" .. tostring(current.reference) ..
+                "' was not found in main inventory.")
+        else
+            dbot.warn("Relative container '" .. tostring(current.reference) ..
+                "' was not found in main inventory.")
+        end
+    elseif current.kind == "rname" then
+        local item = inv.items.getItem(objId)
+        local itemName = item and item.stats
+            and tostring(item.stats[invStatFieldName] or item.stats[invStatFieldColorName] or "") or ""
+        if not item or not item.stats or not current.sawOutput or itemName == "" then
+            restoreRelativeResolvedItem(current)
+            unresolvedRelativeCriterion(current.entry)
+            dbot.warn("Relative item '" .. tostring(current.reference) ..
+                "' did not return usable identify data.")
+        else
+            item.stats[invStatFieldId] = objId
+            if inv.items.updateLocation then
+                inv.items.updateLocation(item, invItemLocInventory)
+            else
+                item.stats[invStatFieldLocation] = invItemLocInventory
+            end
+            item.stats[invStatFieldContainer] = ""
+            item.stats[invStatFieldWorn] = invItemWornNotWorn
+            item.stats.identifyLevel = invIdLevelFull
+            inv.items.ensureKeywordsField(item)
+            inv.items.setItem(objId, item, { silentApi = true })
+            if inv.items.cacheIdentifiedItem then
+                inv.items.cacheIdentifiedItem(item)
+            end
+            current.entry.key = "id"
+            current.entry.value = objId
+            state.capturedItem = true
+        end
+    else
+        local container = inv.items.getItem(objId)
+        if not container then
+            unresolvedRelativeCriterion(current.entry)
+            dbot.warn("Relative container '" .. tostring(current.reference) ..
+                "' resolved to ID " .. objId .. " but is not present in DINV persistence. " ..
+                "No inventory discovery was performed.")
+        else
+            local itemType = inv.items.getStatField(objId, invStatFieldType) or ""
+            if inv.items.normalizeItemType(itemType):lower() ~= "container" then
+                unresolvedRelativeCriterion(current.entry)
+                dbot.warn("Relative location '" .. tostring(current.reference) ..
+                    "' resolved to ID " .. objId .. " but is not a container.")
+            else
+                current.entry.key = "container"
+                current.entry.value = objId
+            end
+        end
+    end
+
+    state.current = nil
+    inv.items.identifyCurrentId = nil
+    inv.items.currentIdentifyId = nil
+    inv.items.identifyResetId = nil
+    inv.items.identifyContinuationKey = nil
+    inv.items.identifyContinuation = nil
+    inv.items.identifyRidState = nil
+    if DINV and DINV.discovery then
+        DINV.discovery.identifyBuffer = {}
+        DINV.discovery.identifyCardOpen = false
+    end
+
+    return startNextRelativeReference()
+end
+
+function inv.items.handleRelativeIdentifyId(objId, line)
+    local state = inv.items.relativeQueryResolution
+    local current = state and state.current or nil
+    local normalizedId = tostring(objId or ""):match("^(%d+)$")
+    if not current or not normalizedId then
+        return DRL_RET_INVALID_PARAM
+    end
+
+    current.objId = normalizedId
+    if not current.capture then
+        return DRL_RET_SUCCESS
+    end
+    if current.initialized then
+        return DRL_RET_SUCCESS
+    end
+
+    local existing = inv.items.getItem(normalizedId)
+    current.wasKnown = existing ~= nil
+    current.originalItem = existing and copyRelativeQueryValue(existing) or nil
+    local item = existing or { stats = {} }
+    item.stats = item.stats or {}
+    item.stats[invStatFieldId] = normalizedId
+    inv.items.resetIdentifyStats(item)
+    inv.items.resetIdentifyEnchantFields(item)
+    inv.items.setItem(normalizedId, item, { silentApi = true })
+    current.initialized = true
+
+    local buffered = DINV and DINV.discovery and DINV.discovery.identifyBuffer or {}
+    if inv.items.parseIdentifyLine then
+        for _, bufferedLine in ipairs(buffered or {}) do
+            if not tostring(bufferedLine):match("^%s*|%s*%-+%s*|%s*$") then
+                inv.items.parseIdentifyLine(item, bufferedLine)
+                current.sawOutput = true
+            end
+        end
+        if line and tostring(line) ~= "" then
+            inv.items.parseIdentifyLine(item, tostring(line))
+        end
+    end
+    inv.items.setItem(normalizedId, item, { silentApi = true })
+    if DINV and DINV.discovery then
+        DINV.discovery.identifyBuffer = {}
+    end
+    return DRL_RET_SUCCESS
+end
+
+function inv.items.handleRelativeIdentifyLine(line)
+    local state = inv.items.relativeQueryResolution
+    local current = state and state.current or nil
+    if not current then
+        return DRL_RET_INVALID_PARAM
+    end
+    if not current.capture then
+        local id = tostring(line or ""):match("|%s*Id%s*:%s*(%d+)")
+        if id then
+            return inv.items.handleRelativeIdentifyId(id, line)
+        end
+        return DRL_RET_SUCCESS
+    end
+
+    local text = tostring(line or "")
+    local id = text:match("|%s*Id%s*:%s*(%d+)")
+    if id then
+        return inv.items.handleRelativeIdentifyId(id, text)
+    end
+    if not current.objId then
+        if DINV and DINV.discovery then
+            DINV.discovery.identifyBuffer = DINV.discovery.identifyBuffer or {}
+            table.insert(DINV.discovery.identifyBuffer, text)
+        end
+        return DRL_RET_SUCCESS
+    end
+
+    local item = inv.items.getItem(current.objId)
+    if item and inv.items.parseIdentifyLine
+        and not text:match("^%s*|%s*%-+%s*|%s*$") then
+        inv.items.parseIdentifyLine(item, text)
+        inv.items.setItem(current.objId, item, { silentApi = true })
+        current.sawOutput = true
+    end
+    return DRL_RET_SUCCESS
+end
+
+function inv.items.markRelativeIdentifyFailure(reason)
+    local state = inv.items.relativeQueryResolution
+    if not state or not state.current then
+        return false
+    end
+    state.current.error = tostring(reason or "not found")
+    return true
+end
+
+function inv.items.handleRelativeIdentifyFence()
+    if not inv.items.relativeQueryResolution then
+        return DRL_RET_INVALID_PARAM
+    end
+    return completeRelativeReference()
+end
+
+startNextRelativeReference = function()
+    local state = inv.items.relativeQueryResolution
+    if not state then
+        return DRL_RET_INVALID_PARAM
+    end
+
+    state.index = state.index + 1
+    local reference = state.references[state.index]
+    if not reference then
+        return finishRelativeQueryResolution(DRL_RET_SUCCESS)
+    end
+
+    state.current = {
+        entry = reference.entry,
+        kind = reference.kind,
+        reference = tostring(reference.entry.value or ""),
+        capture = reference.kind == "rname",
+    }
+    inv.items.identifyCurrentId = nil
+    inv.items.currentIdentifyId = nil
+    inv.items.identifyResetId = nil
+    if DINV and DINV.discovery then
+        DINV.discovery.identifyBuffer = {}
+        DINV.discovery.identifyCardOpen = false
+    end
+
+    state.timerName = "inv.items.relativeQueryResolution"
+    if tempTimer then
+        local timerId = tempTimer(5.0, function()
+            if inv.items.relativeQueryResolution == state then
+                dbot.warn("Timed out while resolving relative reference '" ..
+                    tostring(state.current and state.current.reference or "") .. "'.")
+                finishRelativeQueryResolution(DRL_RET_INTERNAL_ERROR)
+            end
+        end)
+        if dbot and dbot.timers then
+            dbot.timers[state.timerName] = timerId
+        end
+    end
+
+    local command = "identify " .. state.current.reference
+    if sendSilent then
+        sendSilent(command)
+        sendSilent("echo " .. inv.items.identifyFence)
+    elseif send then
+        send(command, false)
+        send("echo " .. inv.items.identifyFence, false)
+    else
+        return finishRelativeQueryResolution(DRL_RET_UNINITIALIZED)
+    end
+    return DRL_RET_SUCCESS
+end
+
+function inv.items.resolveSearchQuery(query, callback)
+    local clauses = copyRelativeQueryValue(inv.items.parseQuery(query or ""))
+    local references = {}
+    for _, criteria in ipairs(clauses) do
+        for _, entry in ipairs(criteria) do
+            local key = tostring(entry.key or ""):lower()
+            if key == "rname" or key == "rlocation" or key == "rloc" then
+                table.insert(references, {
+                    entry = entry,
+                    kind = key == "rname" and "rname" or "rlocation",
+                })
+            end
+        end
+    end
+
+    if #references == 0 then
+        if callback then
+            callback(clauses, DRL_RET_SUCCESS, false)
+        end
+        return DRL_RET_SUCCESS, false
+    end
+    if inv.items.relativeQueryResolution or inv.items.buildInProgress
+        or inv.items.refreshInProgress or inv.items.identifyInProgress
+        or inv.items.identifyHydrateInProgress then
+        dbot.warn("DINV is busy and cannot resolve a relative search reference right now.")
+        return DRL_RET_BUSY, false
+    end
+    if not DINV or not DINV.discovery or not DINV.discovery.registerIdentifyTriggers then
+        dbot.warn("DINV identify triggers are unavailable; relative search cannot be resolved.")
+        return DRL_RET_UNINITIALIZED, false
+    end
+    if dbot.gmcp and dbot.gmcp.statePreventsActions and dbot.gmcp.statePreventsActions() then
+        dbot.warn("Your current state prevents relative search resolution.")
+        return DRL_RET_NOT_ACTIVE, false
+    end
+    if dbot.gmcp and dbot.gmcp.stateIsInCombat and dbot.gmcp.stateIsInCombat() then
+        dbot.warn("Relative search references cannot be resolved during combat.")
+        return DRL_RET_IN_COMBAT, false
+    end
+
+    inv.items.relativeQueryResolution = {
+        clauses = clauses,
+        references = references,
+        index = 0,
+        callback = callback,
+        previousState = inv.state,
+        capturedItem = false,
+    }
+    inv.items.identifyInProgress = true
+    inv.state = invStateIdentify
+    if DINV.setBuildPhase then
+        DINV.setBuildPhase(4)
+    end
+    DINV.discovery.registerIdentifyTriggers()
+    return startNextRelativeReference(), true
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -3646,7 +4084,7 @@ function inv.items.applyCachedStats(item)
     local staged = itemId and inv.items.buildResumeItems
         and inv.items.buildResumeItems[tostring(itemId)] or nil
     if staged and staged.stats and staged.stats.identifyLevel == invIdLevelFull
-        and inv.items.hasCurrentConsumableData(staged.stats) then
+        and inv.items.hasCurrentIdentifyData(staged.stats) then
         for key, value in pairs(staged.stats) do
             if not dynamicFields[key] or exactObjectFields[key] then
                 item.stats[key] = value
@@ -3664,7 +4102,7 @@ function inv.items.applyCachedStats(item)
     if DINV and DINV.database and DINV.database.loadConsumableTemplate then
         local template = DINV.database.loadConsumableTemplate(item)
         if template and template.stats and template.stats.identifyLevel == invIdLevelFull
-            and inv.items.hasCurrentConsumableData(template.stats) then
+            and inv.items.hasCurrentIdentifyData(template.stats) then
             for key, value in pairs(template.stats) do
                 if not dynamicFields[key] then
                     item.stats[key] = value
@@ -3682,7 +4120,7 @@ function inv.items.applyCachedStats(item)
     if itemId then
         local cached = inv.cache.get("recent", tostring(itemId))
         if cached and cached.stats and cached.stats.identifyLevel == invIdLevelFull
-            and inv.items.hasCurrentConsumableData(cached.stats) then
+            and inv.items.hasCurrentIdentifyData(cached.stats) then
             dbot.debug("Cache hit (recent) for ID: " .. tostring(itemId), "inv.items")
             for k, v in pairs(cached.stats) do
                 if k ~= invStatFieldId then
@@ -3708,7 +4146,7 @@ function inv.items.applyCachedStats(item)
                 if cached and cached.stats then
                     local cachedIdentify = cached.stats.identifyLevel or invIdLevelNone
                     if cachedIdentify == invIdLevelFull
-                        and inv.items.hasCurrentConsumableData(cached.stats) then
+                        and inv.items.hasCurrentIdentifyData(cached.stats) then
                         dbot.debug("Cache hit (frequent) for: " .. nameKey, "inv.items")
                         for k, v in pairs(cached.stats) do
                             if k ~= invStatFieldId then
@@ -6105,19 +6543,19 @@ function inv.items.onInvmon(dataLine)
     if DINV and DINV.database then
         if actionNum == invmonActionConsumed and DINV.database.recordTerminalRemoval then
             local persisted, persistErr = DINV.database.recordTerminalRemoval(
-                eventSeq, objId, actionNum, eventReason, containerId, wearLoc
+                eventSeq, objId, actionNum, eventReason, containerId, wearLoc, item
             )
             if not persisted then
                 dbot.warn("Unable to persist consumed/rotted removal immediately: " .. tostring(persistErr))
                 if DINV.database.recordInventoryEvent then
                     DINV.database.recordInventoryEvent(
-                        eventSeq, objId, actionNum, eventReason, containerId, wearLoc
+                        eventSeq, objId, actionNum, eventReason, containerId, wearLoc, item
                     )
                 end
             end
         elseif DINV.database.recordInventoryEvent then
             DINV.database.recordInventoryEvent(
-                eventSeq, objId, actionNum, eventReason, containerId, wearLoc
+                eventSeq, objId, actionNum, eventReason, containerId, wearLoc, item
             )
         end
     end
@@ -6662,17 +7100,85 @@ end
 function inv.items.hasSearchFlag(objId, value)
     local normalized = tostring(value or ""):lower()
     if normalized == "kept" then
-        return inv.items.getStatField(objId, invStatFieldKeepflag) == true
+        local keep = inv.items.getStatField(objId, invStatFieldKeepflag)
+        return keep == true or tostring(keep):lower() == "true" or tostring(keep) == "1"
     end
 
     local flagsStr = inv.items.getStatField(objId, invStatFieldFlags) or ""
-    for flag in tostring(flagsStr):gmatch("%S+") do
-        flag = flag:gsub(",", "")
-        if string.find(string.lower(flag), normalized, 1, true) ~= nil then
+    for flag in tostring(flagsStr):gmatch("[^,%s]+") do
+        if string.lower(flag) == normalized then
             return true
         end
     end
     return false
+end
+
+local function querySetValues(value)
+    local values = {}
+    for token in tostring(value or ""):gmatch("[^,%s]+") do
+        table.insert(values, token:lower())
+    end
+    return values
+end
+
+function inv.items.hasSearchFlags(objId, value)
+    local values = querySetValues(value)
+    if #values == 0 then
+        return false
+    end
+    for _, flag in ipairs(values) do
+        if not inv.items.hasSearchFlag(objId, flag) then
+            return false
+        end
+    end
+    return true
+end
+
+local wornQueryGroups = {
+    ear = { lear = true, rear = true },
+    neck = { neck1 = true, neck2 = true },
+    wrist = { lwrist = true, rwrist = true },
+    finger = { lfinger = true, rfinger = true },
+    medal = { medal1 = true, medal2 = true, medal3 = true, medal4 = true },
+}
+
+local wornQueryAliases = {
+    wield = "wielded",
+    ear1 = "lear",
+    ear2 = "rear",
+    wrist1 = "lwrist",
+    wrist2 = "rwrist",
+    finger1 = "lfinger",
+    finger2 = "rfinger",
+}
+
+function inv.items.matchesWornValue(objId, value)
+    local target = tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+    local isWorn = inv.items.isWorn(objId)
+    if target == "" or target == "any" or target == "true"
+        or target == "worn" or target == "equipped" or target == "*" then
+        return isWorn
+    end
+    if target == "false" or target == "none" or target == "not-worn"
+        or target == "unworn" then
+        return not isWorn
+    end
+    if not isWorn then
+        return false
+    end
+
+    local numeric = tonumber(target)
+    if numeric and inv.wearLoc and inv.wearLoc[numeric] then
+        target = tostring(inv.wearLoc[numeric]):lower()
+    end
+    target = wornQueryAliases[target] or target
+
+    local worn = tostring(inv.items.getStatField(objId, invStatFieldWorn) or ""):lower()
+    local group = wornQueryGroups[target]
+    if group then
+        return group[worn] == true
+    end
+    return worn == target
 end
 
 function inv.items.matchesParsedQuery(objId, clauses)
@@ -6721,7 +7227,7 @@ function inv.items.matchesParsedQuery(objId, clauses)
                 local material = inv.items.getStatField(objId, invStatFieldMaterial) or ""
                 match = string.find(string.lower(material), string.lower(value), 1, true) ~= nil
             elseif key == "flag" or key == "flags" then
-                match = inv.items.hasSearchFlag(objId, value)
+                match = inv.items.hasSearchFlags(objId, value)
             elseif key == "id" then
                 match = tostring(objId) == tostring(value)
             elseif key == "container" then
@@ -6739,7 +7245,7 @@ function inv.items.matchesParsedQuery(objId, clauses)
                 local location = inv.items.getStatField(objId, invStatFieldLocation) or ""
                 match = string.find(string.lower(tostring(location)), string.lower(tostring(target)), 1, true) ~= nil
             elseif key == "worn" then
-                match = inv.items.isWorn(objId)
+                match = inv.items.matchesWornValue(objId, value)
             elseif key == "minlevel" then
                 local minLevel = tonumber(value)
                 match = minLevel ~= nil and level >= minLevel
@@ -6792,7 +7298,7 @@ function inv.items.search(query, displayMode, options)
         return {}, DRL_RET_SUCCESS
     end
 
-    local clauses = inv.items.parseQuery(query or "")
+    local clauses = options.parsedClauses or inv.items.parseQuery(query or "")
     local results = nil
     if DINV and DINV.database and DINV.database.searchParsed then
         local searchError
@@ -6826,7 +7332,7 @@ function inv.items.search(query, displayMode, options)
 
     -- Handle relative matches like "3.sword" by applying ordinal filtering.
     local relIndex, relName = inv.items.convertRelative(query or "")
-    if relIndex and relName then
+    if not options.skipRelativeFilter and relIndex and relName then
         local filtered = {}
         local count = 0
         for _, objId in ipairs(results) do
@@ -6843,7 +7349,7 @@ function inv.items.search(query, displayMode, options)
     end
 
     local clausesLower = tostring(query or ""):lower()
-    local rnameValue = clausesLower:match("rname%s+(%S+)")
+    local rnameValue = not options.skipRelativeFilter and clausesLower:match("rname%s+(%S+)") or nil
     if rnameValue then
         local idx, namePart = inv.items.convertRelative(rnameValue)
         if idx and namePart then
@@ -6903,6 +7409,25 @@ local function statSearchComponentNumber(component)
     return parseStatSearchNumber(value)
 end
 
+local function statSearchEnchantTotal(components)
+    local total = 0
+    local foundNumber = false
+    for _, component in ipairs(components or {}) do
+        local number = statSearchComponentNumber(component)
+        if number ~= nil then
+            total = total + number
+            foundNumber = true
+        end
+    end
+    return foundNumber and total or nil
+end
+
+local function statSearchUsesEnchantTotal(predicate)
+    return predicate.selector == nil
+        and (predicate.field == invStatFieldIlluminate
+            or predicate.field == invStatFieldResonate)
+end
+
 local function statSearchPredicateMatches(objId, predicate)
     local rawValue = inv.items.getStatField(objId, predicate.field)
     if rawValue == nil then
@@ -6935,6 +7460,15 @@ local function statSearchPredicateMatches(objId, predicate)
     end
     if not predicate.comparison then
         return true
+    end
+
+    if statSearchUsesEnchantTotal(predicate) then
+        local total = statSearchEnchantTotal(components)
+        return total ~= nil and compareStatSearchNumbers(
+            total,
+            predicate.comparison.operator,
+            predicate.comparison.number
+        )
     end
 
     for _, component in ipairs(components) do
@@ -7044,6 +7578,10 @@ local function statSearchSortValue(objId, predicate)
     local components = statSearchEnchantComponents(rawValue, predicate.selector)
     if #components == 0 then
         return nil, nil
+    end
+    if statSearchUsesEnchantTotal(predicate) then
+        local total = statSearchEnchantTotal(components)
+        return total ~= nil and "number" or nil, total
     end
     local number = statSearchComponentNumber(components[1])
     if number ~= nil then
@@ -7896,7 +8434,13 @@ function inv.items.displayStatSearchResults(itemIds, spec)
         for _, field in ipairs((spec and spec.fields) or {}) do
             local kind = inv.items.statSearchFieldKinds[field]
             local rawValue = inv.items.getStatField(normalizedId, field)
-            table.insert(pairsText, "@C" .. tostring(field) .. "@w " ..
+            local labelColor = "@C"
+            local removalField = enchantRemovalFields[field]
+            if removalField
+                and inv.items.getStatField(normalizedId, removalField) == "tp" then
+                labelColor = "@M"
+            end
+            table.insert(pairsText, labelColor .. tostring(field) .. "@w " ..
                 formatStatSearchDisplayValue(rawValue, kind))
         end
 
@@ -7944,17 +8488,102 @@ function inv.items.get(query, endTag)
         dbot.info("No items matching '" .. query .. "' found.")
         return DRL_RET_MISSING_ENTRY
     end
-    
+
+    local counts = {
+        alreadyInventory = 0,
+        worn = 0,
+        keyring = 0,
+        unavailable = 0,
+    }
+    local commands = {}
+
+    local function getSummary(retrieved, failed)
+        return string.format(
+            "Retrieved %d item(s). Already in inventory: %d. Worn: %d. Keyring: %d. " ..
+                "Unavailable: %d. Failed/unconfirmed: %d.",
+            tonumber(retrieved) or 0,
+            counts.alreadyInventory,
+            counts.worn,
+            counts.keyring,
+            counts.unavailable,
+            tonumber(failed) or 0
+        )
+    end
+
     for _, objId in ipairs(itemIds) do
-        local container = inv.items.getStatField(objId, invStatFieldContainer)
-        if container and container ~= "" then
-            inv.items.sendActionCommand("get " .. objId .. " " .. container)
+        local currentLoc = tostring(inv.items.getStatField(objId, invStatFieldLocation) or "")
+        local wornLoc = tostring(inv.items.getStatField(objId, invStatFieldWorn) or "")
+        local isWorn = inv.items.isWornLocation(objId, currentLoc)
+
+        if isWorn then
+            local slot = inv.items.resolveWearSlot(wornLoc)
+                or inv.items.resolveWearSlot(currentLoc)
+                or wornLoc
+            if slot == "" then
+                slot = "unknown slot"
+            end
+            counts.worn = counts.worn + 1
+            dbot.info("Item " .. tostring(objId) .. " is worn at " .. tostring(slot) .. "; skipped.")
+        elseif currentLoc == tostring(invItemLocInventory or "inventory") then
+            -- Current location is authoritative. Do not let a stale historical
+            -- container field turn an already-carried item into a get command.
+            counts.alreadyInventory = counts.alreadyInventory + 1
+        elseif inv.items.isKeyringItem(objId) then
+            counts.keyring = counts.keyring + 1
+            dbot.info("Item " .. tostring(objId) .. " is on the keyring; skipped.")
         else
-            inv.items.sendActionCommand("get " .. objId)
+            local container = inv.items.normalizeContainerId(currentLoc)
+                or inv.items.normalizeContainerId(
+                    inv.items.getStatField(objId, invStatFieldContainer)
+                )
+            if container then
+                table.insert(commands, "get " .. tostring(objId) .. " " .. container)
+            else
+                counts.unavailable = counts.unavailable + 1
+                local locationLabel = currentLoc ~= "" and currentLoc or "unknown"
+                dbot.warn("Item " .. tostring(objId) .. " has unsupported or unknown location '" ..
+                    locationLabel .. "'; skipped.")
+            end
         end
     end
-    
-    dbot.info("Retrieved " .. #itemIds .. " item(s)")
+
+    if #commands == 0 then
+        dbot.info(getSummary(0, 0))
+        return DRL_RET_SUCCESS
+    end
+
+    local operationId = nil
+    if inv.operations and inv.operations.startBatchFromCommands then
+        operationId = inv.operations.startBatchFromCommands("DINV get", commands, {
+            report = false,
+            onFinish = function(result)
+                local confirmed = tonumber(result and result.confirmed) or 0
+                local failed = math.max(0, #commands - confirmed)
+                local message = getSummary(confirmed, failed)
+                if failed > 0 then
+                    dbot.warn(message)
+                else
+                    dbot.info(message)
+                end
+            end,
+        })
+    end
+
+    local sendRet = inv.items.sendActionCommands(commands)
+    if sendRet ~= DRL_RET_SUCCESS then
+        if operationId and inv.operations and inv.operations.finish then
+            inv.operations.finish(operationId, true)
+        end
+        return sendRet
+    end
+
+    if operationId then
+        dbot.info("Requested retrieval of " .. #commands ..
+            " item(s); awaiting inventory confirmation.")
+    else
+        dbot.info("Requested retrieval of " .. #commands ..
+            " item(s); confirmation tracking is unavailable.")
+    end
     return DRL_RET_SUCCESS
 end
 

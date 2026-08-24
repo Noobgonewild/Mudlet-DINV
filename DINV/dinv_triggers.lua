@@ -24,6 +24,9 @@ function DINV.triggers.registerEnhanced()
         "^\\{identify\\}$",
         function()
             -- RID identify interception disabled (RID command/module is commented out)
+            if inv.items.relativeQueryResolution then
+                return
+            end
             inv.items.inIdentify = true
             inv.items.identifyContinuation = nil
             dbot.debug("identify start", "triggers")
@@ -34,6 +37,9 @@ function DINV.triggers.registerEnhanced()
         "^\\{/identify\\}$",
         function()
             -- RID identify interception disabled (RID command/module is commented out)
+            if inv.items.relativeQueryResolution then
+                return
+            end
             inv.items.inIdentify = false
             local objId = inv.items.currentIdentifyId
             if objId then
@@ -65,6 +71,13 @@ function DINV.triggers.registerEnhanced()
             -- Mudlet provides regex captures via global 'matches'. tempRegexTrigger
             -- callbacks are not guaranteed to receive captures as function args.
             if not matches then return end
+
+            -- Relative search has a dedicated buffered parser. In particular,
+            -- rlocation must extract only the ID and must never persist the
+            -- container merely because it was resolved.
+            if inv and inv.items and inv.items.relativeQueryResolution then
+                return
+            end
 
             -- Only parse identify output while DINV is actively doing inventory work
             -- (build/refresh/identify) or inside an identify block.
@@ -366,6 +379,12 @@ function inv.items.parseIdentifyLine(item, line)
         solidify = invStatFieldSolidify,
     }
 
+    local enchantRemovalFields = {
+        illuminate = invStatFieldIlluminateRemoval,
+        resonate = invStatFieldResonateRemoval,
+        solidify = invStatFieldSolidifyRemoval,
+    }
+
     local function addEnchantType(kind)
         if not kind or kind == "" then
             return
@@ -396,6 +415,16 @@ function inv.items.parseIdentifyLine(item, line)
         local field = enchantValueFields[kind]
         if not field then
             return
+        end
+
+        local removalField = enchantRemovalFields[kind]
+        if removalField then
+            local lowerValue = string.lower(tostring(value or ""))
+            if string.find(lowerValue, "(removable with tp only)", 1, true) then
+                item.stats[removalField] = "tp"
+            elseif string.find(lowerValue, "(removable by enchanter)", 1, true) then
+                item.stats[removalField] = "enchanter"
+            end
         end
 
         value = cleanEnchantValue(value)

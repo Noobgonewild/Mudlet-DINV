@@ -16,7 +16,7 @@
 ----------------------------------------------------------------------------------------------------
 
 DINV = DINV or {}
-DINV.version = { major = 2, minor = 64 }
+DINV.version = { major = 2, minor = 65 }
 
 -- Get the Mudlet profile directory for module loading
 local profilePath = getMudletHomeDir()
@@ -31,7 +31,7 @@ DINV.modules = {
     "dinv_inv_compare", "dinv_inv_statbonus", "dinv_inv_consume", "dinv_inv_consume_window", "dinv_inv_portal",
     "dinv_inv_pass", "dinv_inv_regen", "dinv_inv_organize", "dinv_inv_keyword",
     "dinv_inv_tags", "dinv_inv_unused", "dinv_inv_discover", "dinv_inv_report",
-    "dinv_rid", "dinv_api", "dinv_cli", "dinv_triggers", "dinv_aliases",
+    "dinv_inv_history", "dinv_rid", "dinv_api", "dinv_cli", "dinv_triggers", "dinv_aliases",
 }
 
 function DINV.setTriggerGroupEnabled(enabled)

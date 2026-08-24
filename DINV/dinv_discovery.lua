@@ -921,11 +921,12 @@ function DINV.discovery.registerIdentifyTriggers()
 	end
     dbot.debug("@YRegistering identify triggers...@W", "discovery")
 	
-    local function shouldSuppressIdentifyOutput()
+	local function shouldSuppressIdentifyOutput()
 		local buildInProgress = inv and inv.items and inv.items.buildInProgress
 		local refreshInProgress = inv and inv.items and inv.items.refreshInProgress
 		local identifyInProgress = inv and inv.items and inv.items.identifyInProgress
-		local workflowActive = (buildInProgress or refreshInProgress) and true or false
+		local relativeResolution = inv and inv.items and inv.items.relativeQueryResolution ~= nil
+		local workflowActive = (buildInProgress or refreshInProgress or relativeResolution) and true or false
 		local result = workflowActive and identifyInProgress and true or false
 		dbot.debug(
 			"shouldSuppress: build=" .. tostring(buildInProgress)
@@ -1076,7 +1077,9 @@ function DINV.discovery.registerIdentifyTriggers()
         function()
             dbot.debug("@YTrigger fired: identify.notSee@W", "discovery")
             if inv.items.identifyInProgress then
-                if inv.items.handleIdentifyGetFailure then
+                if inv.items.relativeQueryResolution and inv.items.markRelativeIdentifyFailure then
+                    inv.items.markRelativeIdentifyFailure("not seen")
+                elseif inv.items.handleIdentifyGetFailure then
                     inv.items.handleIdentifyGetFailure("not seen")
                 end
                 if shouldSuppressIdentifyOutput() then
@@ -1107,8 +1110,10 @@ function DINV.discovery.registerIdentifyTriggers()
         function()
             dbot.debug("@YTrigger fired: identify.fence@W", "discovery")
             if inv.items.identifyInProgress then
-                dbot.debug("@YCalling handleIdentifyFence with id: " .. tostring(inv.items.identifyCurrentId) .. "@W", "discovery")
-                if inv.items.handleIdentifyFence then
+                if inv.items.relativeQueryResolution and inv.items.handleRelativeIdentifyFence then
+                    inv.items.handleRelativeIdentifyFence()
+                elseif inv.items.handleIdentifyFence then
+                    dbot.debug("@YCalling handleIdentifyFence with id: " .. tostring(inv.items.identifyCurrentId) .. "@W", "discovery")
                     inv.items.handleIdentifyFence(inv.items.identifyCurrentId)
                 else
                     dbot.debug("@RhandleIdentifyFence does not exist!@W", "discovery")
@@ -1132,6 +1137,10 @@ function DINV.discovery.registerIdentifyTriggers()
 					return
 				end
 				if not DINV.discovery.identifyCardOpen then
+					return
+				end
+				if inv.items.relativeQueryResolution and inv.items.handleRelativeIdentifyLine then
+					inv.items.handleRelativeIdentifyLine(line)
 					return
 				end
 				if line:match("|%s*Id%s*:") then
@@ -1217,6 +1226,13 @@ function DINV.discovery.registerIdentifyTriggers()
             matches = matches or _G.matches
             local objId = matches and (matches[2] or matches[1]) or nil
             if objId and inv.items.identifyInProgress then
+                if inv.items.relativeQueryResolution and inv.items.handleRelativeIdentifyId then
+                    inv.items.handleRelativeIdentifyId(objId, getCurrentLine())
+                    if shouldSuppressIdentifyOutput() then
+                        deleteLine()
+                    end
+                    return
+                end
                 inv.items.identifySawOutput = inv.items.identifySawOutput or {}
                 inv.items.identifySawOutput[tostring(objId)] = true
                 if objId ~= inv.items.identifyCurrentId then

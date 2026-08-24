@@ -88,7 +88,14 @@ end
 local function reportLine(line, channel)
     local reportChannel = channel or inv.report.getChannel() or reportDefaultChannel
     local cleanedLine = tostring(line or ""):gsub("^@w", ""):gsub("%s+$", "")
-    if reportChannel == "echo" then
+    if tostring(reportChannel):lower() == "copy" then
+        if type(setClipboardText) ~= "function" then
+            dbot.warn("inv.report: setClipboardText is unavailable; requires Mudlet 4.10 or newer")
+            return DRL_RET_UNINITIALIZED
+        end
+        setClipboardText(cleanedLine)
+        dbot.info("Copied report text to clipboard with color codes")
+    elseif reportChannel == "echo" then
         if dbot and dbot.convertColors then
             cecho(dbot.convertColors(cleanedLine) .. "\n")
         else

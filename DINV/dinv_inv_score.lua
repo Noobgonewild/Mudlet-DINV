@@ -17,60 +17,39 @@ inv.priority = inv.priority or {}
 inv.statBonus = inv.statBonus or {}
 inv.statBonus.equipBonus = inv.statBonus.equipBonus or {}
 
-local invScoreInnateFlyingRaces = {
-    gargoyle = true,
-    sprite = true,
-    vampire = true,
-    wraith = true,
-}
-
-local function invScoreGetNormalizedGmcpRace()
-    local race = nil
-    if dbot and dbot.gmcp and dbot.gmcp.getRace then
-        race = dbot.gmcp.getRace()
-    elseif gmcp and gmcp.char and gmcp.char.base then
-        race = gmcp.char.base.race
+local function invScoreFormatEffectAccess(access)
+    if not access then return "available without equipment" end
+    if access.source == "race" then
+        return "race:" .. tostring(access.race or "unknown")
     end
-    race = tostring(race or ""):lower()
-    race = race:match("^%s*(.-)%s*$") or ""
-    return race
+    if access.source == "superhero" then
+        return string.format(
+            "superhero wearableLevel:%d threshold:%d",
+            tonumber(access.wearableLevel) or 0,
+            tonumber(access.threshold) or 0
+        )
+    end
+    return string.format(
+        "class:%s ability:%s wearableLevel:%d threshold:%d",
+        tostring(access.className or "Unknown"),
+        tostring(access.ability or access.effect or "unknown"),
+        tonumber(access.wearableLevel) or 0,
+        tonumber(access.threshold) or 0
+    )
 end
 
-local function invScoreGetNormalizedPrimaryClass()
-    local className = nil
-    if dbot and dbot.gmcp and dbot.gmcp.getClass then
-        className = dbot.gmcp.getClass()
-    elseif gmcp and gmcp.char and gmcp.char.base then
-        className = gmcp.char.base.class
+local function invScoreShouldSkipEffect(effectName, level)
+    if dbot and dbot.ability and dbot.ability.getEffectAccess then
+        local available, access = dbot.ability.getEffectAccess(effectName, level)
+        if available then
+            return true, invScoreFormatEffectAccess(access)
+        end
     end
-    className = tostring(className or ""):lower()
-    className = className:match("^%s*(.-)%s*$") or ""
-    return className
+    return false, ""
 end
 
 local function invScoreShouldSkipFlyingEffect(level)
-    local effectiveLevel = tonumber(level)
-    if effectiveLevel == nil then
-        if dbot and dbot.gmcp and dbot.gmcp.getWearableLevel then
-            effectiveLevel = tonumber(dbot.gmcp.getWearableLevel())
-        end
-    end
-    effectiveLevel = effectiveLevel or 1
-
-    local race = invScoreGetNormalizedGmcpRace()
-    if race ~= "" and race ~= "unknown" and invScoreInnateFlyingRaces[race] then
-        return true, "race:" .. race
-    end
-
-    local className = invScoreGetNormalizedPrimaryClass()
-    if className == "psionicist" and effectiveLevel >= 22 then
-        return true, string.format("class:%s effectiveLevel:%d threshold:22", className, effectiveLevel)
-    end
-    if className == "mage" and effectiveLevel >= 36 then
-        return true, string.format("class:%s effectiveLevel:%d threshold:36", className, effectiveLevel)
-    end
-
-    return false, ""
+    return invScoreShouldSkipEffect("flying", level)
 end
 
 function inv.score.getFlyingSkipReason(level)
@@ -82,22 +61,27 @@ function inv.score.getFlyingSkipReason(level)
 end
 
 local function invScoreShouldSkipDualWieldEffect(level)
-    if dbot and dbot.ability and dbot.ability.getDualWieldAccess then
-        local available, access = dbot.ability.getDualWieldAccess(level)
-        if available then
-            return true, string.format(
-                "class:%s wearableLevel:%d threshold:%d",
-                tostring(access.className or "Unknown"),
-                tonumber(access.wearableLevel) or 0,
-                tonumber(access.threshold) or 0
-            )
-        end
-    end
-    return false, ""
+    return invScoreShouldSkipEffect("dualwield", level)
 end
 
 function inv.score.getDualWieldSkipReason(level)
     local shouldSkip, reason = invScoreShouldSkipDualWieldEffect(level)
+    if shouldSkip then
+        return reason
+    end
+    return nil
+end
+
+function inv.score.getSanctuarySkipReason(level)
+    local shouldSkip, reason = invScoreShouldSkipEffect("sanctuary", level)
+    if shouldSkip then
+        return reason
+    end
+    return nil
+end
+
+function inv.score.getEffectSkipReason(effectName, level)
+    local shouldSkip, reason = invScoreShouldSkipEffect(effectName, level)
     if shouldSkip then
         return reason
     end
@@ -275,40 +259,12 @@ function inv.score.extended(itemStats, priorityName, handicap, level, isOffhand)
     if priority.effects then
         local combined = inv.items.getEffectTextFromStats(itemStats)
 
-        for effectName, effectData in pairs(priority.effects) do
-            local weight = 0
-            if type(effectData) == "table" then
-                weight = inv.score.getWeightFromData(effectData, level)
-            else
-                weight = tonumber(effectData) or 0
-            end
+        for effectName in pairs(priority.effects) do
+            local weight = inv.score.getWeight(priority, effectName, level)
 
             if weight > 0 and inv.items.effectTextHas(combined, effectName) then
-                local shouldApplyEffect = true
-                local normalizedEffectName = tostring(effectName or ""):lower()
-                if normalizedEffectName == "flying" then
-                    local skipFlying, skipReason = invScoreShouldSkipFlyingEffect(level)
-                    if skipFlying then
-                        dbot.debug(
-                            string.format("  Effect 'flying' skipped (%s)", tostring(skipReason)),
-                            "inv.score"
-                        )
-                        shouldApplyEffect = false
-                    end
-                elseif normalizedEffectName:gsub("%s+", "") == "dualwield" then
-                    local skipDualWield, skipReason = invScoreShouldSkipDualWieldEffect(level)
-                    if skipDualWield then
-                        dbot.debug(
-                            string.format("  Effect 'dualwield' skipped (%s)", tostring(skipReason)),
-                            "inv.score"
-                        )
-                        shouldApplyEffect = false
-                    end
-                end
-                if shouldApplyEffect then
-                    score = score + weight
-                    dbot.debug("  Effect '" .. effectName .. "' adds " .. weight .. " to score", "inv.score")
-                end
+                score = score + weight
+                dbot.debug("  Effect '" .. effectName .. "' adds " .. weight .. " to score", "inv.score")
             end
         end
     end
@@ -358,7 +314,19 @@ function inv.score.getWeight(priority, statName, level)
         return 0
     end
 
-    return inv.score.getWeightFromData(data, level)
+    local weight = inv.score.getWeightFromData(data, level)
+    local isEffect = priority.effects and priority.effects[statName] ~= nil
+    if isEffect and weight ~= 0 then
+        local shouldSkip, reason = invScoreShouldSkipEffect(statName, level)
+        if shouldSkip then
+            dbot.debug(
+                string.format("  Effect '%s' weight set to 0 (%s)", tostring(statName), tostring(reason)),
+                "inv.score"
+            )
+            return 0
+        end
+    end
+    return weight
 end
 
 function inv.score.getWeightFromData(data, level)

@@ -144,6 +144,9 @@ invStatFieldEnchants   = "enchants"
 invStatFieldIlluminate = "illuminate"
 invStatFieldResonate   = "resonate"
 invStatFieldSolidify   = "solidify"
+invStatFieldIlluminateRemoval = "illuminateremoval"
+invStatFieldResonateRemoval = "resonateremoval"
+invStatFieldSolidifyRemoval = "solidifyremoval"
 
 -- Calculated/derived fields
 invStatFieldLocType    = "loctype"
@@ -333,6 +336,7 @@ inv.organize = inv.organize or {}
 inv.keyword  = inv.keyword or {}
 inv.unused   = inv.unused or {}
 inv.discover = inv.discover or {}
+inv.history  = inv.history or {}
 inv.cli      = inv.cli or {}
 inv.context  = inv.context or {}
 
@@ -373,7 +377,7 @@ inv.snapshot.table = inv.snapshot.table or {}
 
 -- Increment this when a class/tier-dependent analysis rule changes.  It keeps
 -- saved analyses from silently surviving a semantic change in DINV itself.
-inv.context.rulesVersion = 1
+inv.context.rulesVersion = 2
 
 local function contextCopyArray(values)
     local out = {}
@@ -542,7 +546,7 @@ inv.state = invStateIdle
 
 inv.version = {}
 inv.version.pluginMajor = 2
-inv.version.pluginMinor = 63
+inv.version.pluginMinor = 65
 inv.version.full = inv.version.pluginMajor + (inv.version.pluginMinor / 10000)
 
 inv.version.table = {
@@ -550,7 +554,7 @@ inv.version.table = {
     tableFormat    = { major = 0, minor = 1 },
     cacheFormat    = { major = 0, minor = 1 },
     consumeFormat  = { major = 0, minor = 1 },
-    priorityFormat = { major = 0, minor = 1 },
+    priorityFormat = { major = 0, minor = 2 },
     setFormat      = { major = 0, minor = 1 },
     snapshotFormat = { major = 0, minor = 1 }
 }

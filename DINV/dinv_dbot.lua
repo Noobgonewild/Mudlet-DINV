@@ -2082,46 +2082,122 @@ end
 
 dbot.ability = {}
 
-dbot.ability.dualWieldClassLevels = {
-    thief = 29,
-    warrior = 32,
-    ranger = 25,
-    paladin = 35,
+dbot.ability.effectClassLevels = {
+    dualwield = {
+        thief = { level = 29, ability = "dual wield" },
+        warrior = { level = 32, ability = "dual wield" },
+        ranger = { level = 25, ability = "dual wield" },
+        paladin = { level = 35, ability = "dual wield" },
+    },
+    sanctuary = {
+        cleric = { level = 45, ability = "sanctuary" },
+        paladin = { level = 55, ability = "sanctuary" },
+        psionicist = { level = 51, ability = "biofeedback" },
+    },
+    flying = {
+        mage = { level = 36, ability = "fly" },
+        psionicist = { level = 22, ability = "levitation" },
+    },
 }
 
--- Returns whether the character has natural class/level access to dual wield
--- at an equipment-wearable level.  DINV analysis already adds tier*10 to each
--- projected base level, so comparing that level with the untiered thresholds
--- exactly models Aardwolf's tier reductions (for example T3 Warrior: level 2).
--- Non-listed classes are intentionally ignored, including their level-201
--- superhero availability.
-function dbot.ability.getDualWieldAccess(wearableLevel)
+dbot.ability.effectSuperheroLevels = {
+    dualwield = 201,
+    sanctuary = 201,
+}
+
+dbot.ability.innateEffectRaces = {
+    flying = {
+        gargoyle = true,
+        sprite = true,
+        vampire = true,
+        wraith = true,
+    },
+}
+
+local function normalizeAbilityName(value)
+    local normalized = tostring(value or ""):lower()
+    normalized = normalized:match("^%s*(.-)%s*$") or ""
+    return normalized:gsub("%s+", "")
+end
+
+-- Returns whether the character can provide an equipment effect without an
+-- item at an equipment-wearable level. DINV analysis already adds tier*10 to
+-- each projected base level, so the ordinary ability thresholds also model
+-- Aardwolf's tier reductions.
+function dbot.ability.getEffectAccess(effectName, wearableLevel)
+    local effect = normalizeAbilityName(effectName)
     local level = tonumber(wearableLevel)
     if level == nil and dbot.gmcp and dbot.gmcp.getWearableLevel then
         level = tonumber(dbot.gmcp.getWearableLevel())
     end
     level = level or 1
 
-    for _, className in ipairs(dbot.gmcp.getClasses()) do
-        local normalized = tostring(className or ""):lower()
-        local threshold = dbot.ability.dualWieldClassLevels[normalized]
-        if threshold and level >= threshold then
+    local innateRaces = dbot.ability.innateEffectRaces[effect]
+    if innateRaces then
+        local race = tostring(dbot.gmcp.getRace and dbot.gmcp.getRace() or ""):lower()
+        race = race:match("^%s*(.-)%s*$") or ""
+        if innateRaces[race] then
             return true, {
-                className = className,
-                threshold = threshold,
+                effect = effect,
+                source = "race",
+                race = race,
                 wearableLevel = level,
             }
         end
     end
 
+    local classLevels = dbot.ability.effectClassLevels[effect] or {}
+    for _, className in ipairs(dbot.gmcp.getClasses()) do
+        local normalized = tostring(className or ""):lower()
+        local access = classLevels[normalized]
+        if access and level >= access.level then
+            return true, {
+                effect = effect,
+                source = "class",
+                className = className,
+                ability = access.ability,
+                threshold = access.level,
+                wearableLevel = level,
+            }
+        end
+    end
+
+    local superheroLevel = dbot.ability.effectSuperheroLevels[effect]
+    if superheroLevel and level >= superheroLevel then
+        return true, {
+            effect = effect,
+            source = "superhero",
+            ability = effect,
+            threshold = superheroLevel,
+            wearableLevel = level,
+        }
+    end
+
     return false, {
+        effect = effect,
         wearableLevel = level,
     }
 end
 
-function dbot.ability.hasDualWieldAccess(wearableLevel)
-    local available = dbot.ability.getDualWieldAccess(wearableLevel)
+function dbot.ability.hasEffectAccess(effectName, wearableLevel)
+    local available = dbot.ability.getEffectAccess(effectName, wearableLevel)
     return available == true
+end
+
+function dbot.ability.getDualWieldAccess(wearableLevel)
+    return dbot.ability.getEffectAccess("dualwield", wearableLevel)
+end
+
+function dbot.ability.hasDualWieldAccess(wearableLevel)
+    return dbot.ability.hasEffectAccess("dualwield", wearableLevel)
+end
+
+function dbot.ability.getSanctuaryAccess(wearableLevel)
+    return dbot.ability.getEffectAccess("sanctuary", wearableLevel)
+end
+
+function dbot.ability.hasSanctuaryAccess(wearableLevel)
+    return dbot.ability.hasEffectAccess("sanctuary", wearableLevel)
 end
 
 ----------------------------------------------------------------------------------------------------
