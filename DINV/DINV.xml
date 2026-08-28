@@ -34,6 +34,13 @@ DINV.modules = {
     "dinv_inv_history", "dinv_rid", "dinv_api", "dinv_cli", "dinv_triggers", "dinv_aliases",
 }
 
+-- Runtime resources owned by the XML loader must survive replacement of the
+-- Lua module tables long enough to unregister the previous generation.
+DINV.eventHandlerIds = DINV.eventHandlerIds or {}
+DINV.reloading = DINV.reloading or false
+DINV.reloadGeneration = DINV.reloadGeneration or 0
+DINV.reloadFallbackAliasId = DINV.reloadFallbackAliasId or nil
+
 function DINV.setTriggerGroupEnabled(enabled)
     local setter = enabled and enableTrigger or disableTrigger
     if type(setter) == "function" then pcall(setter, "DINV_Triggers") end
@@ -52,6 +59,19 @@ function DINV.preflight()
     return #missing == 0, missing
 end
 
+function DINV.prepareModules()
+    local prepared = {}
+    for _, module in ipairs(DINV.modules) do
+        local path = DINV.modulePath .. module .. ".lua"
+        local chunk, err = loadfile(path)
+        if not chunk then
+            return nil, module, err
+        end
+        prepared[module] = chunk
+    end
+    return prepared
+end
+
 function DINV.printInstallationWarning(missing)
     if DINV.installWarningShown then return end
     cecho("&lt;orange_red&gt;[DINV INSTALLATION WARNING]&lt;reset&gt; DINV was not loaded.\n")
@@ -67,24 +87,21 @@ end
 -- Module Loader
 ----------------------------------------------------------------------------------------------------
 
-function DINV.loadModule(name)
+function DINV.loadModule(name, preparedChunk)
     local path = DINV.modulePath .. name .. ".lua"
-    local file = io.open(path, "r")
-    if file then
-        file:close()
-        local chunk, err = loadfile(path)
-        if chunk then
-            local ok, result = pcall(chunk)
-            if ok then
-                return true
-            else
-                cecho("&lt;red&gt;[DINV] Error executing " .. name .. ": " .. tostring(result) .. "\n")
-            end
+    local chunk, err = preparedChunk, nil
+    if not chunk then
+        chunk, err = loadfile(path)
+    end
+    if chunk then
+        local ok, result = pcall(chunk)
+        if ok then
+            return true
         else
-            cecho("&lt;red&gt;[DINV] Error loading " .. name .. ": " .. tostring(err) .. "\n")
+            cecho("&lt;red&gt;[DINV] Error executing " .. name .. ": " .. tostring(result) .. "\n")
         end
     else
-        cecho("&lt;orange&gt;[DINV] Module not found: " .. path .. "\n")
+        cecho("&lt;red&gt;[DINV] Error loading " .. name .. ": " .. tostring(err) .. "\n")
     end
     return false
 end
@@ -93,7 +110,7 @@ end
 -- Initialize DINV
 ----------------------------------------------------------------------------------------------------
 
-function DINV.initialize()
+function DINV.initialize(preparedModules)
     cecho("\n&lt;cyan&gt;[DINV] Initializing Durel's Inventory Manager v" ..
           string.format("%d.%04d", DINV.version.major, DINV.version.minor) .. "\n")
 
@@ -104,11 +121,22 @@ function DINV.initialize()
         return false
     end
     DINV.installWarningShown = nil
+
+    if not preparedModules then
+        local failedModule, compileError
+        preparedModules, failedModule, compileError = DINV.prepareModules()
+        if not preparedModules then
+            cecho("&lt;red&gt;[DINV MODULE ERROR]&lt;reset&gt; Could not compile " ..
+                tostring(failedModule) .. ": " .. tostring(compileError) .. "\n")
+            cecho("DINV triggers remain disabled to prevent follow-on errors.\n")
+            return false
+        end
+    end
     
     local loaded = 0
     local failedModules = {}
     for _, module in ipairs(DINV.modules) do
-        if DINV.loadModule(module) then
+        if DINV.loadModule(module, preparedModules[module]) then
             loaded = loaded + 1
         else
             table.insert(failedModules, module)
@@ -180,9 +208,45 @@ end
 -- GMCP Event Handlers
 ----------------------------------------------------------------------------------------------------
 
+function DINV.unregisterEventHandler(name)
+    local handlerId = DINV.eventHandlerIds and DINV.eventHandlerIds[name]
+    if handlerId and type(killAnonymousEventHandler) == "function" then
+        pcall(killAnonymousEventHandler, handlerId)
+    end
+    if DINV.eventHandlerIds then
+        DINV.eventHandlerIds[name] = nil
+    end
+end
+
+function DINV.registerEventHandler(name, eventName, callback)
+    DINV.unregisterEventHandler(name)
+    if type(registerAnonymousEventHandler) ~= "function" then
+        return nil
+    end
+
+    local ok, handlerId = pcall(registerAnonymousEventHandler, eventName, callback)
+    if not ok then
+        cecho("&lt;red&gt;[DINV] Unable to register event handler " .. tostring(name) ..
+            ": " .. tostring(handlerId) .. "\n")
+        return nil
+    end
+    DINV.eventHandlerIds[name] = handlerId
+    return handlerId
+end
+
+function DINV.unregisterEventHandlers()
+    local names = {}
+    for name in pairs(DINV.eventHandlerIds or {}) do
+        table.insert(names, name)
+    end
+    for _, name in ipairs(names) do
+        DINV.unregisterEventHandler(name)
+    end
+end
+
 function DINV.registerGMCPHandlers()
-    registerAnonymousEventHandler("gmcp.char.base", "DINV.onGMCPCharBase")
-    registerAnonymousEventHandler("gmcp.char.status", "DINV.onGMCPCharStatus")
+    DINV.registerEventHandler("loader.char.base", "gmcp.char.base", "DINV.onGMCPCharBase")
+    DINV.registerEventHandler("loader.char.status", "gmcp.char.status", "DINV.onGMCPCharStatus")
 end
 
 function DINV.onGMCPCharBase()
@@ -222,6 +286,263 @@ function DINV.onGMCPCharStatus()
     if dbot and dbot.gmcp and dbot.gmcp.updateState then
         dbot.gmcp.updateState()
     end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Lua module hot reload
+----------------------------------------------------------------------------------------------------
+
+local function reloadTableHasEntries(value)
+    return type(value) == "table" and next(value) ~= nil
+end
+
+function DINV.getReloadBlocker()
+    if DINV.reloading then
+        return "another reload is already in progress"
+    end
+
+    local items = inv and inv.items or nil
+    if items then
+        if items.buildInProgress then return "an inventory build is in progress" end
+        if items.refreshInProgress then return "an inventory refresh is in progress" end
+        if items.identifyInProgress then return "item identification is in progress" end
+        if items.identifyHydrateInProgress then return "item hydration is in progress" end
+        if items.relativeQueryResolution then return "a relative item query is being resolved" end
+        if items.inEqdata or items.inInvdata or items.inKeyring then
+            return "inventory protocol data is being processed"
+        end
+        if reloadTableHasEntries(items.pendingRemoval) then
+            return "an inventory removal is awaiting confirmation"
+        end
+        if reloadTableHasEntries(items.deferredIdentifyQueue) then
+            return "deferred item identification is queued"
+        end
+        local keepSync = items.keepSync
+        if keepSync and (keepSync.active or keepSync.pending or keepSync.scheduled) then
+            return "a keep-flag synchronization is in progress"
+        end
+    end
+
+    if tonumber(DINV.buildPhase) and tonumber(DINV.buildPhase) &gt; 0 then
+        return "an inventory discovery phase is in progress"
+    end
+    if inv and inv.operations and reloadTableHasEntries(inv.operations.active) then
+        return "an observed item operation is in progress"
+    end
+    if inv and inv.analyze
+        and (inv.analyze.activeJob or reloadTableHasEntries(inv.analyze.queue)) then
+        return "equipment analysis is in progress"
+    end
+    if inv and inv.organize and (inv.organize.resolvePkg or inv.organize.runPkg) then
+        return "inventory organization is in progress"
+    end
+    if inv and inv.discover and inv.discover.state and inv.discover.state.busy then
+        return "a market discovery scan is in progress"
+    end
+    if inv and inv.consume
+        and (inv.consume.addPkg or inv.consume.buyPkg or inv.consume.usePkg) then
+        return "a consumable operation is in progress"
+    end
+    if inv and inv.compare and inv.compare.covetPkg then
+        return "an auction comparison is in progress"
+    end
+    if inv and inv.report and inv.report.itemPkg then
+        return "an item report is in progress"
+    end
+    if inv and inv.rid and inv.rid.isActive and inv.rid.isActive() then
+        return "an RID report is in progress"
+    end
+    if inv and inv.pass and reloadTableHasEntries(inv.pass.timerByPass) then
+        return "an area-pass return timer is active"
+    end
+    if inv and inv.consumeWindow and inv.consumeWindow.pendingTravel then
+        return "consumables-window travel is in progress"
+    end
+    if DINV.debug and DINV.debug.hasActiveWearTiming and DINV.debug.hasActiveWearTiming() then
+        return "equipment wear timing is in progress"
+    end
+    if dbot and dbot.backup and dbot.backup.inProgress then
+        return "a backup is in progress"
+    end
+    if dbot and dbot.remote and dbot.remote.getPkg then
+        return "a remote request is in progress"
+    end
+    if dbot and dbot.execute and dbot.execute.queue
+        and reloadTableHasEntries(dbot.execute.queue.commands) then
+        return "item commands are queued for execution"
+    end
+    return nil
+end
+
+function DINV.installReloadFallbackAlias()
+    if DINV.reloadFallbackAliasId and type(killAlias) == "function" then
+        pcall(killAlias, DINV.reloadFallbackAliasId)
+    end
+    DINV.reloadFallbackAliasId = nil
+
+    if type(tempAlias) == "function" then
+        local ok, aliasId = pcall(tempAlias, "^dinv\\s+reload\\s*$", function()
+            DINV.requestReload()
+        end)
+        if ok then
+            DINV.reloadFallbackAliasId = aliasId
+        end
+    end
+end
+
+function DINV.removeReloadFallbackAlias()
+    if DINV.reloadFallbackAliasId and type(killAlias) == "function" then
+        pcall(killAlias, DINV.reloadFallbackAliasId)
+    end
+    DINV.reloadFallbackAliasId = nil
+end
+
+function DINV.cleanupForReload()
+    local warnings = {}
+    local oldInv = inv
+    local oldDbot = dbot
+
+    local function cleanup(label, callback)
+        if type(callback) ~= "function" then return end
+        local ok, err = pcall(callback)
+        if not ok then
+            table.insert(warnings, label .. ": " .. tostring(err))
+        end
+    end
+
+    DINV.setTriggerGroupEnabled(false)
+
+    cleanup("debug state save", DINV.debug and DINV.debug.save)
+    cleanup("inventory finalization", oldInv and oldInv.fini and function()
+        oldInv.fini(true)
+    end or nil)
+    cleanup("dbot finalization", oldDbot and oldDbot.fini and function()
+        oldDbot.fini(true)
+    end or nil)
+    cleanup("identify trigger cleanup", DINV.discovery and DINV.discovery.unregisterIdentifyTriggers)
+    cleanup("trigger cleanup", DINV.triggers and DINV.triggers.unregister)
+    cleanup("discovery trigger cleanup", DINV.discovery and DINV.discovery.unregister)
+    cleanup("organize trigger cleanup", oldInv and oldInv.organize and oldInv.organize.unregisterTriggers)
+    cleanup("alias cleanup", DINV.aliases and DINV.aliases.unregister)
+    cleanup("consumables window cleanup", oldInv and oldInv.consumeWindow
+        and oldInv.consumeWindow.shutdown and function()
+            oldInv.consumeWindow.shutdown(true, true)
+        end or nil)
+    cleanup("event handler cleanup", DINV.unregisterEventHandlers)
+
+    if oldInv and oldInv.pass and type(oldInv.pass.timerByPass) == "table"
+        and type(killTimer) == "function" then
+        for _, timerId in pairs(oldInv.pass.timerByPass) do
+            if timerId then pcall(killTimer, timerId) end
+        end
+        oldInv.pass.timerByPass = {}
+    end
+
+    if oldDbot and type(killTimer) == "function" then
+        for _, timerId in pairs(oldDbot.timers or {}) do
+            if timerId then pcall(killTimer, timerId) end
+        end
+        oldDbot.timers = {}
+    end
+    if oldDbot and type(killTrigger) == "function" then
+        for _, triggerId in pairs(oldDbot.triggers or {}) do
+            if triggerId then pcall(killTrigger, triggerId) end
+        end
+        oldDbot.triggers = {}
+    end
+
+    cleanup("database close", DINV.database and DINV.database.close)
+    cleanup("database runtime reset", DINV.database and DINV.database.resetRuntimeState)
+
+    DINV.installReloadFallbackAlias()
+    DINV.buildPhase = nil
+    DINV.discovery = nil
+    DINV.database = nil
+    DINV.debug = nil
+    DINV.api = nil
+    DINV.actions = nil
+    DINV.triggers = nil
+    DINV.aliases = nil
+    DINV.onGMCPCharVitals = nil
+    DINV.onGMCPCharStats = nil
+    DINV.onGMCPCharWorth = nil
+    DINV.onGMCPRoomInfo = nil
+    DINV.onGMCPCommChannel = nil
+    inv = nil
+    dbot = nil
+
+    return warnings
+end
+
+function DINV.performReload(preparedModules)
+    local cleanupWarnings = DINV.cleanupForReload()
+    for _, warning in ipairs(cleanupWarnings or {}) do
+        cecho("&lt;yellow&gt;[DINV] Reload cleanup warning: " .. tostring(warning) .. "\n")
+    end
+
+    local ok, initialized = pcall(DINV.initialize, preparedModules)
+    local success = ok and initialized == true
+    if success then
+        DINV.reloadGeneration = (tonumber(DINV.reloadGeneration) or 0) + 1
+        DINV.removeReloadFallbackAlias()
+        cecho("&lt;green&gt;[DINV] Reload complete (" .. tostring(#DINV.modules) ..
+            " Lua modules, generation " .. tostring(DINV.reloadGeneration) .. ").\n")
+    else
+        local failedCleanupWarnings = DINV.cleanupForReload()
+        for _, warning in ipairs(failedCleanupWarnings or {}) do
+            cecho("&lt;yellow&gt;[DINV] Failed-reload cleanup warning: " ..
+                tostring(warning) .. "\n")
+        end
+        DINV.setTriggerGroupEnabled(false)
+        local detail = ok and "module initialization failed" or tostring(initialized)
+        cecho("&lt;red&gt;[DINV] Reload failed: " .. detail .. "\n")
+        cecho("&lt;yellow&gt;Fix the module error, then run 'dinv reload' again. " ..
+            "Only the recovery reload alias remains active.\n")
+    end
+
+    DINV.reloading = false
+    preparedModules = nil
+    if type(collectgarbage) == "function" then
+        pcall(collectgarbage, "collect")
+    end
+    return success
+end
+
+function DINV.requestReload()
+    local blocker = DINV.getReloadBlocker()
+    if blocker then
+        if dbot and dbot.warn then
+            dbot.warn("Cannot reload DINV while " .. blocker .. ".")
+        else
+            cecho("&lt;yellow&gt;[DINV] Cannot reload while " .. blocker .. ".\n")
+        end
+        return DRL_RET_BUSY or -4
+    end
+
+    local preparedModules, failedModule, compileError = DINV.prepareModules()
+    if not preparedModules then
+        local message = "Cannot reload: " .. tostring(failedModule) ..
+            " does not compile: " .. tostring(compileError)
+        if dbot and dbot.warn then
+            dbot.warn(message)
+        else
+            cecho("&lt;red&gt;[DINV] " .. message .. "\n")
+        end
+        return DRL_RET_INTERNAL_ERROR or -8
+    end
+
+    DINV.reloading = true
+    cecho("&lt;cyan&gt;[DINV] Reloading " .. tostring(#DINV.modules) .. " Lua modules...\n")
+    if type(tempTimer) == "function" then
+        tempTimer(0, function()
+            local modules = preparedModules
+            preparedModules = nil
+            DINV.performReload(modules)
+        end)
+    else
+        DINV.performReload(preparedModules)
+    end
+    return DRL_RET_SUCCESS or 0
 end
 
 ----------------------------------------------------------------------------------------------------

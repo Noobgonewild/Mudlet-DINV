@@ -175,8 +175,8 @@ function inv.analyze.create(priorityName, positions, endTag, onComplete)
         maxLevel = maxLevel,
         tierBonus = tierBonus,
         currentLevel = 1,
-        batchSize = 5,
-        delaySec = 0.5,
+        batchSize = 1,
+        delaySec = 0.01,
         endTag = endTag,
         callbacks = {},
         context = inv.context and inv.context.capture and inv.context.capture() or nil,
@@ -204,6 +204,9 @@ function inv.analyze._startNextJob()
     end
 
     local job = table.remove(inv.analyze.queue, 1)
+    if inv.set and inv.set.ensureCandidateIndex then
+        job.candidateIndex = inv.set.ensureCandidateIndex(job.candidateIndex)
+    end
     inv.analyze.activeJob = job
     inv.analyze._runJobBatch()
 end
@@ -217,11 +220,16 @@ function inv.analyze._runJobBatch()
     local batchStart = job.currentLevel
     local batchEnd = math.min(job.maxLevel, batchStart + job.batchSize - 1)
 
-    dbot.info(string.format("Creating equipment sets for levels %d-%d", batchStart, batchEnd))
+    if inv.set and inv.set.ensureCandidateIndex then
+        job.candidateIndex = inv.set.ensureCandidateIndex(job.candidateIndex)
+    end
 
     for level = batchStart, batchEnd do
         local wearableLevel = level + job.tierBonus
-        inv.set.create(job.priorityName, wearableLevel, nil, nil, true, level)
+        inv.set.create(job.priorityName, wearableLevel, nil, nil, true, level, {
+            candidateIndex = job.candidateIndex,
+            persist = false,
+        })
         local setData = inv.set.table[job.priorityName]
             and inv.set.table[job.priorityName][tostring(wearableLevel)]
         if setData then
@@ -237,12 +245,29 @@ function inv.analyze._runJobBatch()
             end
             inv.analyze.table[job.priorityName].levels[tostring(level)] = entry
         end
+
+        if inv.items and inv.items.showProgress then
+            inv.items.showProgress(
+                "Analyzing " .. job.priorityName,
+                level,
+                job.maxLevel,
+                "level " .. level
+            )
+        end
     end
 
     job.currentLevel = batchEnd + 1
 
     if job.currentLevel > job.maxLevel then
+        if inv.items and inv.items.finalizeInlineProgress then
+            inv.items.finalizeInlineProgress()
+        end
         dbot.info("Analysis created for priority '" .. job.priorityName .. "' across levels 1-" .. job.maxLevel)
+        local setSaveRetval = inv.set.save()
+        if setSaveRetval ~= DRL_RET_SUCCESS then
+            dbot.warn("inv.analyze: Failed to save equipment sets for priority '" .. job.priorityName .. "': " ..
+                dbot.retval.getString(setSaveRetval))
+        end
         local saveRetval = inv.analyze.save()
         if saveRetval ~= DRL_RET_SUCCESS then
             dbot.warn("inv.analyze: Failed to save analysis for priority '" .. job.priorityName .. "': " ..

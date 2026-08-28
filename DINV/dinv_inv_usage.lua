@@ -4,6 +4,7 @@
 ----------------------------------------------------------------------------------------------------
 
 inv.usage = {}
+inv.usage.analysisJob = nil
 
 function inv.usage.display(priorityName, query, endTag)
     dbot.info("Displaying usage for priority '" .. priorityName .. "'")
@@ -135,7 +136,6 @@ function inv.usage.displayItem(priorityName, objId, doDisplayUnused)
         formattedName = formattedName .. string.rep(" ", maxNameLen - #strip_colours(formattedName) - #formattedId)
     end
     formattedName = string.gsub(formattedName, "@$", " ") .. " " .. DRL_ANSI_WHITE
-    formattedName = formattedName .. colorizedId
 
     local levelUsage = inv.usage.get(priorityName, objId)
     local itemLevel = tonumber(inv.items.getStatField(objId, invStatFieldLevel)) or 0
@@ -154,8 +154,170 @@ function inv.usage.displayItem(priorityName, objId, doDisplayUnused)
 
     if ((levelUsage ~= nil) and (#levelUsage > 0)) or doDisplayUnused then
         local formattedLevel = string.format("%s%3d%s ", levelPrefix, itemLevel, levelSuffix)
-        dbot.print(formattedLevel .. formattedName .. itemType .. " " .. priorityName .. " " .. levelStr)
+        local linePrefix = formattedLevel .. formattedName
+        local lineDetails = colorizedId .. itemType .. " " .. priorityName .. " " .. levelStr
+
+        if levelUsage and #levelUsage > 0
+            and cecho and cechoLink and dbot and dbot.convertColors then
+            local command = string.format(
+                "inv.usage.showAnalysis(%q, %q)",
+                tostring(priorityName),
+                tostring(objId)
+            )
+            local ranges = inv.usage.formatLevelRanges(levelUsage)
+            cecho(dbot.convertColors(linePrefix))
+            cechoLink(
+                dbot.convertColors(lineDetails),
+                command,
+                "Show usage analysis for " .. tostring(priorityName) .. " at levels " .. ranges,
+                true
+            )
+            cecho("\n")
+        else
+            dbot.print(linePrefix .. lineDetails)
+        end
     end
+end
+
+function inv.usage.showAnalysis(priorityName, objId)
+    local pr = tostring(priorityName or "")
+    local targetId = tonumber(objId or "")
+    if pr == "" or targetId == nil then
+        dbot.warn("Usage analysis requires a priority and numeric item ID.")
+        return DRL_RET_INVALID_PARAM
+    end
+
+    if not inv.set or not inv.set.createPreview
+        or not inv.compare or not inv.compare.covetAnalyze then
+        dbot.warn("Usage analysis renderer is unavailable.")
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    local fresh, freshRetval = inv.analyze.checkAvailable(pr, "Usage analysis")
+    if not fresh then
+        return freshRetval
+    end
+
+    local levels, levelsRetval = inv.usage.get(pr, targetId)
+    if levelsRetval ~= DRL_RET_SUCCESS or not levels or #levels == 0 then
+        dbot.warn("Item " .. tostring(targetId) .. " is unused by priority '" .. pr .. "'.")
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    if inv.usage.analysisJob then
+        dbot.info("A usage analysis is already being built. Please wait for it to complete.")
+        return DRL_RET_BUSY
+    end
+
+    local targetName = inv.items.getStatField(targetId, invStatFieldColorName)
+        or inv.items.getStatField(targetId, invStatFieldName)
+        or tostring(targetId)
+    local tierBonus = ((dbot.gmcp and dbot.gmcp.getTier and dbot.gmcp.getTier()) or 0) * 10
+    local excludedItems = {
+        [targetId] = true,
+        [tostring(targetId)] = true,
+    }
+    local comparisonData = {
+        levels = {},
+        context = inv.context and inv.context.copy
+            and inv.context.copy(inv.analyze.table[pr].context)
+            or inv.analyze.table[pr].context,
+    }
+    local job = {
+        priorityName = pr,
+        targetId = targetId,
+        nextIndex = 1,
+    }
+    inv.usage.analysisJob = job
+
+    dbot.info("Building usage comparison for item " .. tostring(targetId) .. " across "
+        .. tostring(#levels) .. " used level" .. (#levels == 1 and "" or "s") .. ".")
+
+    local immediateRetval = DRL_RET_SUCCESS
+
+    local function fail(message, retval)
+        if inv.usage.analysisJob == job then
+            inv.usage.analysisJob = nil
+        end
+        dbot.warn(message)
+        immediateRetval = retval or DRL_RET_INTERNAL_ERROR
+        return immediateRetval
+    end
+
+    local function finish()
+        if inv.usage.analysisJob ~= job then
+            return DRL_RET_BUSY
+        end
+        inv.usage.analysisJob = nil
+        return inv.compare.covetAnalyze(pr, targetId, 1, {
+            analysisChecked = true,
+            analysisData = comparisonData,
+            levels = levels,
+            title = "@WUsage Analysis:@w",
+            targetLabel = targetName,
+            targetReportName = targetName,
+            skipTargetHeader = true,
+            comparisonSource = "rebuilt owned-equipment sets excluding item " .. tostring(targetId)
+                .. " at its used levels for priority '" .. pr .. "'",
+        })
+    end
+
+    local processBatch
+    processBatch = function()
+        if inv.usage.analysisJob ~= job then
+            return
+        end
+
+        local batchEnd = math.min(#levels, job.nextIndex + 4)
+        for index = job.nextIndex, batchEnd do
+            local baseLevel = levels[index]
+            local wearableLevel = baseLevel + tierBonus
+            local ok, equipment, _, score, retval = pcall(
+                inv.set.createPreview,
+                pr,
+                wearableLevel,
+                excludedItems,
+                nil,
+                baseLevel
+            )
+            if not ok then
+                fail("Failed to build usage comparison for level " .. tostring(baseLevel) .. ".",
+                    DRL_RET_INTERNAL_ERROR)
+                return
+            end
+            if retval ~= DRL_RET_SUCCESS then
+                fail("Unable to build usage comparison for level " .. tostring(baseLevel) .. ".", retval)
+                return
+            end
+
+            comparisonData.levels[tostring(baseLevel)] = {
+                equipment = equipment or {},
+                score = score or 0,
+                wearableLevel = wearableLevel,
+            }
+        end
+
+        job.nextIndex = batchEnd + 1
+        if job.nextIndex <= #levels then
+            if tempTimer then
+                tempTimer(0.05, processBatch)
+            else
+                processBatch()
+            end
+            return
+        end
+
+        local ok, retval = pcall(finish)
+        if not ok then
+            fail("Failed to render usage analysis for item " .. tostring(targetId) .. ".",
+                DRL_RET_INTERNAL_ERROR)
+        elseif retval ~= nil then
+            immediateRetval = retval
+        end
+    end
+
+    processBatch()
+    return immediateRetval
 end
 
 function inv.usage.formatLevelRanges(levelUsage)

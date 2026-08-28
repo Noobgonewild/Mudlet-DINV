@@ -17,6 +17,61 @@ inv.priority = inv.priority or {}
 inv.statBonus = inv.statBonus or {}
 inv.statBonus.equipBonus = inv.statBonus.equipBonus or {}
 
+-- These mappings are shared by every score calculation. Build the field map
+-- lazily so lightweight regression harnesses can define DINV field constants
+-- after loading their stubs without making module initialization fail.
+local invScoreStatMapping = nil
+local invScoreCappedStats = { str = true, int = true, wis = true, dex = true, con = true, luck = true }
+local invScoreMaxStatList = { "int", "wis", "luck", "str", "dex", "con" }
+
+local function invScoreGetStatMapping()
+    if invScoreStatMapping ~= nil then
+        return invScoreStatMapping
+    end
+
+    local mapping = {
+        str = "str",
+        int = "int",
+        wis = "wis",
+        dex = "dex",
+        con = "con",
+        luck = "luck",
+        hit = "hit",
+        dam = "dam",
+        hitroll = "hit",
+        damroll = "dam",
+        hp = "hp",
+        mana = "mana",
+        moves = "moves",
+        allphys = "allphys",
+        allmagic = "allmagic",
+        offhandDam = "offhandDam",
+    }
+
+    local function add(fieldName, priorityKey)
+        if fieldName ~= nil then
+            mapping[fieldName] = priorityKey
+        end
+    end
+
+    add(invStatFieldStr, "str")
+    add(invStatFieldInt, "int")
+    add(invStatFieldWis, "wis")
+    add(invStatFieldDex, "dex")
+    add(invStatFieldCon, "con")
+    add(invStatFieldLuck, "luck")
+    add(invStatFieldHitroll, "hit")
+    add(invStatFieldDamroll, "dam")
+    add(invStatFieldHp, "hp")
+    add(invStatFieldMana, "mana")
+    add(invStatFieldMoves, "moves")
+    add(invStatFieldAllPhys, "allphys")
+    add(invStatFieldAllMagic, "allmagic")
+
+    invScoreStatMapping = mapping
+    return invScoreStatMapping
+end
+
 local function invScoreFormatEffectAccess(access)
     if not access then return "available without equipment" end
     if access.source == "race" then
@@ -89,6 +144,185 @@ function inv.score.getEffectSkipReason(effectName, level)
 end
 
 ----------------------------------------------------------------------------------------------------
+-- Resolve level-stable scoring inputs once and reuse them across all handicap passes
+----------------------------------------------------------------------------------------------------
+
+function inv.score.createContext(priorityName, level)
+    if priorityName == nil or priorityName == "" then
+        return nil, DRL_RET_INVALID_PARAM
+    end
+
+    level = tonumber(level) or (dbot.gmcp and dbot.gmcp.getLevel and dbot.gmcp.getLevel()) or 1
+    if not inv.priority or not inv.priority.get then
+        return nil, DRL_RET_UNINITIALIZED
+    end
+
+    local priority = inv.priority.get(priorityName, level)
+    if priority == nil then
+        return nil, DRL_RET_MISSING_ENTRY
+    end
+
+    local equipCapDefault = 200
+    if inv.statBonus and inv.statBonus.getEquipmentCap then
+        equipCapDefault = inv.statBonus.getEquipmentCap(level)
+    end
+
+    local equipCapByStat = inv.statBonus and inv.statBonus.equipBonus
+        and inv.statBonus.equipBonus[level] or nil
+    if equipCapByStat == nil and inv.statBonus and inv.statBonus.get then
+        local bonusType = invStatBonusTypeAve
+        if level == (dbot.gmcp and dbot.gmcp.getLevel and dbot.gmcp.getLevel()) then
+            bonusType = invStatBonusTypeCurrent
+        end
+        inv.statBonus.get(level, bonusType)
+        equipCapByStat = inv.statBonus.equipBonus and inv.statBonus.equipBonus[level] or nil
+    end
+
+    local context = {
+        priorityName = priorityName,
+        level = level,
+        priority = priority,
+        equipCapDefault = equipCapDefault,
+        equipCapByStat = equipCapByStat,
+        weights = {},
+        effectEntries = {},
+    }
+
+    local weightKeys = { avedam = true, offhandDam = true }
+    for _, priorityKey in pairs(invScoreGetStatMapping()) do
+        weightKeys[priorityKey] = true
+    end
+    for _, stat in ipairs(invScoreMaxStatList) do
+        weightKeys["max" .. stat] = true
+    end
+
+    for priorityKey in pairs(weightKeys) do
+        context.weights[priorityKey] = inv.score.getWeight(priority, priorityKey, level)
+    end
+
+    for effectName in pairs(priority.effects or {}) do
+        local weight = inv.score.getWeight(priority, effectName, level)
+        context.weights[effectName] = weight
+        table.insert(context.effectEntries, { name = effectName, weight = weight })
+    end
+
+    return context, DRL_RET_SUCCESS
+end
+
+local function invScoreCalculateComponents(itemStats, context, handicap, normalizedEffectText)
+    local basicScore = 0
+    handicap = handicap or {}
+
+    for statField, priorityKey in pairs(invScoreGetStatMapping()) do
+        local statValue = tonumber(itemStats[statField]) or 0
+        if statValue ~= 0 then
+            local effectiveValue = statValue
+            if invScoreCappedStats[priorityKey] then
+                local statCap = context.equipCapDefault
+                if context.equipCapByStat and context.equipCapByStat[priorityKey] ~= nil then
+                    statCap = context.equipCapByStat[priorityKey]
+                end
+                effectiveValue = math.min(effectiveValue, statCap)
+            end
+            effectiveValue = math.max(0, effectiveValue - (handicap[priorityKey] or 0))
+            basicScore = basicScore + (effectiveValue * (context.weights[priorityKey] or 0))
+        end
+    end
+
+    local effectScore = 0
+    if #context.effectEntries > 0 then
+        local combined = normalizedEffectText
+        if combined == nil then
+            combined = inv.items.getEffectTextFromStats(itemStats)
+        end
+        for _, effectEntry in ipairs(context.effectEntries) do
+            if effectEntry.weight > 0 and inv.items.effectTextHas(combined, effectEntry.name) then
+                effectScore = effectScore + effectEntry.weight
+                dbot.debug("  Effect '" .. effectEntry.name .. "' adds " .. effectEntry.weight .. " to score", "inv.score")
+            end
+        end
+    end
+
+    local maxStatScore = 0
+    for _, stat in ipairs(invScoreMaxStatList) do
+        local maxWeight = context.weights["max" .. stat] or 0
+        if maxWeight > 0 and context.equipCapByStat then
+            local maxAllowed = context.equipCapByStat[stat] or 999
+            if (tonumber(itemStats[stat]) or 0) >= maxAllowed then
+                maxStatScore = maxStatScore + maxWeight
+                dbot.debug("  Max " .. stat .. " bonus adds " .. maxWeight .. " to score", "inv.score")
+            end
+        end
+    end
+
+    local aveDam = tonumber(itemStats[invStatFieldAveDam]) or tonumber(itemStats.avedam) or 0
+    return basicScore, effectScore, maxStatScore, aveDam
+end
+
+local function invScoreRound(score)
+    return tonumber(string.format("%.2f", score)) or 0
+end
+
+function inv.score.extendedWithContext(itemStats, context, handicap, isOffhand, normalizedEffectText)
+    if itemStats == nil or type(context) ~= "table" or context.priority == nil then
+        return 0, DRL_RET_INVALID_PARAM
+    end
+
+    local basicScore, effectScore, maxStatScore, aveDam =
+        invScoreCalculateComponents(itemStats, context, handicap, normalizedEffectText)
+    local damageKey = isOffhand and "offhandDam" or "avedam"
+    local damageScore = aveDam > 0 and (aveDam * (context.weights[damageKey] or 0)) or 0
+    local score = basicScore + damageScore + effectScore + maxStatScore
+    return invScoreRound(score), DRL_RET_SUCCESS
+end
+
+function inv.score.itemWithContext(objId, context, handicap, normalizedEffectText)
+    objId = tonumber(objId)
+    if objId == nil then
+        return 0, 0, DRL_RET_INVALID_PARAM
+    end
+    if type(context) ~= "table" or context.priority == nil then
+        return 0, 0, DRL_RET_INVALID_PARAM
+    end
+    if not inv.items or not inv.items.getItem then
+        return 0, 0, DRL_RET_UNINITIALIZED
+    end
+
+    local item = inv.items.getItem(objId)
+    if item == nil then
+        return 0, 0, DRL_RET_MISSING_ENTRY
+    end
+
+    local itemStats = item.stats or {}
+    local basicScore, effectScore, maxStatScore, aveDam =
+        invScoreCalculateComponents(itemStats, context, handicap, normalizedEffectText)
+    local primaryScore = invScoreRound(
+        basicScore + (aveDam > 0 and aveDam * (context.weights.avedam or 0) or 0)
+            + effectScore + maxStatScore
+    )
+
+    local wearable = ""
+    local typeNum = 0
+    local typeName = ""
+    if inv.items.getStatField then
+        wearable = tostring(inv.items.getStatField(objId, invStatFieldWearable) or "")
+        typeNum = tonumber(inv.items.getStatField(objId, invStatFieldTypeNum)) or 0
+        typeName = tostring(inv.items.getStatField(objId, invStatFieldType) or "")
+    end
+    local weaponTypeId = (inv.items.typeId and inv.items.typeId["Weapon"]) or 5
+    local isWeapon = typeNum == weaponTypeId or typeName == "Weapon" or wearable:lower():find("wield") ~= nil
+    local offhandScore = 0
+    if isWeapon then
+        offhandScore = invScoreRound(
+            basicScore + (aveDam > 0 and aveDam * (context.weights.offhandDam or 0) or 0)
+                + effectScore + maxStatScore
+        )
+    end
+
+    return primaryScore, offhandScore, DRL_RET_SUCCESS
+end
+
+----------------------------------------------------------------------------------------------------
 -- Score an individual item based on priority
 ----------------------------------------------------------------------------------------------------
 
@@ -113,32 +347,12 @@ function inv.score.item(objId, priorityName, handicap, level)
         return 0, 0, DRL_RET_UNINITIALIZED
     end
 
-    local item = inv.items.getItem(objId)
-    if item == nil then
-        return 0, 0, DRL_RET_MISSING_ENTRY
-    end
-
     level = tonumber(level) or (dbot.gmcp and dbot.gmcp.getLevel and dbot.gmcp.getLevel()) or 1
-
-    -- Get primary score
-    score = inv.score.extended(item.stats or {}, priorityName, handicap, level, false)
-
-    -- Get offhand score for weapons
-    local wearable = ""
-    local typeNum = 0
-    local typeName = ""
-    if inv.items.getStatField then
-        wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
-        typeNum = tonumber(inv.items.getStatField(objId, invStatFieldTypeNum)) or 0
-        typeName = inv.items.getStatField(objId, invStatFieldType) or ""
+    local context, retval = inv.score.createContext(priorityName, level)
+    if context == nil then
+        return score, offhandScore, retval
     end
-    local weaponTypeId = (inv.items.typeId and inv.items.typeId["Weapon"]) or 5
-    local isWeaponType = (typeNum == weaponTypeId) or (typeName == "Weapon")
-    if isWeaponType or wearable:lower():find("wield") then
-        offhandScore = inv.score.extended(item.stats or {}, priorityName, handicap, level, true)
-    end
-
-    return score, offhandScore, DRL_RET_SUCCESS
+    return inv.score.itemWithContext(objId, context, handicap)
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -156,143 +370,11 @@ function inv.score.extended(itemStats, priorityName, handicap, level, isOffhand)
 
     level = tonumber(level) or (dbot.gmcp and dbot.gmcp.getLevel and dbot.gmcp.getLevel()) or 1
 
-    -- Defensive check: ensure inv.priority exists
-    if not inv.priority or not inv.priority.get then
-        dbot.warn("inv.score.extended: inv.priority module not loaded")
-        return 0, DRL_RET_UNINITIALIZED
+    local context, retval = inv.score.createContext(priorityName, level)
+    if context == nil then
+        return 0, retval
     end
-
-    -- Get priority weights for this level
-    local priority = inv.priority.get(priorityName, level)
-    if priority == nil then
-        -- Priority might not exist - return 0 score instead of error
-        dbot.debug("inv.score.extended: Priority '" .. priorityName .. "' not found", "inv.score")
-        return 0, DRL_RET_MISSING_ENTRY
-    end
-
-    local score = 0
-    handicap = handicap or {}
-
-    -- Score basic stats
-    local statMapping = {
-        [invStatFieldStr] = "str",
-        [invStatFieldInt] = "int",
-        [invStatFieldWis] = "wis",
-        [invStatFieldDex] = "dex",
-        [invStatFieldCon] = "con",
-        [invStatFieldLuck] = "luck",
-        [invStatFieldHitroll] = "hit",
-        [invStatFieldDamroll] = "dam",
-        [invStatFieldHp] = "hp",
-        [invStatFieldMana] = "mana",
-        [invStatFieldMoves] = "moves",
-        [invStatFieldAllPhys] = "allphys",
-        [invStatFieldAllMagic] = "allmagic",
-        str = "str",
-        int = "int",
-        wis = "wis",
-        dex = "dex",
-        con = "con",
-        luck = "luck",
-        hit = "hit",
-        dam = "dam",
-        hitroll = "hit",
-        damroll = "dam",
-        hp = "hp",
-        mana = "mana",
-        moves = "moves",
-        allphys = "allphys",
-        allmagic = "allmagic",
-        offhandDam = "offhandDam",
-    }
-
-    -- Calculate stat contribution with equipment cap per stat
-    local equipCapDefault = 200
-    if inv.statBonus and inv.statBonus.getEquipmentCap then
-        equipCapDefault = inv.statBonus.getEquipmentCap(level)
-    end
-    local equipCapByStat = nil
-    if inv.statBonus and inv.statBonus.equipBonus then
-        equipCapByStat = inv.statBonus.equipBonus[level]
-    end
-    if equipCapByStat == nil and inv.statBonus and inv.statBonus.get then
-        local bonusType = invStatBonusTypeAve
-        if level == (dbot.gmcp and dbot.gmcp.getLevel and dbot.gmcp.getLevel()) then
-            bonusType = invStatBonusTypeCurrent
-        end
-        inv.statBonus.get(level, bonusType)
-        if inv.statBonus.equipBonus then
-            equipCapByStat = inv.statBonus.equipBonus[level]
-        end
-    end
-    local cappedStats = { str = true, int = true, wis = true, dex = true, con = true, luck = true }
-
-    for statField, priorityKey in pairs(statMapping) do
-        local statValue = tonumber(itemStats[statField]) or 0
-        if statValue ~= 0 then
-            local weight = inv.score.getWeight(priority, priorityKey, level)
-            local handicapValue = handicap[priorityKey] or 0
-
-            -- Apply equipment cap per stat, then handicap (reduces effective stat value)
-            local effectiveValue = statValue
-            if cappedStats[priorityKey] then
-                local statCap = equipCapDefault
-                if equipCapByStat and equipCapByStat[priorityKey] ~= nil then
-                    statCap = equipCapByStat[priorityKey]
-                end
-                effectiveValue = math.min(effectiveValue, statCap)
-            end
-            effectiveValue = math.max(0, effectiveValue - handicapValue)
-            score = score + (effectiveValue * weight)
-        end
-    end
-
-    -- Score weapon damage
-    local aveDam = tonumber(itemStats[invStatFieldAveDam]) or tonumber(itemStats.avedam) or 0
-    if aveDam > 0 then
-        local damKey = isOffhand and "offhandDam" or "avedam"
-        local weight = inv.score.getWeight(priority, damKey, level)
-        score = score + (aveDam * weight)
-    end
-
-    -- Score effects from priority.effects
-    if priority.effects then
-        local combined = inv.items.getEffectTextFromStats(itemStats)
-
-        for effectName in pairs(priority.effects) do
-            local weight = inv.score.getWeight(priority, effectName, level)
-
-            if weight > 0 and inv.items.effectTextHas(combined, effectName) then
-                score = score + weight
-                dbot.debug("  Effect '" .. effectName .. "' adds " .. weight .. " to score", "inv.score")
-            end
-        end
-    end
-
-    -- Check for max stat bonuses
-    local maxStatList = { "int", "wis", "luck", "str", "dex", "con" }
-    for _, stat in ipairs(maxStatList) do
-        local maxKey = "max" .. stat
-        local maxWeight = inv.score.getWeight(priority, maxKey, level)
-
-        if maxWeight > 0 then
-            -- Check if we have equipment bonus tracking
-            if inv.statBonus and inv.statBonus.equipBonus and inv.statBonus.equipBonus[level] then
-                local maxAllowed = inv.statBonus.equipBonus[level][stat] or 999
-                local statValue = tonumber(itemStats[stat]) or 0
-
-                if statValue >= maxAllowed then
-                    score = score + maxWeight
-                    dbot.debug("  Max " .. stat .. " bonus adds " .. maxWeight .. " to score", "inv.score")
-                end
-            end
-        end
-    end
-
-    -- Round to 2 decimal places
-    score = tonumber(string.format("%.2f", score)) or 0
-
-    return score, DRL_RET_SUCCESS
+    return inv.score.extendedWithContext(itemStats, context, handicap, isOffhand)
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -361,7 +443,27 @@ end
 -- Score a complete equipment set
 ----------------------------------------------------------------------------------------------------
 
-function inv.score.set(equipSet, priorityName, level)
+function inv.score.setStats(setStats, priorityName, level, context)
+    if setStats == nil then
+        return 0, nil, DRL_RET_INVALID_PARAM
+    end
+    if priorityName == nil or priorityName == "" then
+        return 0, setStats, DRL_RET_INVALID_PARAM
+    end
+
+    level = tonumber(level) or (dbot.gmcp.getLevel and dbot.gmcp.getLevel()) or 1
+    if type(context) ~= "table" or context.priorityName ~= priorityName or context.level ~= level then
+        context = inv.score.createContext(priorityName, level)
+    end
+    if context == nil then
+        return 0, setStats, DRL_RET_MISSING_ENTRY
+    end
+
+    local setScore, retval = inv.score.extendedWithContext(setStats, context, nil, false)
+    return setScore, setStats, retval
+end
+
+function inv.score.set(equipSet, priorityName, level, context, candidateIndex)
     if equipSet == nil then
         return 0, nil, DRL_RET_INVALID_PARAM
     end
@@ -373,13 +475,9 @@ function inv.score.set(equipSet, priorityName, level)
     level = tonumber(level) or (dbot.gmcp.getLevel and dbot.gmcp.getLevel()) or 1
 
     -- Get combined stats from all items in set
-    local setStats = inv.set.getStats(equipSet, level)
+    local setStats = inv.set.getStats(equipSet, level, nil, candidateIndex)
     setStats.name = "Set for level " .. level .. " " .. priorityName
-
-    -- Score the combined stats
-    local setScore, retval = inv.score.extended(setStats, priorityName, nil, level, false)
-
-    return setScore, setStats, retval
+    return inv.score.setStats(setStats, priorityName, level, context)
 end
 
 ----------------------------------------------------------------------------------------------------

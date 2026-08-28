@@ -20,7 +20,7 @@ inv.cli.commands = {
     -- Equipment analysis
     "analyze", "usage", "compare", "covet",
     -- Advanced options
-    "backup", "progress", "notify", "debug", "levelup", "forget", "ignore", "reset", "cache", "tags", "regen",
+    "backup", "progress", "notify", "debug", "levelup", "forget", "ignore", "reset", "reload", "cache", "tags", "regen",
     -- Using equipment
     "portal", "consume", "pass",
     -- About the plugin
@@ -149,7 +149,7 @@ Usage:
     
   Available topics: build, refresh, identify, search, query, history, set, priority, analyze,
                   report, progress, compare, covet, snapshot, weapon, portal, consume,
-                  config, backup, notify, debug, levelup, unused, and more.
+                  config, backup, reload, notify, debug, levelup, unused, and more.
 ]])
 end
 
@@ -391,6 +391,7 @@ function inv.cli.fullUsage()
     if inv.cli.forget and inv.cli.forget.usage then inv.cli.forget.usage() end
     if inv.cli.ignore and inv.cli.ignore.usage then inv.cli.ignore.usage() end
     if inv.cli.reset and inv.cli.reset.usage then inv.cli.reset.usage() end
+    if inv.cli.reload and inv.cli.reload.usage then inv.cli.reload.usage() end
     if inv.cli.cache and inv.cli.cache.usage then inv.cli.cache.usage() end
     if inv.cli.tags and inv.cli.tags.usage then inv.cli.tags.usage() end
     if inv.cli.regen and inv.cli.regen.usage then inv.cli.regen.usage() end
@@ -875,7 +876,8 @@ function inv.cli.history.examples()
     dbot.print([[@W
 @YInventory History@W
 
-  Consumables are excluded. Dates use your computer's local time.
+  Consumables and expiring keys are excluded. Permanent keys with no rot timer
+  remain tracked. Dates use your computer's local time.
 
   @Gdinv history find <name>@W
       Search by item name. A unique result shows its short history; multiple
@@ -888,12 +890,12 @@ function inv.cli.history.examples()
       Show every recorded movement for the selected object.
 
   @Gdinv history repair@W
-      Preview events that have no matching item name. This command does not
-      remove anything. It explains exactly what a confirmed repair would do.
+      Preview unnamed events and old key history that is expiring or cannot be
+      reliably classified as permanent. This command does not remove anything.
 
   @Gdinv history repair confirm@W
-      Create a full SQLite backup, then remove only events that cannot be linked
-      to the searchable item-name catalog. Named history and inventory are kept.
+      Create a full SQLite backup, then remove the previewed unnamed events and
+      key history. Proven timerless permanent keys and inventory are kept.
 
 Examples:
   @Gdinv history find winged helmet@W
@@ -1916,6 +1918,23 @@ end
 function inv.cli.reset.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s", 
                pluginNameCmd .. " reset @G[module]", "Reset module data"))
+end
+
+----------------------------------------------------------------------------------------------------
+-- Reload Command
+----------------------------------------------------------------------------------------------------
+
+inv.cli.reload = {}
+function inv.cli.reload.fn()
+    if not (DINV and DINV.requestReload) then
+        dbot.warn("DINV's XML loader does not support Lua module reloads")
+        return DRL_RET_UNSUPPORTED
+    end
+    return DINV.requestReload()
+end
+function inv.cli.reload.usage()
+    dbot.printRaw(string.format("@W    %-50s @w- %s",
+               pluginNameCmd .. " reload", "Reload all DINV Lua modules"))
 end
 
 ----------------------------------------------------------------------------------------------------

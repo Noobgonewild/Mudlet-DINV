@@ -65,9 +65,9 @@ local function displayCandidates(searchName, matches, truncated)
         "ID", "Level", "Status", "Last seen", "Name"))
     for _, item in ipairs(matches or {}) do
         local lastSeen = item.lastEventAt or item.lastSeenAt
-        dbot.print(string.format("  @W%-12s %5s  %-18s  %-19s  %s@w",
+        dbot.print(string.format("  @Y%-12s@W %5s  %-18s  %-19s  %s@w",
             tostring(item.objId), tostring(item.level or "-"), statusForAction(item.lastAction),
-            formatDate(lastSeen), tostring(item.name or "unknown item")))
+            formatDate(lastSeen), displayNameForItem(item)))
     end
     if truncated then
         dbot.print("@Y  Only the first 100 matches are shown; use a more specific name.@w")
@@ -219,23 +219,36 @@ function history.repair(isConfirmed)
         dbot.print("@W  Unnamed event range: @C" .. formatDate(status.unseededFirstAt) ..
             "@W to @C" .. formatDate(status.unseededLastAt) .. "@w")
     end
+    dbot.print("@W  Expiring or unclassified key items: @C" ..
+        tostring(status.keyItems or 0) .. "@w")
+    if (status.keyItems or 0) > 0 then
+        dbot.print("@W    Known expiring keys: @C" .. tostring(status.expiringKeyItems or 0) .. "@w")
+        dbot.print("@W    Keys without reliable timer data: @C" ..
+            tostring(status.unclassifiedKeyItems or 0) .. "@w")
+        dbot.print("@W    Events linked to those keys: @C" .. tostring(status.keyEvents or 0) .. "@w")
+    end
+    dbot.print("@W  Proven permanent keys preserved: @C" ..
+        tostring(status.permanentKeyItems or 0) .. "@w")
+
+    local needsRepair = status.unseededEvents > 0 or (status.keyItems or 0) > 0
 
     if not isConfirmed then
         dbot.print("@W")
-        dbot.print("@W  This repair can remove only events that have no matching entry in the@w")
-        dbot.print("@W  searchable item-name catalog. Named history, current inventory, module@w")
-        dbot.print("@W  settings, and consumable configuration are preserved.@w")
-        if status.unseededEvents > 0 then
+        dbot.print("@W  A confirmed repair removes unnamed events and all history for keys that@w")
+        dbot.print("@W  are expiring or cannot be proven permanent from their stored timer data.@w")
+        dbot.print("@W  Timerless permanent keys, current inventory, module settings, and@w")
+        dbot.print("@W  consumable configuration are preserved.@w")
+        if needsRepair then
             dbot.print("@W  A full database backup will be created before any rows are removed.@w")
             dbot.print("@W  To proceed, run: @Gdinv history repair confirm@w")
         else
-            dbot.print("@G  No unnamed history events need repair.@w")
+            dbot.print("@G  No inventory history rows need repair.@w")
         end
         return DRL_RET_SUCCESS
     end
 
-    if status.unseededEvents == 0 then
-        dbot.print("@G  No unnamed history events need repair.@w")
+    if not needsRepair then
+        dbot.print("@G  No inventory history rows need repair.@w")
         return DRL_RET_SUCCESS
     end
     if not (dbot.backup and dbot.backup.create and dbot.backup.getBackupDir) then
@@ -257,8 +270,15 @@ function history.repair(isConfirmed)
 
     local backupFile = tostring(dbot.backup.getBackupDir() or "") ..
         backupName .. "/dinv.db"
+    local removed = type(repairResult) == "table" and repairResult or {
+        unseededEvents = tonumber(repairResult) or 0,
+        keyItems = 0,
+        keyEvents = 0,
+    }
     dbot.print("@G  Inventory history repair complete.@w")
-    dbot.print("@W  Removed unnamed events: @C" .. tostring(repairResult) .. "@w")
+    dbot.print("@W  Removed unnamed events: @C" .. tostring(removed.unseededEvents or 0) .. "@w")
+    dbot.print("@W  Removed key history items: @C" .. tostring(removed.keyItems or 0) .. "@w")
+    dbot.print("@W  Removed key history events: @C" .. tostring(removed.keyEvents or 0) .. "@w")
     dbot.print("@W  Backup: @C" .. backupFile .. "@w")
     return DRL_RET_SUCCESS
 end
@@ -297,6 +317,9 @@ end
 
 local function containerDescription(event)
     local containerId = tostring(event.containerId or "")
+    if event.containerColorName and event.containerColorName ~= "" then
+        return '"' .. tostring(event.containerColorName) .. '@C" [' .. containerId .. "]"
+    end
     if event.containerName and event.containerName ~= "" then
         return '"' .. tostring(event.containerName) .. '" [' .. containerId .. "]"
     end

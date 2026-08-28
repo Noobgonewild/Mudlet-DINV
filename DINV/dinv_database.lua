@@ -8,7 +8,7 @@ DINV.database = DINV.database or {}
 
 local database = DINV.database
 
-database.schemaVersion = 5
+database.schemaVersion = 6
 database.env = database.env or nil
 database.conn = database.conn or nil
 database.isOpen = database.isOpen or false
@@ -287,6 +287,8 @@ local SCHEMA = {
         normalized_name TEXT NOT NULL,
         type_name TEXT,
         level REAL,
+        is_key INTEGER,
+        key_timer REAL,
         first_seen_at INTEGER NOT NULL,
         last_seen_at INTEGER NOT NULL
     )]],
@@ -416,6 +418,39 @@ local function normalizeName(value)
         text = dbot.stripColors(text)
     end
     return text:lower():gsub(",", ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+end
+
+
+local function hasExactFlag(flags, wanted)
+    wanted = tostring(wanted or ""):lower()
+    for token in tostring(flags or ""):lower():gmatch("[^,%s]+") do
+        if token == wanted then return true end
+    end
+    return false
+end
+
+
+-- Key status can be hidden until a full identify.  Preserve that uncertainty
+-- rather than asserting that a partially identified non-Key object is not a key.
+local function inventoryHistoryKeyMetadata(item)
+    local stats = item and item.stats or {}
+    local typeName = string.lower(tostring(stats.type or ""))
+    typeName = string.gsub(typeName, "^%s+", "")
+    typeName = string.gsub(typeName, "%s+$", "")
+    local isKey = typeName == "key" or hasExactFlag(stats.flags, "iskey")
+    if isKey then
+        return true, tonumber(stats.timer)
+    end
+    if tostring(stats.identifyLevel or ""):lower() == "full" then
+        return false, nil
+    end
+    return nil, nil
+end
+
+
+local function isTemporaryHistoryKey(item)
+    local isKey, keyTimer = inventoryHistoryKeyMetadata(item)
+    return isKey == true and keyTimer ~= nil and keyTimer >= 0
 end
 
 
@@ -595,6 +630,8 @@ local function hardenLegacySchema()
         normalized_name = "TEXT NOT NULL DEFAULT ''",
         type_name = "TEXT",
         level = "REAL",
+        is_key = "INTEGER",
+        key_timer = "REAL",
         first_seen_at = "INTEGER NOT NULL DEFAULT 0",
         last_seen_at = "INTEGER NOT NULL DEFAULT 0",
     })
@@ -621,9 +658,19 @@ local function seedInventoryHistoryItems(startedAt)
     end
     closeCursor(eventCursor)
 
-    local sourceTables = { "items", "detached_items", "pending_removed_items", "build_items" }
-    for _, tableName in ipairs(sourceTables) do
-        local cursor, queryErr = query("SELECT obj_id,name,color_name,type_name,level FROM " .. tableName)
+    local sourceTables = {
+        { items = "items", stats = "item_stats" },
+        { items = "detached_items", stats = "detached_item_stats" },
+        { items = "pending_removed_items", stats = "pending_removed_item_stats" },
+        { items = "build_items", stats = "build_item_stats" },
+    }
+    for _, source in ipairs(sourceTables) do
+        local cursor, queryErr = query(
+            "SELECT i.obj_id,i.name,i.color_name,i.type_name,i.level,i.identify_level,i.timer," ..
+            "(SELECT s.text_value FROM " .. source.stats .. " s " ..
+            "WHERE s.obj_id=i.obj_id AND lower(s.stat_key)='flags' LIMIT 1) AS identify_flags " ..
+            "FROM " .. source.items .. " i"
+        )
         if not cursor then
             return false, queryErr
         end
@@ -636,6 +683,9 @@ local function seedInventoryHistoryItems(startedAt)
                     colorName = row.color_name,
                     typeName = row.type_name,
                     level = tonumber(row.level),
+                    identifyLevel = row.identify_level,
+                    timer = tonumber(row.timer),
+                    flags = row.identify_flags,
                 }
             end
             row = cursor:fetch(row, "a")
@@ -653,19 +703,41 @@ local function seedInventoryHistoryItems(startedAt)
         local normalizedType = tostring(item.typeName or ""):lower()
         if normalizedType == "drink container" then normalizedType = "drink" end
         if normalized ~= "" and not CONSUMABLE_TYPES[normalizedType] then
+            local historyItem = { stats = {
+                name = plainName,
+                colorname = item.colorName,
+                type = item.typeName,
+                level = item.level,
+                identifyLevel = item.identifyLevel,
+                timer = item.timer,
+                flags = item.flags,
+            } }
+            local isKey, keyTimer = inventoryHistoryKeyMetadata(historyItem)
+            local isKeyValue = isKey == nil and nil or (isKey and 1 or 0)
             local times = eventTimes[objId] or {}
             local firstSeenAt = times.firstSeenAt or startedAt
             local lastSeenAt = math.max(tonumber(startedAt) or 0, times.lastSeenAt or 0)
-            local inserted, insertErr = execute(
-                "INSERT OR IGNORE INTO inventory_history_items(" ..
-                "obj_id,name,color_name,normalized_name,type_name,level,first_seen_at,last_seen_at) VALUES(" ..
-                table.concat({
-                    sqlQuote(objId), sqlQuote(plainName), sqlQuote(item.colorName), sqlQuote(normalized),
-                    sqlQuote(item.typeName), sqlQuote(item.level), sqlQuote(firstSeenAt), sqlQuote(lastSeenAt),
-                }, ",") .. ")"
-            )
-            if not inserted then
-                return false, insertErr
+            local inserted, insertErr = true, nil
+            if not isTemporaryHistoryKey(historyItem) then
+                inserted, insertErr = execute(
+                    "INSERT OR IGNORE INTO inventory_history_items(" ..
+                    "obj_id,name,color_name,normalized_name,type_name,level,is_key,key_timer," ..
+                    "first_seen_at,last_seen_at) VALUES(" .. table.concat({
+                        sqlQuote(objId), sqlQuote(plainName), sqlQuote(item.colorName), sqlQuote(normalized),
+                        sqlQuote(item.typeName), sqlQuote(item.level), sqlQuote(isKeyValue),
+                        sqlQuote(isKey == true and keyTimer or nil), sqlQuote(firstSeenAt),
+                        sqlQuote(lastSeenAt),
+                    }, ",") .. ")"
+                )
+            end
+            if not inserted then return false, insertErr end
+
+            local keyAssignments = ""
+            if isKey == true then
+                keyAssignments = ",is_key=1,key_timer=COALESCE(" ..
+                    sqlQuote(keyTimer) .. ",key_timer)"
+            elseif isKey == false then
+                keyAssignments = ",is_key=0,key_timer=NULL"
             end
             local updated, updateErr = execute(
                 "UPDATE inventory_history_items SET " ..
@@ -674,6 +746,7 @@ local function seedInventoryHistoryItems(startedAt)
                 ",normalized_name=" .. sqlQuote(normalized) ..
                 ",type_name=COALESCE(" .. sqlQuote(item.typeName) .. ",type_name)" ..
                 ",level=COALESCE(" .. sqlQuote(item.level) .. ",level)" ..
+                keyAssignments ..
                 ",first_seen_at=MIN(first_seen_at," .. sqlQuote(firstSeenAt) .. ")" ..
                 ",last_seen_at=MAX(last_seen_at," .. sqlQuote(lastSeenAt) .. ")" ..
                 " WHERE obj_id=" .. sqlQuote(objId)
@@ -1290,10 +1363,23 @@ local function deleteInventoryHistoryIdentity(objId)
 end
 
 
+local function deleteInventoryHistory(objId)
+    local keySql = sqlQuote(tostring(objId))
+    local eventsDeleted, eventErr = execute(
+        "DELETE FROM inventory_events WHERE obj_id=" .. keySql
+    )
+    if not eventsDeleted then return false, eventErr end
+    return deleteInventoryHistoryIdentity(objId)
+end
+
+
 local function saveInventoryHistoryIdentity(objId, item, observedAt)
     local stats = item and item.stats or {}
     if isConsumableType(stats.type) then
         return deleteInventoryHistoryIdentity(objId)
+    end
+    if isTemporaryHistoryKey(item) then
+        return deleteInventoryHistory(objId)
     end
 
     local plainName = tostring(stats.name or "")
@@ -1307,17 +1393,28 @@ local function saveInventoryHistoryIdentity(objId, item, observedAt)
         return true
     end
 
+    local isKey, keyTimer = inventoryHistoryKeyMetadata(item)
+    local isKeyValue = isKey == nil and nil or (isKey and 1 or 0)
     local seenAt = tonumber(observedAt) or now()
     local inserted, insertErr = execute(
         "INSERT OR IGNORE INTO inventory_history_items(" ..
-        "obj_id,name,color_name,normalized_name,type_name,level,first_seen_at,last_seen_at) VALUES(" ..
+        "obj_id,name,color_name,normalized_name,type_name,level,is_key,key_timer," ..
+        "first_seen_at,last_seen_at) VALUES(" ..
         table.concat({
             sqlQuote(tostring(objId)), sqlQuote(plainName), sqlQuote(colorName), sqlQuote(normalized),
-            sqlQuote(stats.type), sqlQuote(tonumber(stats.level)), sqlQuote(seenAt), sqlQuote(seenAt),
+            sqlQuote(stats.type), sqlQuote(tonumber(stats.level)), sqlQuote(isKeyValue),
+            sqlQuote(isKey == true and keyTimer or nil), sqlQuote(seenAt), sqlQuote(seenAt),
         }, ",") .. ")"
     )
     if not inserted then return false, insertErr end
 
+    local keyAssignments = ""
+    if isKey == true then
+        keyAssignments = ",is_key=1,key_timer=COALESCE(" ..
+            sqlQuote(keyTimer) .. ",key_timer)"
+    elseif isKey == false then
+        keyAssignments = ",is_key=0,key_timer=NULL"
+    end
     local updated, updateErr = execute(
         "UPDATE inventory_history_items SET " ..
         "name=" .. sqlQuote(plainName) ..
@@ -1325,6 +1422,7 @@ local function saveInventoryHistoryIdentity(objId, item, observedAt)
         ",normalized_name=" .. sqlQuote(normalized) ..
         ",type_name=COALESCE(" .. sqlQuote(stats.type) .. ",type_name)" ..
         ",level=COALESCE(" .. sqlQuote(tonumber(stats.level)) .. ",level)" ..
+        keyAssignments ..
         ",last_seen_at=MAX(last_seen_at," .. sqlQuote(seenAt) .. ")" ..
         " WHERE obj_id=" .. sqlQuote(tostring(objId))
     )
@@ -1769,6 +1867,9 @@ local function inventoryHistorySnapshot(item)
         colorname = stats.colorname or stats.colorName,
         type = stats.type,
         level = stats.level,
+        identifyLevel = stats.identifyLevel,
+        flags = stats.flags,
+        timer = stats.timer,
     } }
 end
 
@@ -1806,7 +1907,8 @@ function database.flush(target, options)
         count = count + 1
     end
     for objId, item in pairs(bucket.upserts) do
-        if isConsumableType(item and item.stats and item.stats.type) then
+        if isConsumableType(item and item.stats and item.stats.type)
+            or isTemporaryHistoryKey(item) then
             historyExcludedIds[tostring(objId)] = true
         end
         local ok, err = insertItem(tableName, statsTableName, objId, item)
@@ -1869,9 +1971,16 @@ function database.flush(target, options)
         local snapshot = event.historyItem
         local isConsumable = snapshot and snapshot.stats
             and isConsumableType(snapshot.stats.type)
+        local isTemporaryKey = snapshot and isTemporaryHistoryKey(snapshot)
         local isUnsearchableTerminal = (tonumber(event.action) == 3 or tonumber(event.action) == 7)
             and not snapshot
-        if not historyExcludedIds[tostring(event.objId)]
+        if isTemporaryKey then
+            local deleted, deleteErr = deleteInventoryHistory(event.objId)
+            if not deleted then
+                rollback()
+                return false, deleteErr
+            end
+        elseif not historyExcludedIds[tostring(event.objId)]
             and not isConsumable and not isUnsearchableTerminal then
             if snapshot then
                 local identityOk, identityErr = saveInventoryHistoryIdentity(
@@ -2718,12 +2827,20 @@ function database.recordTerminalRemoval(eventSeq, objId, action, reason, contain
     end
     local keySql = sqlQuote(objId)
     local snapshot = inventoryHistorySnapshot(item)
-    local recordHistory = snapshot ~= nil and not isConsumableType(snapshot.stats.type)
+    local isConsumable = snapshot ~= nil and isConsumableType(snapshot.stats.type)
+    local isTemporaryKey = snapshot ~= nil and isTemporaryHistoryKey(snapshot)
+    local recordHistory = snapshot ~= nil and not isConsumable and not isTemporaryKey
     if recordHistory then
         local identityOk, identityErr = saveInventoryHistoryIdentity(objId, snapshot, event.observedAt)
         if not identityOk then
             rollback()
             return false, identityErr
+        end
+    elseif isTemporaryKey then
+        local cleared, clearErr = deleteInventoryHistory(objId)
+        if not cleared then
+            rollback()
+            return false, clearErr
         end
     else
         local cleared, clearErr = deleteInventoryHistoryIdentity(objId)
@@ -2800,7 +2917,7 @@ end
 
 local function inventoryHistoryItemSelect(whereSql, limit)
     local sql = "SELECT h.obj_id,h.name,h.color_name,h.normalized_name,h.type_name,h.level," ..
-        "h.first_seen_at,h.last_seen_at," ..
+        "h.is_key,h.key_timer,h.first_seen_at,h.last_seen_at," ..
         "(SELECT e.action FROM inventory_events e WHERE e.obj_id=h.obj_id " ..
         "ORDER BY e.event_seq DESC,e.id DESC LIMIT 1) AS last_action," ..
         "(SELECT e.reason FROM inventory_events e WHERE e.obj_id=h.obj_id " ..
@@ -2828,6 +2945,9 @@ local function loadInventoryHistoryItems(sql)
             normalizedName = row.normalized_name,
             typeName = row.type_name,
             level = tonumber(row.level),
+            isKey = tonumber(row.is_key) == 1,
+            keyClassificationKnown = row.is_key ~= nil,
+            keyTimer = tonumber(row.key_timer),
             firstSeenAt = tonumber(row.first_seen_at),
             lastSeenAt = tonumber(row.last_seen_at),
             lastAction = tonumber(row.last_action),
@@ -2881,7 +3001,7 @@ function database.getInventoryHistoryEvents(objId)
     if not ready then return nil, readyErr end
     local cursor, queryErr = query(
         "SELECT e.id,e.event_seq,e.obj_id,e.action,e.reason,e.container_id,e.wear_location," ..
-        "e.observed_at,e.session_id,c.name AS container_name " ..
+        "e.observed_at,e.session_id,c.name AS container_name,c.color_name AS container_color_name " ..
         "FROM inventory_events e LEFT JOIN inventory_history_items c ON c.obj_id=e.container_id " ..
         "WHERE e.obj_id=" .. sqlQuote(tostring(objId)) ..
         " ORDER BY e.event_seq,e.id"
@@ -2898,6 +3018,7 @@ function database.getInventoryHistoryEvents(objId)
             reason = row.reason,
             containerId = row.container_id,
             containerName = row.container_name,
+            containerColorName = row.container_color_name,
             wearLocation = row.wear_location,
             observedAt = tonumber(row.observed_at),
             sessionId = row.session_id,
@@ -2913,6 +3034,15 @@ function database.getInventoryHistoryStartedAt()
     local ready, readyErr = prepareInventoryHistoryRead()
     if not ready then return nil, readyErr end
     return tonumber(getMeta("inventory_history_started_at"))
+end
+
+
+local function repairableHistoryKeyWhere(alias)
+    local prefix = tostring(alias or "h") .. "."
+    local knownKey = "COALESCE(" .. prefix .. "is_key,0)=1"
+    local typedKey = "lower(trim(COALESCE(" .. prefix .. "type_name,'')))='key'"
+    local permanentKey = "(" .. knownKey .. " AND " .. prefix .. "key_timer<0)"
+    return "((" .. knownKey .. " OR " .. typedKey .. ") AND NOT " .. permanentKey .. ")"
 end
 
 
@@ -2937,12 +3067,43 @@ function database.getInventoryHistoryRepairStatus()
     if not cursor then return nil, queryErr end
     local row = cursor:fetch({}, "a") or {}
     closeCursor(cursor)
+
+    local keyWhere = repairableHistoryKeyWhere("h")
+    local keyItems, keyItemsErr = scalar(
+        "SELECT COUNT(*) FROM inventory_history_items h WHERE " .. keyWhere
+    )
+    if keyItems == nil then return nil, keyItemsErr end
+    local keyEvents, keyEventsErr = scalar(
+        "SELECT COUNT(*) FROM inventory_events e WHERE EXISTS (" ..
+        "SELECT 1 FROM inventory_history_items h WHERE h.obj_id=e.obj_id AND " .. keyWhere .. ")"
+    )
+    if keyEvents == nil then return nil, keyEventsErr end
+    local unclassifiedKeys, unclassifiedErr = scalar(
+        "SELECT COUNT(*) FROM inventory_history_items h WHERE " .. keyWhere ..
+        " AND (h.is_key IS NULL OR h.key_timer IS NULL)"
+    )
+    if unclassifiedKeys == nil then return nil, unclassifiedErr end
+    local expiringKeys, expiringErr = scalar(
+        "SELECT COUNT(*) FROM inventory_history_items h WHERE " .. keyWhere ..
+        " AND h.is_key=1 AND h.key_timer>=0"
+    )
+    if expiringKeys == nil then return nil, expiringErr end
+    local permanentKeys, permanentErr = scalar(
+        "SELECT COUNT(*) FROM inventory_history_items h " ..
+        "WHERE h.is_key=1 AND h.key_timer<0"
+    )
+    if permanentKeys == nil then return nil, permanentErr end
     return {
         totalEvents = tonumber(row.total_events) or 0,
         linkedEvents = tonumber(row.linked_events) or 0,
         unseededEvents = tonumber(row.unseeded_events) or 0,
         unseededFirstAt = tonumber(row.unseeded_first_at),
         unseededLastAt = tonumber(row.unseeded_last_at),
+        keyItems = tonumber(keyItems) or 0,
+        keyEvents = tonumber(keyEvents) or 0,
+        unclassifiedKeyItems = tonumber(unclassifiedKeys) or 0,
+        expiringKeyItems = tonumber(expiringKeys) or 0,
+        permanentKeyItems = tonumber(permanentKeys) or 0,
     }
 end
 
@@ -2952,6 +3113,32 @@ function database.repairInventoryHistory()
     if not ready then return false, readyErr end
     local txOk, txErr = beginTransaction()
     if not txOk then return false, txErr end
+
+    local keyWhere = repairableHistoryKeyWhere("h")
+    local keyItems = tonumber(scalar(
+        "SELECT COUNT(*) FROM inventory_history_items h WHERE " .. keyWhere
+    )) or 0
+    local keyEvents = tonumber(scalar(
+        "SELECT COUNT(*) FROM inventory_events e WHERE EXISTS (" ..
+        "SELECT 1 FROM inventory_history_items h WHERE h.obj_id=e.obj_id AND " .. keyWhere .. ")"
+    )) or 0
+    local keyEventsDeleted, keyEventErr = execute(
+        "DELETE FROM inventory_events WHERE EXISTS (" ..
+        "SELECT 1 FROM inventory_history_items h " ..
+        "WHERE h.obj_id=inventory_events.obj_id AND " .. keyWhere .. ")"
+    )
+    if not keyEventsDeleted then
+        rollback()
+        return false, keyEventErr
+    end
+    local keyItemsDeleted, keyItemErr = execute(
+        "DELETE FROM inventory_history_items WHERE obj_id IN (" ..
+        "SELECT h.obj_id FROM inventory_history_items h WHERE " .. keyWhere .. ")"
+    )
+    if not keyItemsDeleted then
+        rollback()
+        return false, keyItemErr
+    end
 
     local unseeded = tonumber(scalar([[SELECT COUNT(*) FROM inventory_events e
         WHERE NOT EXISTS (
@@ -2980,7 +3167,12 @@ function database.repairInventoryHistory()
     end
     local committed, commitErr = commit()
     if not committed then return false, commitErr end
-    return true, unseeded
+    return true, {
+        unseededEvents = unseeded,
+        keyItems = keyItems,
+        keyEvents = keyEvents,
+        totalEvents = unseeded + keyEvents,
+    }
 end
 
 
@@ -3320,4 +3512,6 @@ end
 
 database._sqlQuote = sqlQuote
 database._isConsumableType = isConsumableType
+database._inventoryHistoryKeyMetadata = inventoryHistoryKeyMetadata
+database._isTemporaryHistoryKey = isTemporaryHistoryKey
 database._templateKey = templateKey

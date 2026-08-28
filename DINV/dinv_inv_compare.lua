@@ -311,7 +311,8 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels, opts)
             return freshRetval
         end
     end
-    local analysisData = inv.analyze and inv.analyze.table and inv.analyze.table[priorityName] or nil
+    local analysisData = opts.analysisData
+        or (inv.analyze and inv.analyze.table and inv.analyze.table[priorityName] or nil)
     if not analysisData or not analysisData.levels then
         dbot.warn("Covet requires analysis data. Run 'dinv analyze create " .. priorityName .. "' first.")
         return DRL_RET_MISSING_ENTRY
@@ -324,6 +325,24 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels, opts)
     local skip = tonumber(skipLevels) or 1
     if skip < 1 then
         skip = 1
+    end
+
+    local levelsToAnalyze = nil
+    if opts.levels then
+        levelsToAnalyze = {}
+        local seenLevels = {}
+        for _, requestedLevel in ipairs(opts.levels) do
+            local normalizedLevel = tonumber(requestedLevel)
+            if normalizedLevel and not seenLevels[normalizedLevel] then
+                seenLevels[normalizedLevel] = true
+                table.insert(levelsToAnalyze, normalizedLevel)
+            end
+        end
+        table.sort(levelsToAnalyze)
+        if #levelsToAnalyze > 0 then
+            minLevel = levelsToAnalyze[1]
+            maxLevel = levelsToAnalyze[#levelsToAnalyze]
+        end
     end
 
     local targetName = inv.items.getStatField(targetId, invStatFieldName) or ("Auction #" .. tostring(targetId))
@@ -412,7 +431,14 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels, opts)
         return s .. string.rep(" ", pad)
     end
 
-    for level = minLevel, maxLevel, skip do
+    local levelSequence = levelsToAnalyze or {}
+    if not levelsToAnalyze then
+        for level = minLevel, maxLevel, skip do
+            table.insert(levelSequence, level)
+        end
+    end
+
+    for _, level in ipairs(levelSequence) do
         local entry = analysisData.levels[tostring(level)]
         if entry and entry.equipment then
             local bestDelta = nil
@@ -490,7 +516,9 @@ function inv.compare.covetAnalyze(priorityName, targetId, skipLevels, opts)
             dbot.print("  @CTarget@W: " .. tostring(targetId) .. " " .. targetAuctionLabel .. " @Y(level " .. tostring(itemLevel) .. ")@w")
         end
     end
-    dbot.print("  @CComparison source@W: analyzed equipment snapshots for priority '" .. tostring(priorityName) .. "' only")
+    local comparisonSource = opts.comparisonSource
+        or ("analyzed equipment snapshots for priority '" .. tostring(priorityName) .. "' only")
+    dbot.print("  @CComparison source@W: " .. comparisonSource)
     dbot.print("")
 
     -- Collect every objId that will appear in the output so column widths

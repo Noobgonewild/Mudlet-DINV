@@ -998,7 +998,14 @@ end
 ----------------------------------------------------------------------------------------------------
 
 function DINV.triggers.registerGMCPHandlers()
-    if registerAnonymousEventHandler then
+    if DINV.registerEventHandler then
+        DINV.registerEventHandler("triggers.char.vitals", "gmcp.char.vitals", "DINV.onGMCPCharVitals")
+        DINV.registerEventHandler("triggers.char.stats", "gmcp.char.stats", "DINV.onGMCPCharStats")
+        DINV.registerEventHandler("triggers.char.worth", "gmcp.char.worth", "DINV.onGMCPCharWorth")
+        DINV.registerEventHandler("triggers.room.info", "gmcp.room.info", "DINV.onGMCPRoomInfo")
+        DINV.registerEventHandler("triggers.comm.channel", "gmcp.comm.channel", "DINV.onGMCPCommChannel")
+    elseif registerAnonymousEventHandler then
+        -- Compatibility fallback for loading this module without the XML loader.
         registerAnonymousEventHandler("gmcp.char.vitals", "DINV.onGMCPCharVitals")
         registerAnonymousEventHandler("gmcp.char.stats", "DINV.onGMCPCharStats")
         registerAnonymousEventHandler("gmcp.char.worth", "DINV.onGMCPCharWorth")

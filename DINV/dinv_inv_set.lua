@@ -80,8 +80,93 @@ inv.set.wearLocMap = {
     hold = "hold", float = "float", above = "above", portal = "portal", sleeping = "sleeping",
 }
 
+-- Build the structural part of the equipment candidate search once, then
+-- reuse it across levels and handicap passes. Scoring and level-dependent
+-- eligibility deliberately remain in createWithHandicap().
+function inv.set.buildCandidateIndex()
+    local candidateIndex = {
+        allItems = {},
+        byId = {},
+        byLocation = {},
+        locationMembership = {},
+        weapons = {},
+        sourceTable = inv.items and inv.items.table or nil,
+        eventSequence = tonumber(inv.items and inv.items.eventSequence) or 0,
+    }
+
+    for _, loc in ipairs(inv.set.wearableLocations or {}) do
+        if loc ~= "wielded" and loc ~= "second" then
+            candidateIndex.byLocation[loc] = {}
+        end
+    end
+
+    local weaponTypeId = (inv.items and inv.items.typeId and inv.items.typeId["Weapon"]) or 5
+    for objId, item in pairs(inv.items and inv.items.table or {}) do
+        local record = { id = objId, item = item, effectMatches = {} }
+        if inv.items.getEffectTextFromStats then
+            record.effectText = inv.items.getEffectTextFromStats(item.stats or item)
+        end
+        table.insert(candidateIndex.allItems, record)
+        candidateIndex.byId[tostring(objId)] = record
+
+        local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
+        local memberships = {}
+        candidateIndex.locationMembership[objId] = memberships
+
+        for _, loc in ipairs(inv.set.wearableLocations or {}) do
+            if loc ~= "wielded" and loc ~= "second"
+                and inv.set.canWearAt(wearable, loc) then
+                memberships[loc] = true
+                table.insert(candidateIndex.byLocation[loc], record)
+            end
+        end
+
+        local typeNum = tonumber(inv.items.getStatField(objId, invStatFieldTypeNum)) or 0
+        local typeName = inv.items.getStatField(objId, invStatFieldType) or ""
+        local isWeaponType = (typeNum == weaponTypeId) or (typeName == "Weapon")
+        if inv.set.canWearAt(wearable, "wielded") or isWeaponType then
+            table.insert(candidateIndex.weapons, record)
+        end
+    end
+
+    return candidateIndex
+end
+
+function inv.set.isCandidateIndexCurrent(candidateIndex)
+    if type(candidateIndex) ~= "table" then
+        return false
+    end
+    if candidateIndex.sourceTable ~= (inv.items and inv.items.table or nil) then
+        return false
+    end
+    return (tonumber(candidateIndex.eventSequence) or 0)
+        == (tonumber(inv.items and inv.items.eventSequence) or 0)
+end
+
+function inv.set.ensureCandidateIndex(candidateIndex)
+    if inv.set.isCandidateIndexCurrent(candidateIndex) then
+        return candidateIndex
+    end
+    return inv.set.buildCandidateIndex()
+end
+
 local function itemHasEffect(objId, effectName)
     return inv.items.hasEffect and inv.items.hasEffect(objId, effectName) or false
+end
+
+local function candidateHasEffect(record, effectName)
+    if record and record.effectText ~= nil and inv.items.effectTextHas then
+        local effectKey = string.lower(tostring(effectName or "")) or ""
+        local cached = record.effectMatches and record.effectMatches[effectKey] or nil
+        if cached ~= nil then
+            return cached
+        end
+        local hasEffect = inv.items.effectTextHas(record.effectText, effectName)
+        record.effectMatches = record.effectMatches or {}
+        record.effectMatches[effectKey] = hasEffect
+        return hasEffect
+    end
+    return record and itemHasEffect(record.id, effectName) or false
 end
 
 local function itemIsHeroOnly(objId)
@@ -115,7 +200,7 @@ local function invSetResolveBaseLevel(targetLevel)
     return math.max(1, math.min(201, projectedBase))
 end
 
-function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, baseLevelOverride)
+function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, baseLevelOverride, options)
     if priorityName == nil or priorityName == "" then
         dbot.warn("inv.set.create: Missing priority name")
         return DRL_RET_INVALID_PARAM
@@ -186,6 +271,9 @@ function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, ba
         statDelta = inv.statBonus.get(targetLevel, bonusType)
     end
 
+    options = options or {}
+    local candidateIndex = inv.set.ensureCandidateIndex(options.candidateIndex)
+    local scoreContext = inv.score.createContext and inv.score.createContext(priorityName, targetLevel) or nil
     local createIntensity = intensity or inv.set.createIntensity or 1
     local handicap = { int = 0, wis = 0, luck = 0, str = 0, dex = 0, con = 0 }
     local handicapDelta = 1 / math.max(1, createIntensity)
@@ -200,7 +288,10 @@ function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, ba
             targetLevel,
             baseLevel,
             handicap,
-            iteration == 1
+            iteration == 1,
+            nil,
+            candidateIndex,
+            scoreContext
         )
 
         if score > bestScore then
@@ -234,7 +325,7 @@ function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, ba
 
     local totalScore = bestScore
     if totalScore == -999999 and equipment then
-        local setScore = inv.score.set(equipment, priorityName, targetLevel)
+        local setScore = inv.score.set(equipment, priorityName, targetLevel, scoreContext, candidateIndex)
         totalScore = setScore or 0
     end
 
@@ -260,7 +351,9 @@ function inv.set.create(priorityName, level, synchronous, intensity, isQuiet, ba
         context = inv.context and inv.context.capture and inv.context.capture() or nil,
     }
 
-    inv.set.save()
+    if options.persist ~= false then
+        inv.set.save()
+    end
 
     if not isQuiet then
         dbot.info("Equipment set created with score: @G" .. string.format("%.2f", totalScore) .. "@W")
@@ -273,7 +366,9 @@ end
 -- Create equipment set with stat handicap to avoid overmaxing
 ----------------------------------------------------------------------------------------------------
 
-function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handicap, debugEnabled)
+function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handicap, debugEnabled, excludedItems,
+                                    candidateIndex, scoreContext)
+    candidateIndex = inv.set.ensureCandidateIndex(candidateIndex)
     local equipment = {}
     local usedItems = {}
     local weaponArray = {}
@@ -284,9 +379,45 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
         end
     end
 
-    local function scoreItem(objId)
-        local score = inv.score.item(objId, priorityName, handicap, targetLevel)
+    local scoreCache = {}
+    local function scoreItemPair(objId, record)
+        local cacheKey = tostring(objId)
+        local cached = scoreCache[cacheKey]
+        if cached then
+            return cached.primary, cached.offhand
+        end
+
+        local primaryScore, offhandScore
+        if scoreContext and inv.score.itemWithContext then
+            primaryScore, offhandScore = inv.score.itemWithContext(
+                objId,
+                scoreContext,
+                handicap,
+                record and record.effectText or nil
+            )
+        else
+            primaryScore, offhandScore = inv.score.item(objId, priorityName, handicap, targetLevel)
+        end
+        cached = {
+            primary = primaryScore or 0,
+            offhand = offhandScore or 0,
+        }
+        scoreCache[cacheKey] = cached
+        return cached.primary, cached.offhand
+    end
+
+    local function scoreItem(objId, record)
+        local score = scoreItemPair(objId, record)
         return score or 0
+    end
+
+    local function isExcluded(objId)
+        if not excludedItems then
+            return false
+        end
+        return excludedItems[objId] == true
+            or excludedItems[tostring(objId)] == true
+            or (tonumber(objId) ~= nil and excludedItems[tonumber(objId)] == true)
     end
 
     local function hasHeroOnlyFlag(objId)
@@ -311,11 +442,12 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
     end
 
     local function forcedCandidateEligible(objId, item, loc)
+        if isExcluded(objId) then return false end
         if usedItems[objId] then return false end
         if inv.items.isKeyringItem and inv.items.isKeyringItem(item) then return false end
 
-        local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
-        if not inv.set.canWearAt(wearable, loc) then return false end
+        local memberships = candidateIndex.locationMembership[objId] or {}
+        if not memberships[loc] then return false end
 
         local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
         if container ~= "" and inv.config.isIgnored(container) then return false end
@@ -330,10 +462,10 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
         return true
     end
 
-    local function forcedCandidateCoverage(objId, satisfied)
+    local function forcedCandidateCoverage(record, satisfied)
         local coverage = 0
         for effectName in pairs(forcedEffectSet) do
-            if not satisfied[effectName] and itemHasEffect(objId, effectName) then
+            if not satisfied[effectName] and candidateHasEffect(record, effectName) then
                 coverage = coverage + 1
             end
         end
@@ -349,8 +481,9 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
         local scarcity = {}
         for _, effectName in ipairs(forcedEffects) do
             local candidateItems = {}
-            for objId, item in pairs(inv.items.table or {}) do
-                if itemHasEffect(objId, effectName) then
+            for _, record in ipairs(candidateIndex.allItems) do
+                local objId, item = record.id, record.item
+                if candidateHasEffect(record, effectName) then
                     for _, loc in ipairs(inv.set.wearableLocations) do
                         if loc ~= "wielded" and loc ~= "second"
                             and forcedCandidateEligible(objId, item, loc) then
@@ -371,16 +504,18 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
             local effectName = required.effect
             if not satisfiedForcedEffects[effectName] then
                 local best = nil
-                for objId, item in pairs(inv.items.table or {}) do
-                    if itemHasEffect(objId, effectName) then
+                for _, record in ipairs(candidateIndex.allItems) do
+                    local objId, item = record.id, record.item
+                    if candidateHasEffect(record, effectName) then
                         for _, loc in ipairs(inv.set.wearableLocations) do
                             if loc ~= "wielded" and loc ~= "second" and equipment[loc] == nil
                                 and forcedCandidateEligible(objId, item, loc) then
                                 local candidate = {
                                     id = objId,
                                     loc = loc,
-                                    coverage = forcedCandidateCoverage(objId, satisfiedForcedEffects),
-                                    score = scoreItem(objId),
+                                    record = record,
+                                    coverage = forcedCandidateCoverage(record, satisfiedForcedEffects),
+                                    score = scoreItem(objId, record),
                                     level = tonumber(inv.items.getStatField(objId, invStatFieldLevel)) or 0,
                                     name = inv.items.getStatField(objId, invStatFieldName) or "Unknown",
                                 }
@@ -404,7 +539,7 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
                     usedItems[best.id] = true
                     forcedLocations[best.loc] = true
                     for forcedEffect in pairs(forcedEffectSet) do
-                        if itemHasEffect(best.id, forcedEffect) then
+                        if candidateHasEffect(best.record, forcedEffect) then
                             satisfiedForcedEffects[forcedEffect] = true
                         end
                     end
@@ -436,56 +571,52 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
 
             local filteredNames = {}
 
-            for objId, item in pairs(inv.items.table or {}) do
+            for _, record in ipairs(candidateIndex.byLocation[loc] or {}) do
+                local objId, item = record.id, record.item
                 local isKeyringItem = inv.items.isKeyringItem
                     and inv.items.isKeyringItem(item)
-                if not usedItems[objId] and not isKeyringItem then
+                if not isExcluded(objId) and not usedItems[objId] and not isKeyringItem then
                     local itemName = inv.items.getStatField(objId, invStatFieldName) or "Unknown"
-                    local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
-                    local canWear = inv.set.canWearAt(wearable, loc)
+                    local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
+                    local isIgnored = container ~= "" and inv.config.isIgnored(container)
+                    if isIgnored then
+                        table.insert(filteredNames, string.format("%s [ignored container %s]", itemName, tostring(container)))
+                    else
+                        local itemLevel = tonumber(inv.items.getStatField(objId, invStatFieldLevel)) or 0
+                        local levelOk = itemLevel <= targetLevel
+                        local heroOk = heroOnlyOk(objId)
 
-                    if canWear then
-                        local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
-                        local isIgnored = container ~= "" and inv.config.isIgnored(container)
-                        if isIgnored then
-                            table.insert(filteredNames, string.format("%s [ignored container %s]", itemName, tostring(container)))
+                        local locAllowed = true
+                        if inv.priority.locIsAllowed then
+                            locAllowed = inv.priority.locIsAllowed(loc, priorityName, targetLevel)
+                        end
+
+                        if levelOk and heroOk and locAllowed then
+                            table.insert(candidateNames, itemName)
+
+                            local score = scoreItem(objId, record)
+                            debug(string.format("Phase 1: Candidate for %s -> %s (L%d) score=%.1f",
+                                  loc, itemName,
+                                  itemLevel, score or 0))
+
+                            if score > bestScore then
+                                bestScore = score
+                                bestItem = objId
+                                bestLevel = itemLevel
+                                bestName = itemName
+                            end
                         else
-                            local itemLevel = tonumber(inv.items.getStatField(objId, invStatFieldLevel)) or 0
-                            local levelOk = itemLevel <= targetLevel
-                            local heroOk = heroOnlyOk(objId)
-
-                            local locAllowed = true
-                            if inv.priority.locIsAllowed then
-                                locAllowed = inv.priority.locIsAllowed(loc, priorityName, targetLevel)
+                            local reasons = {}
+                            if not levelOk then
+                                table.insert(reasons, string.format("level %d>%d", itemLevel, targetLevel))
                             end
-
-                            if levelOk and heroOk and locAllowed then
-                                table.insert(candidateNames, itemName)
-
-                                local score = scoreItem(objId)
-                                debug(string.format("Phase 1: Candidate for %s -> %s (L%d) score=%.1f",
-                                      loc, itemName,
-                                      itemLevel, score or 0))
-
-                                if score > bestScore then
-                                    bestScore = score
-                                    bestItem = objId
-                                    bestLevel = itemLevel
-                                    bestName = itemName
-                                end
-                            else
-                                local reasons = {}
-                                if not levelOk then
-                                    table.insert(reasons, string.format("level %d>%d", itemLevel, targetLevel))
-                                end
-                                if not heroOk then
-                                    table.insert(reasons, "heroOnly gate")
-                                end
-                                if not locAllowed then
-                                    table.insert(reasons, "priority blocked")
-                                end
-                                table.insert(filteredNames, string.format("%s [%s]", itemName, table.concat(reasons, ", ")))
+                            if not heroOk then
+                                table.insert(reasons, "heroOnly gate")
                             end
+                            if not locAllowed then
+                                table.insert(reasons, "priority blocked")
+                            end
+                            table.insert(filteredNames, string.format("%s [%s]", itemName, table.concat(reasons, ", ")))
                         end
                     end
                 end
@@ -518,22 +649,16 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
 
     debug("Phase 2: Building weapon array for level " .. targetLevel)
 
-    for objId, item in pairs(inv.items.table or {}) do
+    for _, record in ipairs(candidateIndex.weapons) do
+        local objId, item = record.id, record.item
         local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
         local isIgnored = container ~= "" and inv.config.isIgnored(container)
         local isKeyringItem = inv.items.isKeyringItem
             and inv.items.isKeyringItem(item)
-        if not isIgnored and not isKeyringItem then
-            local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
+        if not isExcluded(objId) and not isIgnored and not isKeyringItem then
             local itemLevel = tonumber(inv.items.getStatField(objId, invStatFieldLevel)) or 0
-            local typeNum = tonumber(inv.items.getStatField(objId, invStatFieldTypeNum)) or 0
-            local typeName = inv.items.getStatField(objId, invStatFieldType) or ""
-            local weaponTypeId = (inv.items.typeId and inv.items.typeId["Weapon"]) or 5
-            local isWeaponType = (typeNum == weaponTypeId) or (typeName == "Weapon")
-            local canWield = inv.set.canWearAt(wearable, "wielded") or isWeaponType
-
-            if canWield and itemLevel <= targetLevel and heroOnlyOk(objId) then
-                local primaryScore, offhandScore = inv.score.item(objId, priorityName, handicap, targetLevel)
+            if itemLevel <= targetLevel and heroOnlyOk(objId) then
+                local primaryScore, offhandScore = scoreItemPair(objId, record)
                 local weight = tonumber(inv.items.getStatField(objId, invStatFieldWeight)) or 0
                 local aveDam = tonumber(inv.items.getStatField(objId, invStatFieldAveDam)) or 0
                 local name = inv.items.getStatField(objId, invStatFieldName) or "Unknown"
@@ -720,11 +845,11 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
     local scoreHold = 0
 
     if equipment.shield then
-        scoreShield = inv.score.item(equipment.shield, priorityName, handicap, targetLevel)
+        scoreShield = scoreItem(equipment.shield)
     end
 
     if equipment.hold then
-        scoreHold = inv.score.item(equipment.hold, priorityName, handicap, targetLevel)
+        scoreHold = scoreItem(equipment.hold)
     end
 
     local singleWeaponTotal = scorePrimary + scoreShield + scoreHold
@@ -759,10 +884,88 @@ function inv.set.createWithHandicap(priorityName, targetLevel, baseLevel, handic
         debug("Phase 6: SELECTED SINGLE WEAPON + HOLD")
     end
 
-    local setScore, setStats = inv.score.set(equipment, priorityName, targetLevel)
-    local rawStats = inv.set.getStats(equipment, targetLevel, false)
+    local rawStats = inv.set.getStats(equipment, targetLevel, false, candidateIndex)
+    local setScore
+    if scoreContext and inv.score.setStats then
+        setScore = inv.score.setStats(rawStats, priorityName, targetLevel, scoreContext)
+    else
+        setScore = inv.score.set(equipment, priorityName, targetLevel, scoreContext, candidateIndex)
+    end
 
     return equipment, rawStats, setScore or 0
+end
+
+----------------------------------------------------------------------------------------------------
+-- Create an in-memory equipment preview without changing or saving inv.set.table
+----------------------------------------------------------------------------------------------------
+
+function inv.set.createPreview(priorityName, level, excludedItems, intensity, baseLevelOverride)
+    if priorityName == nil or priorityName == "" then
+        dbot.warn("inv.set.createPreview: Missing priority name")
+        return nil, nil, nil, DRL_RET_INVALID_PARAM
+    end
+
+    if not inv.priority.exists(priorityName) then
+        dbot.warn("Priority '" .. priorityName .. "' does not exist")
+        return nil, nil, nil, DRL_RET_MISSING_ENTRY
+    end
+
+    local targetLevel = invSetResolveTargetLevel(level)
+    local baseLevel = tonumber(baseLevelOverride) or invSetResolveBaseLevel(targetLevel)
+    local bonusType = invStatBonusTypeAve
+    if targetLevel == invSetResolveTargetLevel(nil) then
+        bonusType = invStatBonusTypeCurrent
+    end
+
+    local statDelta = nil
+    if inv.statBonus and inv.statBonus.get then
+        statDelta = inv.statBonus.get(targetLevel, bonusType)
+    end
+
+    local candidateIndex = inv.set.buildCandidateIndex()
+    local scoreContext = inv.score.createContext and inv.score.createContext(priorityName, targetLevel) or nil
+    local createIntensity = intensity or inv.set.createIntensity or 1
+    local handicap = { int = 0, wis = 0, luck = 0, str = 0, dex = 0, con = 0 }
+    local handicapDelta = 1 / math.max(1, createIntensity)
+    local bestScore = -999999
+    local bestEquipment = nil
+    local bestStats = nil
+
+    for _ = 1, createIntensity do
+        local equipment, rawStats, score = inv.set.createWithHandicap(
+            priorityName,
+            targetLevel,
+            baseLevel,
+            handicap,
+            false,
+            excludedItems,
+            candidateIndex,
+            scoreContext
+        )
+
+        if score > bestScore then
+            bestScore = score
+            bestEquipment = equipment
+            bestStats = rawStats
+        end
+
+        local overstat = false
+        if statDelta and rawStats then
+            for statName, delta in pairs(statDelta) do
+                if rawStats[statName] ~= nil and delta ~= nil
+                    and tonumber(rawStats[statName]) > tonumber(delta) then
+                    handicap[statName] = handicap[statName] + handicapDelta
+                    overstat = true
+                end
+            end
+        end
+
+        if not overstat then
+            break
+        end
+    end
+
+    return bestEquipment or {}, bestStats, bestScore, DRL_RET_SUCCESS
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -1011,7 +1214,7 @@ end
 -- Get combined stats from an equipment set
 ----------------------------------------------------------------------------------------------------
 
-function inv.set.getStats(equipSet, level, doCap)
+function inv.set.getStats(equipSet, level, doCap, candidateIndex)
     local retval = DRL_RET_SUCCESS
 
     if equipSet == nil then
@@ -1094,8 +1297,17 @@ function inv.set.getStats(equipSet, level, doCap)
                     "detectmagic", "detectgood", "detectevil"
                 }
 
+                local candidateRecord = candidateIndex and candidateIndex.byId
+                    and candidateIndex.byId[tostring(objId)] or nil
+
                 for _, effect in ipairs(effectsList) do
-                    if itemHasEffect(objId, effect) then
+                    local hasEffect
+                    if candidateRecord then
+                        hasEffect = candidateHasEffect(candidateRecord, effect)
+                    else
+                        hasEffect = itemHasEffect(objId, effect)
+                    end
+                    if hasEffect then
                         setStats.effects[effect] = true
                     end
                 end
