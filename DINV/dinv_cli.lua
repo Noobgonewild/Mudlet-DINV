@@ -1523,6 +1523,8 @@ function inv.cli.priority.fn(name, line, wildcards)
         return inv.priority.importFromFile(name, endTag)
     elseif action == "display" then
         return inv.priority.display(name, endTag)
+    elseif action == "locate" then
+        return inv.priority.locate(name, endTag)
     elseif action == "default" then
         local retval = inv.priority.setDefault(name)
         return inv.tags.stop(invTagsPriority, endTag, retval)
@@ -1538,13 +1540,13 @@ function inv.cli.priority.fn(name, line, wildcards)
     elseif action == "list" or action == "" then
         return inv.priority.list(endTag)
     else
-        dbot.warn("Usage: dinv priority [list|display|default|status|create|delete|copy|paste|compare|export|import] [name]")
+        dbot.warn("Usage: dinv priority [list|display|locate|default|status|create|delete|copy|paste|compare|export|import] [name]")
         return DRL_RET_INVALID_PARAM
     end
 end
 function inv.cli.priority.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s", 
-               pluginNameCmd .. " priority @G[list|display|default|status|create|delete|copy|paste|compare|export|import] [name]", "Stat priorities"))
+               pluginNameCmd .. " priority @G[list|display|locate|default|status|create|delete|copy|paste|compare|export|import] [name]", "Stat priorities"))
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -2578,7 +2580,7 @@ could not be met.  Force also overrides the normal rule that ignores equipment e
 or classes can already provide.
 
 Example priority file with two level ranges:
-  @Clevels       1-50     51-291@W
+  @Clevels       1-100    101-291@W
   @Csanctuary    force    0.00@W
   @Cregeneration 100.00   force@W
 
@@ -2655,6 +2657,9 @@ Examples:
 
  12) Check the currently configured default priority and other status details.
      "@Gdinv priority status@W"
+
+ 13) Output only the editable file location for a priority.
+     "@Gdinv priority locate mage@W"
 ]])
 end
 

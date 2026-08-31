@@ -509,12 +509,26 @@ function inv.priority.create(priorityName, endTag)
         return DRL_RET_ALREADY_EXISTS
     end
 
-    -- Create new empty priority with default structure
-    local newPriority = {}
-    for _, fieldInfo in ipairs(inv.priority.allFields or {}) do
-        newPriority[fieldInfo.name] = { weight = 0, levels = {} }
+    -- Start new priorities with two broad level ranges so the editable file
+    -- makes level-specific weighting clear without being overly granular.
+    local function newEmptyField()
+        return {
+            weight = 0,
+            levels = {
+                { min = 1, max = 100, weight = 0 },
+                { min = 101, max = 291, weight = 0 },
+            },
+        }
     end
-    newPriority.effects = {}
+
+    local newPriority = { effects = {} }
+    for _, fieldInfo in ipairs(inv.priority.allFields or {}) do
+        if inv.priority.isEffect(fieldInfo.name) then
+            newPriority.effects[fieldInfo.name] = newEmptyField()
+        else
+            newPriority[fieldInfo.name] = newEmptyField()
+        end
+    end
 
     inv.priority.table[priorityName] = newPriority
     inv.priority.save()
@@ -527,17 +541,25 @@ function inv.priority.create(priorityName, endTag)
     end
     local filePath = inv.priority.getFilePath(priorityName)
 
+    -- Run the generated file through the normal import path immediately so
+    -- creation and manual import establish the same live priority state.
+    retval = inv.priority.importFromFile(priorityName, nil, true)
+    if retval ~= DRL_RET_SUCCESS then
+        if endTag then return inv.tags.stop(invTagsPriority, endTag, retval) end
+        return retval
+    end
+
     -- *** FIX: Show confirmation message like the original MUSHclient version ***
     dbot.info("Created priority \"@C" .. priorityName .. "@W\"")
 
     dbot.print("@Y================================================================================@W")
-    dbot.print("@W  Priority '@G" .. priorityName .. "@W' created and exported to:@w")
+    dbot.print("@W  Priority '@G" .. priorityName .. "@W' created, imported, and exported to:@w")
     dbot.print("@C  " .. filePath .. "@w")
     dbot.print("@Y================================================================================@W")
     dbot.print("@W  1. Open the file above in your favorite text editor@w")
     dbot.print("@W  2. Modify the stat weights as desired@w")
     dbot.print("@W  3. Save the file@w")
-    dbot.print("@W  4. Run: @Gdinv priority import " .. priorityName .. "@w")
+    dbot.print("@W  4. After future edits, run: @Gdinv priority import " .. priorityName .. "@w")
 
     if endTag then return inv.tags.stop(invTagsPriority, endTag, DRL_RET_SUCCESS) end
     return DRL_RET_SUCCESS
@@ -645,6 +667,31 @@ end
 
 function inv.priority.exists(name)
     return inv.priority.table[name] ~= nil
+end
+
+function inv.priority.locate(priorityName, endTag)
+    if priorityName == nil or priorityName == "" then
+        dbot.warn("Usage: dinv priority locate <name>")
+        if endTag then return inv.tags.stop(invTagsPriority, endTag, DRL_RET_INVALID_PARAM) end
+        return DRL_RET_INVALID_PARAM
+    end
+
+    if not inv.priority.exists(priorityName) then
+        dbot.warn("Priority '" .. priorityName .. "' does not exist")
+        if endTag then return inv.tags.stop(invTagsPriority, endTag, DRL_RET_MISSING_ENTRY) end
+        return DRL_RET_MISSING_ENTRY
+    end
+
+    local filePath = inv.priority.getFilePath(priorityName)
+    if not filePath then
+        dbot.warn("Priority location is unavailable until the character database is open")
+        if endTag then return inv.tags.stop(invTagsPriority, endTag, DRL_RET_UNINITIALIZED) end
+        return DRL_RET_UNINITIALIZED
+    end
+
+    dbot.print(filePath)
+    if endTag then return inv.tags.stop(invTagsPriority, endTag, DRL_RET_SUCCESS) end
+    return DRL_RET_SUCCESS
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -764,7 +811,7 @@ function inv.priority.display(priorityName, endTag)
     local header1 = string.format("@C%12s", priorityName)
     for _, range in ipairs(levelRanges) do
         local rangeLabel = string.format("%d-%d", range.min, range.max)
-        header1 = header1 .. string.format("@G%7s", rangeLabel)
+        header1 = header1 .. string.format("@G%8s", rangeLabel)
     end
 
     dbot.print("@W")
@@ -789,14 +836,14 @@ function inv.priority.display(priorityName, endTag)
             local line = string.format("@C%12s", fieldName)
             for _, value in ipairs(values) do
                 if value == "force" then
-                    line = line .. string.format("@M%7s", "FORCE")
+                    line = line .. string.format("@M%8s", "FORCE")
                 else
                     local color = "@g"
                     if value >= 1 then color = "@G" end
                     if value >= 10 then color = "@Y" end
                     if value >= 50 then color = "@R" end
                     if value == 0 then color = "@r" end
-                    line = line .. string.format("%s%7.2f", color, value)
+                    line = line .. string.format("%s%8.2f", color, value)
                 end
             end
             line = line .. "@W  : @c" .. fieldInfo.desc .. "@w"
@@ -1068,7 +1115,7 @@ function inv.priority.exportToFile(priorityName)
 
     local header = string.format("%-12s", "levels")
     for _, range in ipairs(levelRanges) do
-        header = header .. string.format(" %-7s", range.min .. "-" .. range.max)
+        header = header .. string.format(" %-8s", range.min .. "-" .. range.max)
     end
     file:write(header .. "\n")
 
@@ -1076,10 +1123,10 @@ function inv.priority.exportToFile(priorityName)
         local line = string.format("%-12s", fieldInfo.name)
         for _, range in ipairs(levelRanges) do
             if inv.priority.getForce(priority, fieldInfo.name, range.min) then
-                line = line .. string.format(" %-7s", "force")
+                line = line .. string.format(" %-8s", "force")
             else
                 local weight = inv.priority.getWeight(priority, fieldInfo.name, range.min)
-                line = line .. string.format(" %-7.2f", weight)
+                line = line .. string.format(" %-8.2f", weight)
             end
         end
         file:write(line .. "\n")
@@ -1090,7 +1137,7 @@ function inv.priority.exportToFile(priorityName)
     return DRL_RET_SUCCESS
 end
 
-function inv.priority.importFromFile(priorityName, endTag)
+function inv.priority.importFromFile(priorityName, endTag, skipSuccessOutput)
     if priorityName == nil or priorityName == "" then
         dbot.warn("Usage: dinv priority import <name>")
         if endTag then return inv.tags.stop(invTagsPriority, endTag, DRL_RET_INVALID_PARAM) end
@@ -1132,7 +1179,7 @@ function inv.priority.importFromFile(priorityName, endTag)
     inv.priority.table[priorityName] = priorityEntry
     inv.priority.lastImported = priorityName
     inv.priority.save()
-    inv.priority.setDefault(priorityName)
+    inv.priority.setDefault(priorityName, skipSuccessOutput)
 
     -- Invalidate any equipment set analysis based on this priority
     if inv.set and inv.set.table then
@@ -1142,19 +1189,21 @@ function inv.priority.importFromFile(priorityName, endTag)
         end
     end
 
-    -- *** FIX: Show complete success message ***
-    dbot.print("@Y================================================================================@W")
-    dbot.print("@G  SUCCESS: @WPriority '@C" .. priorityName .. "@W' imported!@w")
-    dbot.print("@Y================================================================================@W")
-    dbot.print("@W  " .. operation .. " from: @C" .. filePath .. "@w")
-    dbot.print("@W")
-    dbot.print("@W  Next steps:@w")
-    dbot.print("@W    @Gdinv priority display " .. priorityName .. "@W  - View the priority@w")
-    dbot.print("@W    @Gdinv analyze create " .. priorityName .. "@W   - Generate optimal sets@w")
-    dbot.print("@W")
+    if not skipSuccessOutput then
+        -- *** FIX: Show complete success message ***
+        dbot.print("@Y================================================================================@W")
+        dbot.print("@G  SUCCESS: @WPriority '@C" .. priorityName .. "@W' imported!@w")
+        dbot.print("@Y================================================================================@W")
+        dbot.print("@W  " .. operation .. " from: @C" .. filePath .. "@w")
+        dbot.print("@W")
+        dbot.print("@W  Next steps:@w")
+        dbot.print("@W    @Gdinv priority display " .. priorityName .. "@W  - View the priority@w")
+        dbot.print("@W    @Gdinv analyze create " .. priorityName .. "@W   - Generate optimal sets@w")
+        dbot.print("@W")
 
-    -- Also show the standard info message for scripting/automation
-    dbot.info(operation .. " priority \"@C" .. priorityName .. "@W\" from file")
+        -- Also show the standard info message for scripting/automation
+        dbot.info(operation .. " priority \"@C" .. priorityName .. "@W\" from file")
+    end
 
     if endTag then return inv.tags.stop(invTagsPriority, endTag, DRL_RET_SUCCESS) end
     return DRL_RET_SUCCESS
