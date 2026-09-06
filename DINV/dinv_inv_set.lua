@@ -1518,33 +1518,29 @@ function inv.set.wear(priorityName, level, endTag, options)
     local desiredLocsById = {}
     local removedForReequip = {}
     local removedOrStoredById = {}
+    local organizeRules = {}
+    if inv.organize and inv.organize.syncRulesFromConfig then
+        organizeRules = inv.organize.syncRulesFromConfig({ warnMissing = false, saveItems = false })
+    end
     local function isKnownWearSlotLocation(locationValue)
         return inv.items.isWearSlot(locationValue)
     end
 
     local function resolveStoreContainer(objId)
-        local function isUsableContainer(containerId)
-            local normalized = inv.items.normalizeContainerId(containerId)
-            if not normalized then
-                return nil
-            end
-
-            local containerItem = inv.items.table and inv.items.table[normalized]
-            if not containerItem then
-                return nil
-            end
-
-            local typeName = inv.items.getStatField(normalized, invStatFieldType) or ""
-            local typeNum = tonumber(inv.items.getStatField(normalized, invStatFieldTypeNum)) or 0
-            if typeName == "Container" or typeNum == 11 then
-                return normalized
-            end
-            return nil
+        if inv.organize and inv.organize.resolveDestination then
+            return inv.organize.resolveDestination(objId, organizeRules, {
+                -- Organize rules normally inspect main-inventory items after
+                -- removal. Match the outgoing set item against that resulting
+                -- state without persisting an unconfirmed expected location.
+                fieldOverrides = {
+                    [invStatFieldLocation] = invItemLocInventory,
+                    [invStatFieldContainer] = "",
+                    [invStatFieldWorn] = invItemWornNotWorn,
+                }
+            })
         end
-
-        local lastStored = inv.items.getStatField(objId, invStatFieldLastStored)
-        local configuredContainer = inv.items.getStatField(objId, invStatFieldContainer)
-        return isUsableContainer(lastStored) or isUsableContainer(configuredContainer)
+        local fallbackContainer = inv.items.resolveStoreContainer(objId)
+        return fallbackContainer, fallbackContainer and "fallback" or "inventory"
     end
 
     local function markItemInventory(objId)
@@ -1562,7 +1558,7 @@ function inv.set.wear(priorityName, level, endTag, options)
 
     local function queueStoreRemovedItem(objId, alreadyRemoved)
         local idKey = tostring(objId)
-        local containerId = resolveStoreContainer(objId)
+        local containerId, destination = resolveStoreContainer(objId)
         if not alreadyRemoved then
             table.insert(commands, "remove " .. objId)
         end
@@ -1573,8 +1569,8 @@ function inv.set.wear(priorityName, level, endTag, options)
             markItemInventory(objId)
         end
         removedOrStoredById[idKey] = true
-        wearDebug(string.format("queue store objId=%s to container=%s (alreadyRemoved=%s)",
-            idKey, tostring(containerId), tostring(alreadyRemoved == true)))
+        wearDebug(string.format("queue store objId=%s to container=%s via=%s (alreadyRemoved=%s)",
+            idKey, tostring(containerId), tostring(destination), tostring(alreadyRemoved == true)))
     end
 
     for _, loc in ipairs(inv.set.wearableLocations) do

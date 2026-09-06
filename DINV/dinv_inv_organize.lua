@@ -180,6 +180,35 @@ function inv.organize.syncRulesFromConfig(options)
     return activeRules, missingCount
 end
 
+function inv.organize.findMatchingRule(objId, rules, fieldOverrides)
+    for _, rule in ipairs(rules or {}) do
+        if inv.items.matchesParsedQuery(objId, rule.clauses, fieldOverrides) then
+            return rule
+        end
+    end
+    return nil
+end
+
+function inv.organize.resolveDestination(objId, rules, options)
+    options = options or {}
+    local rule = inv.organize.findMatchingRule(objId, rules, options.fieldOverrides)
+    if rule then
+        local containerId = tostring(rule.containerId or "")
+        local isIgnored = inv.config and inv.config.isIgnored
+            and inv.config.isIgnored(containerId) == true
+        if containerId == "" or isIgnored then
+            return nil, "rule_ignored", rule
+        end
+        return containerId, "rule", rule
+    end
+
+    local fallbackContainer = inv.items.resolveStoreContainer(objId)
+    if fallbackContainer then
+        return fallbackContainer, "fallback", nil
+    end
+    return nil, "inventory", nil
+end
+
 function inv.organize.identifyContainerIfNeeded(objId)
     if not inv.items or not inv.items.identifySingleItem then
         return DRL_RET_SUCCESS
@@ -850,13 +879,6 @@ function inv.organize.processInventory()
     local pkg = inv.organize.runPkg
     if not pkg then return end
 
-    local function isIgnoredDestination(containerId)
-        if containerId == nil then
-            return false
-        end
-        return inv.config and inv.config.isIgnored and inv.config.isIgnored(containerId) == true
-    end
-
     dbot.debug("Organize: Processing " .. #pkg.inventoryItems .. " inventory items", "organize")
 
     local ruleCount = 0
@@ -869,55 +891,33 @@ function inv.organize.processInventory()
         if item.typeNum == 11 then
             dbot.debug("Organize: Skipping container " .. item.objId, "organize")
         else
-            local didMatchRule = false
-            -- Check against each rule
-            for _, rule in ipairs(pkg.rules) do
-                local matches = inv.items.matchesParsedQuery(item.objId, rule.clauses)
-
-                if matches then
-                    dbot.debug(string.format("Organize: Item %s matches query '%s' for container %s",
-                        item.objId, rule.query, rule.containerId), "organize")
-
-                    if isIgnoredDestination(rule.containerId) then
-                        dbot.debug(string.format("Organize: Skipping rule destination for item %s because container %s is ignored",
-                            tostring(item.objId), tostring(rule.containerId)), "organize")
-                        keptCount = keptCount + 1
-                        didMatchRule = true
-                    else
-                        table.insert(pkg.pendingCommands, {
-                            itemId = item.objId,
-                            containerId = rule.containerId,
-                            itemName = item.itemName,
-                            containerName = rule.containerName,
-                            destination = "rule"
-                        })
-                        didMatchRule = true
-                        ruleCount = ruleCount + 1
-                    end
-                    break  -- Only organize to first matching container
+            local containerId, destination, rule = inv.organize.resolveDestination(item.objId, pkg.rules)
+            if destination == "rule" then
+                dbot.debug(string.format("Organize: Item %s matches query '%s' for container %s",
+                    item.objId, rule.query, rule.containerId), "organize")
+                table.insert(pkg.pendingCommands, {
+                    itemId = item.objId,
+                    containerId = containerId,
+                    itemName = item.itemName,
+                    containerName = rule.containerName,
+                    destination = "rule"
+                })
+                ruleCount = ruleCount + 1
+            elseif destination == "fallback" then
+                table.insert(pkg.pendingCommands, {
+                    itemId = item.objId,
+                    containerId = containerId,
+                    itemName = item.itemName,
+                    containerName = containerId,
+                    destination = "fallback"
+                })
+                fallbackCount = fallbackCount + 1
+            else
+                if destination == "rule_ignored" and rule then
+                    dbot.debug(string.format("Organize: Skipping rule destination for item %s because container %s is ignored",
+                        tostring(item.objId), tostring(rule.containerId)), "organize")
                 end
-            end
-
-            if not didMatchRule then
-                local fallbackContainer = inv.items.resolveStoreContainer(item.objId)
-                if fallbackContainer then
-                    if isIgnoredDestination(fallbackContainer) then
-                        dbot.debug(string.format("Organize: Skipping fallback destination for item %s because container %s is ignored",
-                            tostring(item.objId), tostring(fallbackContainer)), "organize")
-                        keptCount = keptCount + 1
-                    else
-                        table.insert(pkg.pendingCommands, {
-                            itemId = item.objId,
-                            containerId = fallbackContainer,
-                            itemName = item.itemName,
-                            containerName = fallbackContainer,
-                            destination = "fallback"
-                        })
-                        fallbackCount = fallbackCount + 1
-                    end
-                else
-                    keptCount = keptCount + 1
-                end
+                keptCount = keptCount + 1
             end
         end
     end

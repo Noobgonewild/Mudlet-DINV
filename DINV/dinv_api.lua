@@ -10,7 +10,7 @@ DINV.actions = DINV.actions or {}
 local api = DINV.api
 local actions = DINV.actions
 
-api.version = 3
+api.version = 5
 api.mode = "controlled-actions"
 actions.version = 1
 api.revision = tonumber(api.revision) or 0
@@ -27,6 +27,7 @@ local SUMMARY_FIELDS = {
     "location", "container", "lastStored", "worn", "wearable", "timer", "owner", "clan",
     "material", "weight", "worth", "score", "identifyLevel",
     "charges", "chargeKnown", "chargeDirty", "chargeSource", "chargeObservedAt", "chargeRevision",
+    "knownKeySourceRoom", "knownKeySourceArea", "knownKeyKeywordSignature", "knownKeyKnowledgeSource",
 }
 
 local FIELD_ALIASES = {
@@ -64,6 +65,10 @@ local FIELD_ALIASES = {
     chargeSource = { "chargeSource", "chargesource" },
     chargeObservedAt = { "chargeObservedAt", "chargeobservedat" },
     chargeRevision = { "chargeRevision", "chargerevision" },
+    knownKeySourceRoom = { "knownKeySourceRoom" },
+    knownKeySourceArea = { "knownKeySourceArea" },
+    knownKeyKeywordSignature = { "knownKeyKeywordSignature" },
+    knownKeyKnowledgeSource = { "knownKeyKnowledgeSource" },
     servings = { "servings" },
     liquid = { "liquid" },
     destination = { "destination" },
@@ -875,7 +880,7 @@ function api.getCapabilities()
                 "search", "getItem", "findOne", "count", "exists", "distinct", "groupBy",
                 "getEquipment", "getEquipped", "getContainer", "getContainerContents",
                 "getLocationContents", "getKeyring", "getItemLocation", "resolveContainer",
-                "getWeapons", "getWeaponDamageTypes", "getPortals", "getConsumables", "getKeys",
+                "getWeapons", "getWeaponDamageTypes", "getPortals", "getConsumables", "getKeys", "getKnownKeys",
                 "getWearableItems", "getNewItems", "findDuplicates", "getPriority",
                 "listPriorities", "scoreItem", "compareItems", "getBestItems", "getChangesSince",
                 "getStaves", "getStaveChargeState",
@@ -1437,6 +1442,26 @@ function api.getKeys(options)
         end
     end
     return result
+end
+
+function api.getKnownKeys(options)
+    options = type(options) == "table" and options or {}
+    return invoke("getKnownKeys", options, function()
+        if not DINV or not DINV.database or type(DINV.database.findKnownKeys) ~= "function" then
+            return failure("UNSUPPORTED", "Persistent key definitions are unavailable.")
+        end
+        local keys, queryErr = DINV.database.findKnownKeys(options)
+        if not keys then
+            return failure("INTERNAL_ERROR", "Unable to query persistent key definitions: " .. tostring(queryErr))
+        end
+        return success({
+            count = #keys,
+            total = #keys,
+            items = keys,
+            identityDefinition = "normalizedName+keywordSignature+sourceRoom+sourceArea",
+            keywordDefinition = "exactFullIdentifyTokenSet",
+        })
+    end)
 end
 
 function api.getWearableItems(wearLocation, options)

@@ -754,6 +754,7 @@ function inv.cli.search.fn(name, line, wildcards)
     local endTag = inv.tags.new(line)
 
     local statSpec
+    local parsedSearchClauses
     if displayMode == "stat" then
         local statError
         statSpec, statError = inv.items.parseStatSearchQuery(statQuery)
@@ -762,6 +763,7 @@ function inv.cli.search.fn(name, line, wildcards)
             dbot.info("Use '@Gdinv help search@W' for stat-search syntax and allowed fields.")
             return inv.tags.stop(invTagsSearch, endTag, DRL_RET_INVALID_PARAM)
         end
+        parsedSearchClauses = inv.items.prepareStatSearchItemClauses(statSpec, query)
     end
 
     local completedRetval
@@ -799,7 +801,9 @@ function inv.cli.search.fn(name, line, wildcards)
         return completedRetval
     end
 
-    local retval, pending = inv.items.resolveSearchQuery(query, executeResolvedSearch)
+    local retval, pending = inv.items.resolveSearchQuery(query, executeResolvedSearch, {
+        parsedClauses = parsedSearchClauses,
+    })
     if completedRetval ~= nil then
         return completedRetval
     end
@@ -995,6 +999,7 @@ function inv.cli.api.examples()
   @GDINV.api.getStaves(options)@W
   @GDINV.api.getStaveChargeState(objId, options)@W
   @GDINV.api.getKeys(options)@W
+  @GDINV.api.getKnownKeys(options)@W
   @GDINV.api.getWearableItems(wearLocation, options)@W
   @GDINV.api.getNewItems(sinceRevision, options)@W
   @GDINV.api.findDuplicates(options)@W
@@ -1036,7 +1041,17 @@ function inv.cli.api.examples()
       source = "live",
       exactKeywords = "eternal damnation small key",
       fields = {"id", "name", "keywords", "identifyLevel", "location"}
+  })@W
+
+  @Glocal knownKeys = DINV.api.getKnownKeys({
+      exactName = "a simple key",
+      sourceRoom = "12345",
+      sourceArea = "example area"
     })@W
+
+  @G-- Persistent key identity is normalized name + exact keyword signature +
+  -- acquisition room + acquisition area. A name/room/area lookup can therefore
+  -- return multiple definitions until an acquired object is identified.@W
 
   @G-- exactKeywords compares the full normalized token set and only matches
   -- fully identified isKey flags or Type Key items in any location.@W
@@ -2336,14 +2351,18 @@ in the search row, using the item's colorName and the requested stat fields.
 
 Stat mode syntax:
   @Gdinv search <item query> stat <expression> [|| stat <expression> ...]@W
+  @Gdinv search <item query> stat <expression> [|| <item query> stat <expression> ...]@W
 
 Everything before the first "stat" is the item query and applies to every chained stat expression.
-Use "|| stat" between alternative stat conditions.  The item query may be omitted to search all
-items.  A bare numeric stat matches present, non-zero values.  Comparisons support =, <, <=, >, and >=
-and require a valid number.  Single-word enchant selectors such as @Gwis@W do not need quotes;
-multiword selectors such as @G"hit roll"@W must be quoted.  An optional comparison checks the signed
-number in the matching enchant component.  The complete requested enchant field is displayed and
-reported even when a selector matched only one component.
+Use "|| stat" when alternative stat conditions share that item query.  To give an alternative its
+own item query, put it before that branch's "stat" marker.  Each branch pairs its item query and stat
+conditions with implicit AND, and "||" joins the complete branches with OR.  An item query containing
+"||" before the first "stat" remains a shared group of ordinary query alternatives.  The item query
+may be omitted to search all items.  A bare numeric stat matches present, non-zero values.  Comparisons
+support =, <, <=, >, and >= and require a valid number.  Single-word enchant selectors such as @Gwis@W
+do not need quotes; multiword selectors such as @G"hit roll"@W must be quoted.  An optional comparison
+checks the signed number in the matching enchant component.  The complete requested enchant field is
+displayed and reported even when a selector matched only one component.
 
 Allowed stat fields:
   str, int, wis, dex, con, luck, hp, mana, moves, hitroll, damroll, saves, avedam,
@@ -2414,7 +2433,10 @@ Cosmic Calling           lv150   0str  0int  0wis  0dex  0con  0luc   0hr   0dr
  11) Search one item name and chain alternative enchant conditions
      "@Gdinv search immortal providence stat solidify "hit roll" < 3 || stat illuminate wis > 3 || stat resonate@W"
 
- 12) Show average weapon damage at or above 600
+ 12) Pair each enchant-removal method with its corresponding low enchant value
+     "@Gdinv search illuminateremoval enchanter stat illuminate < 3 || resonateremoval enchanter stat resonate < 3 || solidifyremoval enchanter stat solidify < 3@W"
+
+ 13) Show average weapon damage at or above 600
      "@Gdinv search stat avedam >= 600@W"
 
 ]])

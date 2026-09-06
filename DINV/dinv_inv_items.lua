@@ -487,6 +487,7 @@ inv.items.refreshIdentifyPartials = inv.items.refreshIdentifyPartials or false
 inv.items.partialIdentifyMode = inv.items.partialIdentifyMode or false
 inv.items.identifyPartialOnly = inv.items.identifyPartialOnly or false
 inv.items.deferredIdentifyQueue = inv.items.deferredIdentifyQueue or {}
+inv.items.keyAcquisitionContexts = inv.items.keyAcquisitionContexts or {}
 inv.items.identifyReturnToKeyring = inv.items.identifyReturnToKeyring or nil
 inv.items.eventSequence = inv.items.eventSequence or 0
 inv.items.refreshGeneration = inv.items.refreshGeneration or 0
@@ -2366,7 +2367,10 @@ function inv.items.identifySingleItem(objId, source)
     inv.items.identifyCreatedMissing = inv.items.identifyCreatedMissing or {}
     inv.items.identifySawOutput = inv.items.identifySawOutput or {}
 
-    if not inv.items.getItem(normalizedObjId) then
+    local trackedItem = inv.items.getItem(normalizedObjId)
+    local trackedStats = trackedItem and trackedItem.stats or nil
+    local trackedColorName = trackedStats and trackedStats[invStatFieldColorName] or nil
+    if not trackedItem or trackedColorName == nil or tostring(trackedColorName) == "" then
         return inv.items.startIdentifyHydrateFromInvdata(normalizedObjId, source or "single-identify")
     end
 
@@ -2620,6 +2624,112 @@ function inv.items.queueKeyIdentificationIfNeeded(objId, source)
     dbot.debug("Queued full key identify objId=" .. normalizedObjId
         .. " source=" .. tostring(source), "inv.items")
     return true
+end
+
+function inv.items.captureKeyAcquisition(objId)
+    local key = tostring(objId or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if key == "" then return nil end
+    inv.items.keyAcquisitionContexts = inv.items.keyAcquisitionContexts or {}
+    if inv.items.keyAcquisitionContexts[key] then
+        return inv.items.keyAcquisitionContexts[key]
+    end
+    local gmcpApi = dbot and dbot.gmcp or {}
+    local context = {
+        roomUid = gmcpApi.getRoomId and tostring(gmcpApi.getRoomId() or "") or "",
+        area = gmcpApi.getArea and tostring(gmcpApi.getArea() or "") or "",
+        characterLevel = gmcpApi.getLevel and tonumber(gmcpApi.getLevel()) or nil,
+        acquiredAt = os.time(),
+    }
+    inv.items.keyAcquisitionContexts[key] = context
+    dbot.debug(string.format(
+        "Captured key acquisition objId=%s room=%s area=%s characterLevel=%s",
+        key, tostring(context.roomUid), tostring(context.area), tostring(context.characterLevel)
+    ), "inv.items")
+    return context
+end
+
+function inv.items.persistAcquiredKnownKey(objId)
+    local key = tostring(objId or "")
+    local context = inv.items.keyAcquisitionContexts and inv.items.keyAcquisitionContexts[key] or nil
+    local item = inv.items.getItem(key)
+    local stats = item and item.stats or nil
+    if not context or not stats or not inv.items.isKeyItem(item)
+        or tostring(stats.identifyLevel or ""):lower() ~= "full"
+        or tostring(stats[invStatFieldKeywords] or ""):gsub("%s", "") == "" then
+        return false
+    end
+    if not DINV or not DINV.database or not DINV.database.saveKnownKey then
+        return false
+    end
+
+    local definition, saveErr = DINV.database.saveKnownKey(item, context)
+    if not definition then
+        dbot.warn("Unable to persist identified key definition: " .. tostring(saveErr))
+        return false
+    end
+    stats.knownKeySourceRoom = definition.sourceRoomUid
+    stats.knownKeySourceArea = definition.sourceArea
+    stats.knownKeyKeywordSignature = definition.keywordSignature
+    stats.knownKeyKnowledgeSource = "identified-acquisition"
+    inv.items.setItem(key, item)
+    inv.items.keyAcquisitionContexts[key] = nil
+    dbot.debug("Persisted identified key definition objId=" .. key, "inv.items")
+    return true
+end
+
+function inv.items.resolveAcquiredKey(objId)
+    local key = tostring(objId or "")
+    local context = inv.items.keyAcquisitionContexts and inv.items.keyAcquisitionContexts[key] or nil
+    local item = inv.items.getItem(key)
+    local stats = item and item.stats or nil
+    if not context or not stats or not inv.items.isKeyItem(item) then return false end
+
+    if tostring(stats.identifyLevel or ""):lower() == "full"
+        and tostring(stats[invStatFieldKeywords] or ""):gsub("%s", "") ~= "" then
+        return inv.items.persistAcquiredKnownKey(key)
+    end
+
+    local definition, lookupErr, matchCount
+    if DINV and DINV.database and DINV.database.getKnownKey then
+        definition, lookupErr, matchCount = DINV.database.getKnownKey(
+            stats[invStatFieldName] or stats[invStatFieldColorName],
+            context.roomUid,
+            context.area
+        )
+    end
+    if definition then
+        stats[invStatFieldKeywords] = definition.keywords
+        stats.identifyLevel = invIdLevelFull
+        if stats[invStatFieldType] == nil or tostring(stats[invStatFieldType]) == "" then
+            stats[invStatFieldType] = definition.typeName
+        end
+        if stats[invStatFieldFlags] == nil or tostring(stats[invStatFieldFlags]) == "" then
+            stats[invStatFieldFlags] = definition.flags
+        end
+        stats.knownKeySourceRoom = definition.sourceRoomUid
+        stats.knownKeySourceArea = definition.sourceArea
+        stats.knownKeyKeywordSignature = definition.keywordSignature
+        stats.knownKeyKnowledgeSource = "catalog"
+        inv.items.setItem(key, item)
+        local saved, saveErr = DINV.database.saveKnownKey(item, context)
+        if not saved then
+            dbot.warn("Unable to update known key observation: " .. tostring(saveErr))
+            return false
+        end
+        inv.items.keyAcquisitionContexts[key] = nil
+        inv.items.scheduleSaveFromInvmon()
+        dbot.debug("Applied persisted key definition to objId=" .. key, "inv.items")
+        return true
+    end
+    if lookupErr then
+        dbot.warn("Unable to query persisted key definitions: " .. tostring(lookupErr))
+    elseif (tonumber(matchCount) or 0) > 1 then
+        dbot.debug(string.format(
+            "Acquired key objId=%s matched %d definitions; identifying to select exact keywords",
+            key, tonumber(matchCount)
+        ), "inv.items")
+    end
+    return inv.items.queueKeyIdentificationIfNeeded(key, "unknown acquired key")
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -3487,8 +3597,10 @@ startNextRelativeReference = function()
     return DRL_RET_SUCCESS
 end
 
-function inv.items.resolveSearchQuery(query, callback)
-    local clauses = copyRelativeQueryValue(inv.items.parseQuery(query or ""))
+function inv.items.resolveSearchQuery(query, callback, options)
+    options = options or {}
+    local sourceClauses = options.parsedClauses or inv.items.parseQuery(query or "")
+    local clauses = copyRelativeQueryValue(sourceClauses)
     local references = {}
     for _, criteria in ipairs(clauses) do
         for _, entry in ipairs(criteria) do
@@ -3608,6 +3720,7 @@ local function tokenizeStatSearchSegment(segment)
             break
         end
 
+        local tokenStart = index
         local quote = text:sub(index, index)
         if quote == "\"" or quote == "'" then
             index = index + 1
@@ -3630,7 +3743,12 @@ local function tokenizeStatSearchSegment(segment)
             if not closed then
                 return nil, "Unclosed quote in stat search."
             end
-            table.insert(tokens, { value = table.concat(value), quoted = true })
+            table.insert(tokens, {
+                value = table.concat(value),
+                quoted = true,
+                startIndex = tokenStart,
+                endIndex = index - 1,
+            })
         else
             local startIndex = index
             while index <= #text and not text:sub(index, index):match("%s") do
@@ -3639,6 +3757,8 @@ local function tokenizeStatSearchSegment(segment)
             table.insert(tokens, {
                 value = text:sub(startIndex, index - 1),
                 quoted = false,
+                startIndex = tokenStart,
+                endIndex = index - 1,
             })
         end
     end
@@ -3755,17 +3875,34 @@ function inv.items.parseStatSearchQuery(query)
         clauses = {},
         fields = {},
         primary = nil,
+        itemQueries = {},
     }
     local seenFields = {}
 
-    for _, segment in ipairs(segments) do
+    for segmentIndex, segment in ipairs(segments) do
         local tokens, tokenError = tokenizeStatSearchSegment(segment)
         if not tokens then
             return nil, tokenError
         end
 
-        if tokens[1] and tostring(tokens[1].value or ""):lower() == "stat" then
-            table.remove(tokens, 1)
+        local statMarkerIndex
+        for index, token in ipairs(tokens) do
+            if not token.quoted and tostring(token.value or ""):lower() == "stat" then
+                statMarkerIndex = index
+                break
+            end
+        end
+        if statMarkerIndex then
+            local marker = tokens[statMarkerIndex]
+            local itemQuery = trimStatSearchText(segment:sub(1, marker.startIndex - 1))
+            if itemQuery ~= "" then
+                spec.itemQueries[segmentIndex] = itemQuery
+            end
+            local statText = segment:sub(marker.endIndex + 1)
+            tokens, tokenError = tokenizeStatSearchSegment(statText)
+            if not tokens then
+                return nil, tokenError
+            end
         end
         if #tokens == 0 then
             return nil, "Each 'stat' marker must be followed by a stat expression."
@@ -3875,6 +4012,37 @@ function inv.items.parseStatSearchQuery(query)
     end
 
     return spec
+end
+
+function inv.items.prepareStatSearchItemClauses(spec, sharedQuery)
+    local clauses = {}
+    if type(spec) ~= "table" then
+        return clauses
+    end
+
+    spec.itemClauseIndexes = {}
+    spec.effectiveItemQueries = {}
+    local indexesByQuery = {}
+    for clauseIndex, _ in ipairs(spec.clauses or {}) do
+        local itemQuery = spec.itemQueries and spec.itemQueries[clauseIndex]
+        if itemQuery == nil then
+            itemQuery = sharedQuery or ""
+        end
+        spec.effectiveItemQueries[clauseIndex] = itemQuery
+
+        local indexes = indexesByQuery[itemQuery]
+        if not indexes then
+            indexes = {}
+            for _, criteria in ipairs(inv.items.parseQuery(itemQuery)) do
+                table.insert(clauses, criteria)
+                table.insert(indexes, #clauses)
+            end
+            indexesByQuery[itemQuery] = indexes
+        end
+        spec.itemClauseIndexes[clauseIndex] = indexes
+    end
+
+    return clauses
 end
 
 function inv.items.setItem(objId, itemData, options)
@@ -4657,6 +4825,10 @@ function inv.items.onInvitem(dataLine)
         end
     end
 
+    if result == DRL_RET_SUCCESS and objId then
+        inv.items.resolveAcquiredKey(objId)
+    end
+
     inv.items.scheduleSaveFromInvmon()
     if result == DRL_RET_SUCCESS and objId and raiseEvent then
         raiseEvent("DINV.itemObserved", tostring(objId))
@@ -4678,6 +4850,7 @@ function inv.items.onIdentify(dataLine)
                 item.stats.identifyLevel = invIdLevelFull
                 inv.items.ensureKeywordsField(item)
                 inv.items.setItem(currentId, item)
+                inv.items.persistAcquiredKnownKey(currentId)
                 if inv.items.cacheIdentifiedItem then
                     inv.items.cacheIdentifiedItem(item)
                 end
@@ -5663,9 +5836,14 @@ function inv.items.identifyNext()
         and inv.items.buildResumeItems[tostring(objId)] or nil
     local hasStagedFull = stagedResume and stagedResume.stats
         and stagedResume.stats.identifyLevel == invIdLevelFull
-    local canUseCache = hasStagedFull
+    -- An explicit one-item identify must observe this object live. Reusable
+    -- consumable templates can otherwise replace its freshly hydrated name,
+    -- including the MUD color codes supplied by invdata.
+    local canUseCache = not inv.items.singleIdentifyMode and (
+        hasStagedFull
         or not inv.items.forceIdentify
         or inv.items.isFrequentCacheType(itemType)
+    )
     if canUseCache and inv.items.applyCachedStats(item) then
         item.stats.identifyLevel = invIdLevelFull
         inv.items.setItem(objId, item)
@@ -6004,6 +6182,7 @@ function inv.items.handleIdentifyFence(fallbackObjId)
         dbot.debug("handleIdentifyFence: Marked item as identified", "inv.items")
 
         inv.items.setItem(objId, item)
+        inv.items.persistAcquiredKnownKey(objId)
         if inv.items.databaseBuildId then
             inv.items.databaseBuildIdentifiedSinceFlush =
                 (tonumber(inv.items.databaseBuildIdentifiedSinceFlush) or 0) + 1
@@ -6529,6 +6708,14 @@ function inv.items.onInvmon(dataLine)
         return DRL_RET_INVALID_PARAM
     end
 
+    if actionNum == invmonActionAddedToInv then
+        inv.items.captureKeyAcquisition(objId)
+    elseif actionNum == invmonActionRemovedFromInv or actionNum == invmonActionConsumed then
+        if inv.items.keyAcquisitionContexts then
+            inv.items.keyAcquisitionContexts[objId] = nil
+        end
+    end
+
     dbot.debug(string.format("onInvmon parsed: action=%d, objId=%s, containerId=%s, wearLoc=%s",
         actionNum, tostring(objId), tostring(containerId), tostring(wearLoc)), "inv.items")
 
@@ -6887,6 +7074,11 @@ function inv.items.onInvmon(dataLine)
 
     end
 
+
+    if actionNum == invmonActionAddedToInv then
+        inv.items.resolveAcquiredKey(objId)
+    end
+
     if forceImmediateSave and not inv.items.buildInProgress
         and not inv.items.refreshInProgress and not inv.items.identifyInProgress then
         inv.items.save()
@@ -7152,9 +7344,21 @@ local wornQueryAliases = {
     finger2 = "rfinger",
 }
 
-function inv.items.matchesWornValue(objId, value)
+function inv.items.matchesWornValue(objId, value, fieldOverrides)
     local target = tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
-    local isWorn = inv.items.isWorn(objId)
+    local wornOverride = fieldOverrides and fieldOverrides[invStatFieldWorn]
+    local worn = wornOverride ~= nil
+        and tostring(wornOverride):lower()
+        or tostring(inv.items.getStatField(objId, invStatFieldWorn) or ""):lower()
+    local isWorn
+    if wornOverride ~= nil then
+        isWorn = worn ~= "" and worn ~= tostring(invItemWornNotWorn):lower()
+            and worn ~= "undefined"
+    else
+        -- Preserve the established search behavior unless a caller explicitly
+        -- asks to evaluate a projected item state (currently set replacement).
+        isWorn = inv.items.isWorn(objId)
+    end
     if target == "" or target == "any" or target == "true"
         or target == "worn" or target == "equipped" or target == "*" then
         return isWorn
@@ -7173,7 +7377,6 @@ function inv.items.matchesWornValue(objId, value)
     end
     target = wornQueryAliases[target] or target
 
-    local worn = tostring(inv.items.getStatField(objId, invStatFieldWorn) or ""):lower()
     local group = wornQueryGroups[target]
     if group then
         return group[worn] == true
@@ -7181,17 +7384,24 @@ function inv.items.matchesWornValue(objId, value)
     return worn == target
 end
 
-function inv.items.matchesParsedQuery(objId, clauses)
+function inv.items.matchesParsedQuery(objId, clauses, fieldOverrides)
     local item = inv.items.getItem(objId)
     if not item then
         return false
     end
 
-    local itemName = inv.items.getStatField(objId, invStatFieldName) or ""
-    local itemType = inv.items.getStatField(objId, invStatFieldType) or ""
-    local level = tonumber(inv.items.getStatField(objId, invStatFieldLevel)) or 0
-    local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
-    local container = inv.items.getStatField(objId, invStatFieldContainer) or ""
+    local function getQueryField(fieldName)
+        if fieldOverrides and fieldOverrides[fieldName] ~= nil then
+            return fieldOverrides[fieldName]
+        end
+        return inv.items.getStatField(objId, fieldName)
+    end
+
+    local itemName = getQueryField(invStatFieldName) or ""
+    local itemType = getQueryField(invStatFieldType) or ""
+    local level = tonumber(getQueryField(invStatFieldLevel)) or 0
+    local wearable = getQueryField(invStatFieldWearable) or ""
+    local container = getQueryField(invStatFieldContainer) or ""
 
     for _, criteria in ipairs(clauses or {}) do
         local matchedAll = true
@@ -7212,7 +7422,7 @@ function inv.items.matchesParsedQuery(objId, clauses)
             elseif key == "wearable" then
                 match = string.find(string.lower(wearable), string.lower(value), 1, true) ~= nil
             elseif key == "keyword" or key == "keywords" then
-                local keywordsStr = inv.items.getStatField(objId, invStatFieldKeywords) or ""
+                local keywordsStr = getQueryField(invStatFieldKeywords) or ""
                 for word in tostring(keywordsStr):gmatch("%S+") do
                     word = word:gsub(",", "")
                     if string.find(string.lower(word), string.lower(value), 1, true) ~= nil then
@@ -7221,10 +7431,10 @@ function inv.items.matchesParsedQuery(objId, clauses)
                     end
                 end
             elseif key == invStatFieldLeadsTo then
-                local leadsTo = inv.items.getStatField(objId, invStatFieldLeadsTo) or ""
+                local leadsTo = getQueryField(invStatFieldLeadsTo) or ""
                 match = string.find(string.lower(leadsTo), string.lower(value), 1, true) ~= nil
             elseif key == invStatFieldMaterial then
-                local material = inv.items.getStatField(objId, invStatFieldMaterial) or ""
+                local material = getQueryField(invStatFieldMaterial) or ""
                 match = string.find(string.lower(material), string.lower(value), 1, true) ~= nil
             elseif key == "flag" or key == "flags" then
                 match = inv.items.hasSearchFlags(objId, value)
@@ -7233,7 +7443,7 @@ function inv.items.matchesParsedQuery(objId, clauses)
             elseif key == "container" then
                 match = tostring(container) == tostring(value)
             elseif key == "location" or key == "loc" then
-                local location = inv.items.getStatField(objId, invStatFieldLocation) or ""
+                local location = getQueryField(invStatFieldLocation) or ""
                 match = string.find(string.lower(tostring(location)), string.lower(tostring(value)), 1, true) ~= nil
             elseif key == "rname" then
                 local _, relVal = inv.items.convertRelative(value)
@@ -7242,10 +7452,10 @@ function inv.items.matchesParsedQuery(objId, clauses)
             elseif key == "rlocation" or key == "rloc" then
                 local _, relVal = inv.items.convertRelative(value)
                 local target = relVal or value
-                local location = inv.items.getStatField(objId, invStatFieldLocation) or ""
+                local location = getQueryField(invStatFieldLocation) or ""
                 match = string.find(string.lower(tostring(location)), string.lower(tostring(target)), 1, true) ~= nil
             elseif key == "worn" then
-                match = inv.items.matchesWornValue(objId, value)
+                match = inv.items.matchesWornValue(objId, value, fieldOverrides)
             elseif key == "minlevel" then
                 local minLevel = tonumber(value)
                 match = minLevel ~= nil and level >= minLevel
@@ -7256,7 +7466,7 @@ function inv.items.matchesParsedQuery(objId, clauses)
                 local exactLevel = tonumber(value)
                 match = exactLevel ~= nil and level == exactLevel
             elseif inv.items.isKnownQueryKey(key) then
-                local statValue = inv.items.getStatField(objId, key)
+                local statValue = getQueryField(key)
                 local lhs = tostring(statValue or ""):lower()
                 local rhs = tostring(value or ""):lower()
                 local lhsNum = tonumber(lhs)
@@ -7484,16 +7694,35 @@ local function statSearchPredicateMatches(objId, predicate)
     return false
 end
 
-function inv.items.matchesStatSearch(objId, spec)
-    for _, clause in ipairs((spec and spec.clauses) or {}) do
-        local matchedAll = true
-        for _, predicate in ipairs(clause) do
-            if not statSearchPredicateMatches(objId, predicate) then
-                matchedAll = false
-                break
-            end
+local function statSearchItemQueryMatches(objId, spec, clauseIndex, itemClauses)
+    local indexes = spec and spec.itemClauseIndexes
+        and spec.itemClauseIndexes[clauseIndex] or nil
+    if not indexes or not itemClauses then
+        return true
+    end
+
+    for _, itemClauseIndex in ipairs(indexes) do
+        local criteria = itemClauses[itemClauseIndex]
+        if criteria and inv.items.matchesParsedQuery(objId, { criteria }) then
+            return true
         end
-        if matchedAll then
+    end
+    return false
+end
+
+local function statSearchClauseMatches(objId, clause)
+    for _, predicate in ipairs(clause or {}) do
+        if not statSearchPredicateMatches(objId, predicate) then
+            return false
+        end
+    end
+    return true
+end
+
+function inv.items.matchesStatSearch(objId, spec, itemClauses)
+    for clauseIndex, clause in ipairs((spec and spec.clauses) or {}) do
+        if statSearchClauseMatches(objId, clause)
+            and statSearchItemQueryMatches(objId, spec, clauseIndex, itemClauses) then
             return true
         end
     end
@@ -7502,6 +7731,51 @@ end
 
 function inv.items.searchStats(spec, options)
     options = options or {}
+
+    if spec and spec.itemClauseIndexes and options.parsedClauses then
+        local results = {}
+        local seenIds = {}
+        local candidateCache = {}
+
+        for clauseIndex, statClause in ipairs(spec.clauses or {}) do
+            local indexes = spec.itemClauseIndexes[clauseIndex] or {}
+            local branchItemClauses = {}
+            for _, itemClauseIndex in ipairs(indexes) do
+                local criteria = options.parsedClauses[itemClauseIndex]
+                if criteria then
+                    table.insert(branchItemClauses, criteria)
+                end
+            end
+
+            local branchQuery = spec.effectiveItemQueries
+                and spec.effectiveItemQueries[clauseIndex] or options.query or ""
+            local cacheKey = table.concat(indexes, ",") .. "\0" .. tostring(branchQuery)
+            local candidates = candidateCache[cacheKey]
+            if not candidates then
+                local retval
+                candidates, retval = inv.items.search(branchQuery, nil, {
+                    parsedClauses = branchItemClauses,
+                    skipRelativeFilter = options.skipRelativeFilter,
+                    includeIgnored = options.includeIgnored,
+                })
+                if retval ~= DRL_RET_SUCCESS then
+                    return {}, retval
+                end
+                candidateCache[cacheKey] = candidates
+            end
+
+            for _, objId in ipairs(candidates or {}) do
+                local key = tostring(objId)
+                if not seenIds[key] and statSearchClauseMatches(key, statClause) then
+                    seenIds[key] = true
+                    table.insert(results, key)
+                end
+            end
+        end
+
+        return results, DRL_RET_SUCCESS
+    end
+
     local candidates, retval = inv.items.search(options.query or "", nil, options)
     if retval ~= DRL_RET_SUCCESS then
         return {}, retval
@@ -7509,7 +7783,7 @@ function inv.items.searchStats(spec, options)
 
     local results = {}
     for _, objId in ipairs(candidates or {}) do
-        if inv.items.matchesStatSearch(objId, spec) then
+        if inv.items.matchesStatSearch(objId, spec, options.parsedClauses) then
             table.insert(results, tostring(objId))
         end
     end

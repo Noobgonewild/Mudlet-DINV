@@ -8,7 +8,7 @@ DINV.database = DINV.database or {}
 
 local database = DINV.database
 
-database.schemaVersion = 6
+database.schemaVersion = 8
 database.env = database.env or nil
 database.conn = database.conn or nil
 database.isOpen = database.isOpen or false
@@ -292,6 +292,29 @@ local SCHEMA = {
         first_seen_at INTEGER NOT NULL,
         last_seen_at INTEGER NOT NULL
     )]],
+    [[CREATE TABLE IF NOT EXISTS known_keys (
+        normalized_name TEXT NOT NULL,
+        source_room_uid TEXT NOT NULL,
+        source_area_key TEXT NOT NULL,
+        source_area_name TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        keywords TEXT NOT NULL,
+        keyword_signature TEXT NOT NULL,
+        type_name TEXT,
+        flags TEXT,
+        first_item_level REAL,
+        last_item_level REAL,
+        min_item_level REAL,
+        max_item_level REAL,
+        first_character_level REAL,
+        last_character_level REAL,
+        min_character_level REAL,
+        max_character_level REAL,
+        timer REAL,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        PRIMARY KEY (normalized_name, keyword_signature, source_room_uid, source_area_key)
+    )]],
     [[CREATE TABLE IF NOT EXISTS module_state_entries (
         namespace TEXT NOT NULL,
         node_id INTEGER NOT NULL,
@@ -317,6 +340,10 @@ local SCHEMA = {
     [[CREATE INDEX IF NOT EXISTS idx_events_obj_seq ON inventory_events(obj_id, event_seq)]],
     [[CREATE INDEX IF NOT EXISTS idx_history_items_name
         ON inventory_history_items(normalized_name, obj_id)]],
+    [[CREATE INDEX IF NOT EXISTS idx_known_keys_keywords
+        ON known_keys(keyword_signature)]],
+    [[CREATE INDEX IF NOT EXISTS idx_known_keys_source
+        ON known_keys(source_area_key, source_room_uid)]],
     [[CREATE INDEX IF NOT EXISTS idx_module_state_parent
         ON module_state_entries(namespace, parent_id, ordinal)]],
 }
@@ -418,6 +445,29 @@ local function normalizeName(value)
         text = dbot.stripColors(text)
     end
     return text:lower():gsub(",", ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+end
+
+
+local function normalizeArea(value)
+    return normalizeName(value)
+end
+
+
+local function normalizeKeywordSignature(value)
+    local text = tostring(value or "")
+    if dbot and dbot.stripColors then
+        text = dbot.stripColors(text)
+    end
+    local tokens = {}
+    local seen = {}
+    for token in text:lower():gmatch("[^,%s]+") do
+        if not seen[token] then
+            seen[token] = true
+            table.insert(tokens, token)
+        end
+    end
+    table.sort(tokens)
+    return table.concat(tokens, " ")
 end
 
 
@@ -637,6 +687,74 @@ local function hardenLegacySchema()
     })
     if not historyHardened then return false, historyErr end
     return hardenInventoryEventsTable()
+end
+
+
+local function knownKeyIdentityIncludesKeywords()
+    local cursor, queryErr = query("PRAGMA table_info(known_keys)")
+    if not cursor then return nil, queryErr end
+    local includesKeywords = false
+    local row = cursor:fetch({}, "a")
+    while row do
+        if tostring(row.name) == "keyword_signature" and (tonumber(row.pk) or 0) > 0 then
+            includesKeywords = true
+        end
+        row = cursor:fetch(row, "a")
+    end
+    closeCursor(cursor)
+    return includesKeywords
+end
+
+
+local function hardenKnownKeyIdentity()
+    local includesKeywords, identityErr = knownKeyIdentityIncludesKeywords()
+    if includesKeywords == nil then return false, identityErr end
+    if includesKeywords then return true end
+
+    local droppedTemp, dropTempErr = execute("DROP TABLE IF EXISTS known_keys_v8_rebuild")
+    if not droppedTemp then return false, dropTempErr end
+    local created, createErr = execute([[CREATE TABLE known_keys_v8_rebuild (
+        normalized_name TEXT NOT NULL,
+        source_room_uid TEXT NOT NULL,
+        source_area_key TEXT NOT NULL,
+        source_area_name TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        keywords TEXT NOT NULL,
+        keyword_signature TEXT NOT NULL,
+        type_name TEXT,
+        flags TEXT,
+        first_item_level REAL,
+        last_item_level REAL,
+        min_item_level REAL,
+        max_item_level REAL,
+        first_character_level REAL,
+        last_character_level REAL,
+        min_character_level REAL,
+        max_character_level REAL,
+        timer REAL,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        PRIMARY KEY (normalized_name, keyword_signature, source_room_uid, source_area_key)
+    )]])
+    if not created then return false, createErr end
+
+    local columns = table.concat({
+        "normalized_name", "source_room_uid", "source_area_key", "source_area_name",
+        "display_name", "keywords", "keyword_signature", "type_name", "flags",
+        "first_item_level", "last_item_level", "min_item_level", "max_item_level",
+        "first_character_level", "last_character_level", "min_character_level",
+        "max_character_level", "timer", "first_seen_at", "last_seen_at",
+    }, ",")
+    local copied, copyErr = execute("INSERT OR IGNORE INTO known_keys_v8_rebuild (" ..
+        columns .. ") SELECT " .. columns .. " FROM known_keys")
+    if not copied then return false, copyErr end
+    local dropped, dropErr = execute("DROP TABLE known_keys")
+    if not dropped then return false, dropErr end
+    local renamed, renameErr = execute(
+        "ALTER TABLE known_keys_v8_rebuild RENAME TO known_keys"
+    )
+    if not renamed then return false, renameErr end
+    return true
 end
 
 
@@ -935,6 +1053,11 @@ local function ensureSchema(character)
     if not hardened then
         rollback()
         return false, "schema compatibility repair failed: " .. tostring(hardenErr)
+    end
+    local keyIdentityHardened, keyIdentityErr = hardenKnownKeyIdentity()
+    if not keyIdentityHardened then
+        rollback()
+        return false, "known key identity migration failed: " .. tostring(keyIdentityErr)
     end
     for _, statement in ipairs(SCHEMA) do
         if statement:match("^%s*CREATE INDEX") then
@@ -2904,6 +3027,180 @@ function database.getMaxEventSequence()
 end
 
 
+local function prepareKnownKeyRead()
+    if not database.isOpen then
+        local initialized, initErr = database.initialize()
+        if not initialized then return false, initErr end
+    end
+    return true
+end
+
+
+local function loadKnownKeys(sql)
+    local cursor, queryErr = query(sql)
+    if not cursor then return nil, queryErr end
+    local keys = {}
+    local row = cursor:fetch({}, "a")
+    while row do
+        table.insert(keys, {
+            normalizedName = row.normalized_name,
+            sourceRoomUid = row.source_room_uid,
+            sourceAreaKey = row.source_area_key,
+            sourceArea = row.source_area_name,
+            name = row.display_name,
+            keywords = row.keywords,
+            keywordSignature = row.keyword_signature,
+            typeName = row.type_name,
+            flags = row.flags,
+            firstItemLevel = tonumber(row.first_item_level),
+            lastItemLevel = tonumber(row.last_item_level),
+            minItemLevel = tonumber(row.min_item_level),
+            maxItemLevel = tonumber(row.max_item_level),
+            firstCharacterLevel = tonumber(row.first_character_level),
+            lastCharacterLevel = tonumber(row.last_character_level),
+            minCharacterLevel = tonumber(row.min_character_level),
+            maxCharacterLevel = tonumber(row.max_character_level),
+            timer = tonumber(row.timer),
+            firstSeenAt = tonumber(row.first_seen_at),
+            lastSeenAt = tonumber(row.last_seen_at),
+        })
+        row = cursor:fetch(row, "a")
+    end
+    closeCursor(cursor)
+    return keys
+end
+
+
+function database.findKnownKeys(options)
+    local ready, readyErr = prepareKnownKeyRead()
+    if not ready then return nil, readyErr end
+    options = type(options) == "table" and options or {}
+
+    local where = {}
+    if options.exactName ~= nil then
+        local normalizedName = normalizeName(options.exactName)
+        if normalizedName == "" then return {}, nil end
+        table.insert(where, "normalized_name=" .. sqlQuote(normalizedName))
+    end
+    if options.sourceRoom ~= nil or options.sourceRoomUid ~= nil then
+        local sourceRoom = tostring(options.sourceRoomUid or options.sourceRoom or "")
+            :gsub("^%s+", ""):gsub("%s+$", "")
+        table.insert(where, "source_room_uid=" .. sqlQuote(sourceRoom))
+    end
+    if options.sourceArea ~= nil then
+        local sourceArea = normalizeArea(options.sourceArea)
+        if sourceArea == "" then return {}, nil end
+        table.insert(where, "source_area_key=" .. sqlQuote(sourceArea))
+    end
+    if options.exactKeywords ~= nil then
+        local signature = normalizeKeywordSignature(options.exactKeywords)
+        if signature == "" then return {}, nil end
+        table.insert(where, "keyword_signature=" .. sqlQuote(signature))
+    end
+
+    local sql = "SELECT * FROM known_keys"
+    if #where > 0 then sql = sql .. " WHERE " .. table.concat(where, " AND ") end
+    sql = sql .. " ORDER BY normalized_name,source_area_key,source_room_uid,keyword_signature"
+    return loadKnownKeys(sql)
+end
+
+
+function database.getKnownKey(name, sourceRoomUid, sourceArea, exactKeywords)
+    local options = {
+        exactName = name,
+        sourceRoomUid = sourceRoomUid,
+        sourceArea = sourceArea,
+    }
+    if exactKeywords ~= nil then options.exactKeywords = exactKeywords end
+    local keys, queryErr = database.findKnownKeys(options)
+    if not keys then return nil, queryErr end
+    if #keys > 1 then
+        return nil, nil, #keys
+    end
+    return keys[1], nil, #keys
+end
+
+
+local function observedMinimum(previous, current)
+    previous, current = tonumber(previous), tonumber(current)
+    if previous == nil then return current end
+    if current == nil then return previous end
+    return math.min(previous, current)
+end
+
+
+local function observedMaximum(previous, current)
+    previous, current = tonumber(previous), tonumber(current)
+    if previous == nil then return current end
+    if current == nil then return previous end
+    return math.max(previous, current)
+end
+
+
+function database.saveKnownKey(item, acquisition)
+    local ready, readyErr = prepareKnownKeyRead()
+    if not ready then return false, readyErr end
+    local stats = item and item.stats or nil
+    acquisition = type(acquisition) == "table" and acquisition or {}
+    if not stats or tostring(stats.identifyLevel or ""):lower() ~= "full" then
+        return false, "a fully identified key is required"
+    end
+
+    local displayName = tostring(stats.name or stats.colorname or stats.colorName or "")
+    if dbot and dbot.stripColors then displayName = dbot.stripColors(displayName) end
+    displayName = displayName:gsub("^%s+", ""):gsub("%s+$", "")
+    local normalizedName = normalizeName(displayName)
+    local sourceRoomUid = tostring(acquisition.roomUid or acquisition.sourceRoomUid or "")
+        :gsub("^%s+", ""):gsub("%s+$", "")
+    local sourceAreaName = tostring(acquisition.area or acquisition.sourceArea or "")
+        :gsub("^%s+", ""):gsub("%s+$", "")
+    local sourceAreaKey = normalizeArea(sourceAreaName)
+    local keywords = tostring(stats.keywords or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local keywordSignature = normalizeKeywordSignature(keywords)
+    if normalizedName == "" or sourceRoomUid == "" or sourceRoomUid == "0"
+        or sourceAreaKey == "" or keywordSignature == "" then
+        return false, "key name, acquisition room, acquisition area, and exact keywords are required"
+    end
+
+    local existing, existingErr = database.getKnownKey(
+        displayName, sourceRoomUid, sourceAreaName, keywords
+    )
+    if existingErr then return false, existingErr end
+
+    local itemLevel = tonumber(stats.level)
+    local characterLevel = tonumber(acquisition.characterLevel)
+    local observedAt = tonumber(acquisition.acquiredAt) or now()
+    local firstSeenAt = existing and existing.firstSeenAt or observedAt
+    local firstItemLevel = existing and existing.firstItemLevel or itemLevel
+    local firstCharacterLevel = existing and existing.firstCharacterLevel or characterLevel
+    local minItemLevel = observedMinimum(existing and existing.minItemLevel, itemLevel)
+    local maxItemLevel = observedMaximum(existing and existing.maxItemLevel, itemLevel)
+    local minCharacterLevel = observedMinimum(existing and existing.minCharacterLevel, characterLevel)
+    local maxCharacterLevel = observedMaximum(existing and existing.maxCharacterLevel, characterLevel)
+
+    local columns = table.concat({
+        "normalized_name", "source_room_uid", "source_area_key", "source_area_name",
+        "display_name", "keywords", "keyword_signature", "type_name", "flags",
+        "first_item_level", "last_item_level", "min_item_level", "max_item_level",
+        "first_character_level", "last_character_level", "min_character_level",
+        "max_character_level", "timer", "first_seen_at", "last_seen_at",
+    }, ",")
+    local values = table.concat({
+        sqlQuote(normalizedName), sqlQuote(sourceRoomUid), sqlQuote(sourceAreaKey),
+        sqlQuote(sourceAreaName), sqlQuote(displayName), sqlQuote(keywords),
+        sqlQuote(keywordSignature), sqlQuote(stats.type), sqlQuote(stats.flags),
+        sqlQuote(firstItemLevel), sqlQuote(itemLevel), sqlQuote(minItemLevel),
+        sqlQuote(maxItemLevel), sqlQuote(firstCharacterLevel), sqlQuote(characterLevel),
+        sqlQuote(minCharacterLevel), sqlQuote(maxCharacterLevel), sqlQuote(tonumber(stats.timer)),
+        sqlQuote(firstSeenAt), sqlQuote(observedAt),
+    }, ",")
+    local saved, saveErr = execute("INSERT OR REPLACE INTO known_keys (" .. columns ..
+        ") VALUES (" .. values .. ")")
+    if not saved then return false, saveErr end
+    return database.getKnownKey(displayName, sourceRoomUid, sourceAreaName, keywords)
+end
+
+
 local function prepareInventoryHistoryRead()
     if not database.isOpen then
         local initialized, initErr = database.initialize()
@@ -3505,6 +3802,7 @@ function database.getStatus()
         pendingRemovedItems = tonumber(scalar("SELECT COUNT(*) FROM pending_removed_items")) or 0,
         stagedItems = tonumber(scalar("SELECT COUNT(*) FROM build_items")) or 0,
         consumableTemplates = tonumber(scalar("SELECT COUNT(*) FROM consumable_templates")) or 0,
+        knownKeys = tonumber(scalar("SELECT COUNT(*) FROM known_keys")) or 0,
         events = tonumber(scalar("SELECT COUNT(*) FROM inventory_events")) or 0,
         moduleNamespaces = tonumber(scalar("SELECT COUNT(DISTINCT namespace) FROM module_state_entries")) or 0,
     }
@@ -3515,3 +3813,4 @@ database._isConsumableType = isConsumableType
 database._inventoryHistoryKeyMetadata = inventoryHistoryKeyMetadata
 database._isTemporaryHistoryKey = isTemporaryHistoryKey
 database._templateKey = templateKey
+database._normalizeKeywordSignature = normalizeKeywordSignature

@@ -546,7 +546,7 @@ inv.state = invStateIdle
 
 inv.version = {}
 inv.version.pluginMajor = 2
-inv.version.pluginMinor = 65
+inv.version.pluginMinor = 69
 inv.version.full = inv.version.pluginMajor + (inv.version.pluginMinor / 10000)
 
 inv.version.table = {

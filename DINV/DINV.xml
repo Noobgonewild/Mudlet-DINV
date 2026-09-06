@@ -16,7 +16,7 @@
 ----------------------------------------------------------------------------------------------------
 
 DINV = DINV or {}
-DINV.version = { major = 2, minor = 65 }
+DINV.version = { major = 2, minor = 69 }
 
 -- Get the Mudlet profile directory for module loading
 local profilePath = getMudletHomeDir()
