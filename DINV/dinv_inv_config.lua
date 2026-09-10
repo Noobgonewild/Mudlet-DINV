@@ -23,8 +23,13 @@ local configDefaults = {
     
     -- Regen ring settings
     isRegenEnabled = false,
+    regenHpThreshold = 80,
     regenOrigObjId = 0,
     regenNewObjId = 0,
+    regenPinnedObjId = 0,
+    regenHomeContainer = 0,
+    regenPreWorn = false,
+    regenDisplacedLoc = "",
     
     -- Prompt tracking
     isPromptEnabled = true,
@@ -74,11 +79,6 @@ function inv.config.init.atActive()
        inv.config.table.isPromptEnabled ~= dbot.prompt.isEnabled then
         dbot.info("Prompt state does not match expected state: toggling prompt")
         send("prompt")
-    end
-    
-    -- Initialize regen module if available
-    if inv.regen and inv.regen.init then
-        inv.regen.init()
     end
     
     return retval
@@ -192,6 +192,15 @@ end
 
 function inv.config.setRegenEnabled(enabled)
     return inv.config.set("isRegenEnabled", enabled == true)
+end
+
+function inv.config.getRegenHpThreshold()
+    return tonumber(inv.config.get("regenHpThreshold")) or 80
+end
+
+function inv.config.setRegenHpThreshold(threshold)
+    local val = tonumber(threshold) or 80
+    return inv.config.set("regenHpThreshold", val)
 end
 
 function inv.config.getReportChannel()

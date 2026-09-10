@@ -10,12 +10,14 @@
 ----------------------------------------------------------------------------------------------------
 
 DINV = DINV or {}
-DINV.version = "2.0069"
 DINV.name = "Durel's Inventory Manager"
 
 -- Determine the path to the DINV directory
 -- Mudlet stores scripts in getMudletHomeDir()
 DINV.path = getMudletHomeDir() .. "/DINV/"
+
+-- Load centralized version definition if available
+pcall(dofile, DINV.path .. "dinv_version.lua")
 
 -- Plugin identifiers (kept for compatibility)
 pluginNameCmd = "dinv"
@@ -31,6 +33,7 @@ pluginStatePath = getMudletHomeDir() .. "/dinv-" .. pluginId .. "/"
 ----------------------------------------------------------------------------------------------------
 
 DINV.modules = {
+    "dinv_version",
     -- Core utilities (DBOT) - MUST be loaded first
     "dinv_dbot",
     "dinv_notify",

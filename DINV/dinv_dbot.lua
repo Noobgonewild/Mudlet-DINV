@@ -30,6 +30,8 @@ DRL_RET_UNIDENTIFIED   = -9
 DRL_RET_NOT_ACTIVE     = -10
 DRL_RET_IN_COMBAT      = -11
 DRL_RET_VER_MISMATCH   = -12
+DRL_RET_ALREADY_EXISTS = -13
+DRL_RET_NOT_SUPPORTED  = DRL_RET_UNSUPPORTED
 
 ----------------------------------------------------------------------------------------------------
 -- Base Module
@@ -58,6 +60,7 @@ dbot.retval.table[DRL_RET_UNIDENTIFIED]   = "item is not yet identified"
 dbot.retval.table[DRL_RET_NOT_ACTIVE]     = "you are not in the active state"
 dbot.retval.table[DRL_RET_IN_COMBAT]      = "you are in combat!"
 dbot.retval.table[DRL_RET_VER_MISMATCH]   = "version mismatch"
+dbot.retval.table[DRL_RET_ALREADY_EXISTS] = "entry already exists"
 
 function dbot.retval.getString(retval)
     local str = dbot.retval.table[retval]
@@ -2307,11 +2310,12 @@ dbot.version.changelog = {}
 dbot.version.update = {}
 
 function dbot.version.display()
-    local version = DINV.version or "unknown"
-    if type(version) == "table" then
-        version = string.format("%d.%04d", tonumber(version.major) or 0, tonumber(version.minor) or 0)
+    if inv and inv.version and inv.version.display then
+        return inv.version.display()
     end
-    dbot.print("@WDINV Version: @G" .. tostring(version))
+    local version = tostring(DINV.version or "unknown")
+    dbot.print("@WDINV Version: @G" .. version)
+    return DRL_RET_SUCCESS
 end
 
 ----------------------------------------------------------------------------------------------------

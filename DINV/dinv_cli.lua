@@ -931,7 +931,7 @@ function inv.cli.api.examples()
   Other Mudlet scripts can call @GDINV.api@W directly. API calls return Lua values
   silently: they do not print search results or errors in the main window.
 
-  API version: @G3@W
+  API version: @G]] .. tostring(DINV.api and DINV.api.version or "unknown") .. [[@W
   API namespace: @GDINV.api@W
   Mode: @Gcontrolled-actions@W
 
@@ -2160,20 +2160,43 @@ function inv.cli.regen.fn(name, line, wildcards)
     local action = wildcards and wildcards[1] or ""
     
     if action == "on" then
-        inv.config.setRegenEnabled(true)
-        dbot.info("Regen ring auto-swap enabled")
+        if inv.regen and inv.regen.enable then
+            return inv.regen.enable()
+        else
+            inv.config.setRegenEnabled(true)
+            dbot.info("Regen ring auto-swap enabled")
+        end
     elseif action == "off" then
-        inv.config.setRegenEnabled(false)
-        dbot.info("Regen ring auto-swap disabled")
+        if inv.regen and inv.regen.disable then
+            return inv.regen.disable()
+        else
+            inv.config.setRegenEnabled(false)
+            dbot.info("Regen ring auto-swap disabled")
+        end
     else
-        local status = inv.config.isRegenEnabled() and "enabled" or "disabled"
-        dbot.info("Regen ring auto-swap is " .. status)
+        local isEnabled = inv.config.isRegenEnabled()
+        local status = isEnabled and "@Genabled@W" or "@Rdisabled@W"
+        local pinnedId = tostring(inv.config.table.regenPinnedObjId or inv.config.table.regenNewObjId or 0)
+        local detail = ""
+        if isEnabled and pinnedId ~= "0" and pinnedId ~= "" then
+            local colorName = (inv.regen and inv.regen.getColorName and inv.regen.getColorName(pinnedId))
+                or (inv.items and inv.items.getStatField and inv.items.getStatField(pinnedId, "colorname"))
+                or (inv.items and inv.items.getStatField and inv.items.getStatField(pinnedId, invStatFieldName))
+                or ("item " .. pinnedId)
+            local isPreWorn = inv.config.table.regenPreWorn == true
+            local modeStr = isPreWorn and "pre-worn" or "in inventory"
+            local threshold = (inv.config and inv.config.getRegenHpThreshold and inv.config.getRegenHpThreshold())
+                or (inv.config and inv.config.get and tonumber(inv.config.get("regenHpThreshold")))
+                or 80
+            detail = string.format(" (%s@W [@Y%s@W] - %s, HP < %d%%)", colorName, pinnedId, modeStr, threshold)
+        end
+        dbot.info(string.format("Regen ring auto-swap is %s%s", status, detail))
     end
     return DRL_RET_SUCCESS
 end
 function inv.cli.regen.usage()
     dbot.printRaw(string.format("@W    %-50s @w- %s", 
-               pluginNameCmd .. " regen @G[on|off]", "Auto regen ring when sleeping"))
+               pluginNameCmd .. " regen @G[on|off]", "Auto regen ring before server tick"))
 end
 
 ----------------------------------------------------------------------------------------------------

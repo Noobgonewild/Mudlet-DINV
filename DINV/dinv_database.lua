@@ -1695,6 +1695,12 @@ local function loadTableItems(tableName, statsTableName, requestedObjId)
         local item = result[tostring(row.obj_id)]
         if item then
             item.stats[row.stat_key] = decodeValue(row)
+            if row.stat_key == "custom_keywords" and row.text_value then
+                item.keywords = item.keywords or {}
+                for kw in tostring(row.text_value):gmatch("%S+") do
+                    item.keywords[kw:lower()] = true
+                end
+            end
         end
         row = cursor:fetch(row, "a")
     end
@@ -3627,8 +3633,14 @@ local function criterionSql(entry, statsTableName)
         else
             valueCondition = containsSql(statValueExpression("sv"), value)
         end
+        local keyCondition
+        if key == "keyword" or key == "keywords" then
+            keyCondition = "(lower(sv.stat_key)='keywords' OR lower(sv.stat_key)='custom_keywords')"
+        else
+            keyCondition = "lower(sv.stat_key)=" .. sqlQuote(key)
+        end
         condition = "EXISTS(SELECT 1 FROM " .. statsTableName .. " sv WHERE sv.obj_id=i.obj_id " ..
-            "AND lower(sv.stat_key)=" .. sqlQuote(key) .. " AND " .. valueCondition .. ")"
+            "AND " .. keyCondition .. " AND " .. valueCondition .. ")"
     end
     if entry.negated then
         return "NOT(" .. condition .. ")"

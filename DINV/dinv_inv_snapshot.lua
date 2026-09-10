@@ -87,17 +87,17 @@ function inv.snapshot.delete(name, endTag)
     end
     if inv.snapshot.table[name] == nil then
         dbot.warn("Snapshot '" .. name .. "' does not exist")
-        return DRL_RET_MISSING_ENTRY
+        return inv.tags.stop(invTagsSnapshot, endTag, DRL_RET_MISSING_ENTRY)
     end
     local previous = inv.snapshot.table[name]
     inv.snapshot.table[name] = nil
     local saveRet = inv.snapshot.save()
     if saveRet ~= DRL_RET_SUCCESS then
         inv.snapshot.table[name] = previous
-        return saveRet
+        return inv.tags.stop(invTagsSnapshot, endTag, saveRet)
     end
     dbot.info("Deleted snapshot '" .. name .. "'")
-    return DRL_RET_SUCCESS
+    return inv.tags.stop(invTagsSnapshot, endTag, DRL_RET_SUCCESS)
 end
 
 function inv.snapshot.list(endTag)
@@ -111,7 +111,7 @@ function inv.snapshot.list(endTag)
     if count == 0 then
         dbot.print("  @Y(none)@w")
     end
-    return DRL_RET_SUCCESS
+    return inv.tags.stop(invTagsSnapshot, endTag, DRL_RET_SUCCESS)
 end
 
 function inv.snapshot.display(name, endTag)
@@ -121,7 +121,7 @@ function inv.snapshot.display(name, endTag)
     end
     if inv.snapshot.table[name] == nil then
         dbot.warn("Snapshot '" .. name .. "' does not exist")
-        return DRL_RET_MISSING_ENTRY
+        return inv.tags.stop(invTagsSnapshot, endTag, DRL_RET_MISSING_ENTRY)
     end
     dbot.print("@WSnapshot: @G" .. name .. "@w")
     local equipment = inv.snapshot.table[name].equipment or {}
@@ -143,7 +143,7 @@ function inv.snapshot.wear(name, endTag)
     end
     if inv.snapshot.table[name] == nil then
         dbot.warn("Snapshot '" .. name .. "' does not exist")
-        return DRL_RET_MISSING_ENTRY
+        return inv.tags.stop(invTagsSnapshot, endTag, DRL_RET_MISSING_ENTRY)
     end
     dbot.info("Wearing snapshot '" .. name .. "'")
     local equipment = inv.snapshot.table[name].equipment or {}
@@ -158,22 +158,43 @@ function inv.snapshot.wear(name, endTag)
         return nil
     end
 
+    local desiredItems = {}
+    local slotsToChange = {}
     for wearLoc, objId in pairs(equipment) do
         local objIdStr = tostring(objId)
-        local currentlyWorn = inv.items.getStatField(objIdStr, invStatFieldWorn) or ""
-        local removedId = findWornAt(wearLoc)
+        desiredItems[objIdStr] = wearLoc
+        local currentWornLoc = inv.items.getStatField(objIdStr, invStatFieldWorn) or ""
+        if currentWornLoc ~= wearLoc then
+            table.insert(slotsToChange, { loc = wearLoc, id = objIdStr })
+        end
+    end
 
-        if currentlyWorn ~= wearLoc then
-            local location = inv.items.getStatField(objIdStr, invStatFieldLocation) or ""
-            if not inv.items.isWorn(objIdStr) and location ~= "" and location ~= "inventory" then
-                inv.items.get("id " .. objIdStr)
+    local removedOccupants = {}
+    for _, slot in ipairs(slotsToChange) do
+        local occupantId = findWornAt(slot.loc)
+        if occupantId and occupantId ~= slot.id and not removedOccupants[occupantId] then
+            removedOccupants[occupantId] = true
+            if desiredItems[occupantId] then
+                inv.items.removeWornItem(occupantId)
+            else
+                inv.items.store("id " .. occupantId)
             end
-            inv.items.wearItem(objIdStr, wearLoc)
         end
 
-        if removedId and removedId ~= objIdStr then
-            inv.items.store("id " .. removedId)
+        local currentLoc = inv.items.getStatField(slot.id, invStatFieldWorn) or ""
+        if currentLoc ~= "" and currentLoc ~= "not-worn" and currentLoc ~= "undefined"
+            and not removedOccupants[slot.id] then
+            removedOccupants[slot.id] = true
+            inv.items.removeWornItem(slot.id)
         end
+    end
+
+    for _, slot in ipairs(slotsToChange) do
+        local location = inv.items.getStatField(slot.id, invStatFieldLocation) or ""
+        if not inv.items.isWorn(slot.id) and location ~= "" and location ~= "inventory" then
+            inv.items.get("id " .. slot.id)
+        end
+        inv.items.wearItem(slot.id, slot.loc)
     end
     return inv.tags.stop(invTagsSnapshot, endTag, DRL_RET_SUCCESS)
 end

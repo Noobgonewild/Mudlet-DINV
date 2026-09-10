@@ -302,6 +302,7 @@ invTagsUnused    = "unused"
 invTagsKeyword   = "keyword"
 invTagsReset     = "reset"
 invTagsDiscover  = "discover"
+invTagsPass      = "pass"
 
 ----------------------------------------------------------------------------------------------------
 -- Base Inventory Module
@@ -544,52 +545,43 @@ inv.state = invStateIdle
 -- Version Information
 ----------------------------------------------------------------------------------------------------
 
-inv.version = {}
-inv.version.pluginMajor = 2
-inv.version.pluginMinor = 69
-inv.version.full = inv.version.pluginMajor + (inv.version.pluginMinor / 10000)
+DINV = DINV or {}
+inv = inv or {}
+inv.version = DINV.version or {}
 
-inv.version.table = {
-    pluginVer      = { major = inv.version.pluginMajor, minor = inv.version.pluginMinor },
-    tableFormat    = { major = 0, minor = 1 },
-    cacheFormat    = { major = 0, minor = 1 },
-    consumeFormat  = { major = 0, minor = 1 },
-    priorityFormat = { major = 0, minor = 2 },
-    setFormat      = { major = 0, minor = 1 },
-    snapshotFormat = { major = 0, minor = 1 }
-}
+setmetatable(inv.version, {
+    __index = function(t, k)
+        if k == "pluginMajor" then return t.major end
+        if k == "pluginMinor" then return t.minor end
+        if k == "full" then
+            local maj = tonumber(t.major) or 0
+            local min = tonumber(t.minor) or 0
+            return maj + (min / 10000)
+        end
+        return nil
+    end,
+    __tostring = function(t)
+        return string.format("%d.%04d", tonumber(t.major) or 0, tonumber(t.minor) or 0)
+    end,
+    __concat = function(a, b)
+        return tostring(a) .. tostring(b)
+    end,
+})
 
 function inv.version.get()
-    return inv.version.table
+    local maj = tonumber(inv.version.major) or 0
+    local min = tonumber(inv.version.minor) or 0
+    return {
+        pluginVer = { major = maj, minor = min }
+    }
 end
 
 function inv.version.display()
-    dbot.print("\n  @y" .. pluginNameAbbr .. "  Aardwolf Plugin\n" ..
+    local verStr = tostring(DINV.version or "unknown")
+    local apiVer = tostring(DINV.api and DINV.api.version or "unknown")
+    dbot.print("\n  @y" .. (pluginNameAbbr or "DINV") .. "  Aardwolf Plugin\n" ..
                "-------------------------@w")
-    dbot.print("@WPlugin Version:    @G" ..
-               string.format("%01d", inv.version.table.pluginVer.major) .. "." ..
-               string.format("%04d", inv.version.table.pluginVer.minor) .. "@w")
-    dbot.print("")
-    dbot.print("@WInv. Table Format: @G" ..
-               inv.version.table.tableFormat.major .. "." ..
-               inv.version.table.tableFormat.minor .. "@w")
-    dbot.print("@WInv. Cache Format: @G" ..
-               inv.version.table.cacheFormat.major .. "." ..
-               inv.version.table.cacheFormat.minor .. "@w")
-    dbot.print("@WConsumable Format: @G" ..
-               inv.version.table.consumeFormat.major .. "." ..
-               inv.version.table.consumeFormat.minor .. "@w")
-    dbot.print("@WPriorities Format: @G" ..
-               inv.version.table.priorityFormat.major .. "." ..
-               inv.version.table.priorityFormat.minor .. "@w")
-    dbot.print("@WEquip Set Format:  @G" ..
-               inv.version.table.setFormat.major .. "." ..
-               inv.version.table.setFormat.minor .. "@w")
-    dbot.print("@WSnapshot Format:   @G" ..
-               inv.version.table.snapshotFormat.major .. "." ..
-               inv.version.table.snapshotFormat.minor .. "@w")
-    dbot.print("")
-    
+    dbot.print("@WVersion:        @G" .. verStr .. "@w  (@WAPI v@G" .. apiVer .. "@w)\n")
     return DRL_RET_SUCCESS
 end
 
@@ -716,10 +708,23 @@ function inv.init.atActiveDirect()
                 end
             end
         end
+
+        -- Regen depends on both persisted config and inventory items, so initialize
+        -- it only after every regular inventory module has loaded its active state.
+        if retval == DRL_RET_SUCCESS and inv.regen and inv.regen.init then
+            local regenVal = inv.regen.init()
+            if regenVal ~= DRL_RET_SUCCESS then
+                dbot.warn("inv.init.atActiveDirect: Failed to initialize inv.regen module: " ..
+                          dbot.retval.getString(regenVal))
+                retval = regenVal
+            else
+                dbot.debug("Initialized 'at active' module inv.regen", "inv.core")
+            end
+        end
         
         if retval == DRL_RET_SUCCESS then
             inv.init.initializedActive = true
-            local fullVer = string.format("%d.%04d", inv.version.pluginMajor, inv.version.pluginMinor)
+            local fullVer = tostring(DINV.version or "unknown")
             dbot.info("Plugin version " .. fullVer .. " is fully initialized")
             
             -- Kick off initial refresh if enabled

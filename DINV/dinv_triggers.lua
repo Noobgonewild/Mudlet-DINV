@@ -755,7 +755,7 @@ function inv.items.parseIdentifyLine(item, line)
         ["tot weight"] = { field = invStatFieldTotWeight, additive = false },
         ["item burden"] = { field = invStatFieldItemBurden, additive = false },
         ["heaviest item"] = { field = invStatFieldHeaviestItem, additive = false },
-        ["weight reduction"] = { field = invStatFieldWeightReduction, additive = false },
+        ["weight reduction"] = { field = invStatFieldReducedBy, additive = false },
         -- Stat mods (ADDITIVE - enchants add to base)
         ["hit roll"] = { field = invStatFieldHitroll, additive = true },
         ["damage roll"] = { field = invStatFieldDamroll, additive = true },
@@ -993,6 +993,12 @@ function DINV.onGMCPCommChannel()
     end
 end
 
+function DINV.onGMCPCommTick()
+    if inv and inv.regen and inv.regen.onServerTick then
+        inv.regen.onServerTick()
+    end
+end
+
 ----------------------------------------------------------------------------------------------------
 -- Register GMCP Event Handlers
 ----------------------------------------------------------------------------------------------------
@@ -1004,6 +1010,7 @@ function DINV.triggers.registerGMCPHandlers()
         DINV.registerEventHandler("triggers.char.worth", "gmcp.char.worth", "DINV.onGMCPCharWorth")
         DINV.registerEventHandler("triggers.room.info", "gmcp.room.info", "DINV.onGMCPRoomInfo")
         DINV.registerEventHandler("triggers.comm.channel", "gmcp.comm.channel", "DINV.onGMCPCommChannel")
+        DINV.registerEventHandler("triggers.comm.tick", "gmcp.comm.tick", "DINV.onGMCPCommTick")
     elseif registerAnonymousEventHandler then
         -- Compatibility fallback for loading this module without the XML loader.
         registerAnonymousEventHandler("gmcp.char.vitals", "DINV.onGMCPCharVitals")
@@ -1011,6 +1018,7 @@ function DINV.triggers.registerGMCPHandlers()
         registerAnonymousEventHandler("gmcp.char.worth", "DINV.onGMCPCharWorth")
         registerAnonymousEventHandler("gmcp.room.info", "DINV.onGMCPRoomInfo")
         registerAnonymousEventHandler("gmcp.comm.channel", "DINV.onGMCPCommChannel")
+        registerAnonymousEventHandler("gmcp.comm.tick", "DINV.onGMCPCommTick")
     end
     
     return DRL_RET_SUCCESS

@@ -337,6 +337,12 @@ function inv.score.item(objId, priorityName, handicap, level)
     end
 
     if priorityName == nil or priorityName == "" then
+        if inv.priority and inv.priority.getDefault then
+            priorityName = inv.priority.getDefault()
+        end
+    end
+
+    if priorityName == nil or priorityName == "" then
         dbot.warn("inv.score.item: Missing priorityName")
         return 0, 0, DRL_RET_INVALID_PARAM
     end
@@ -362,6 +368,12 @@ end
 function inv.score.extended(itemStats, priorityName, handicap, level, isOffhand)
     if itemStats == nil then
         return 0, DRL_RET_INVALID_PARAM
+    end
+
+    if priorityName == nil or priorityName == "" then
+        if inv.priority and inv.priority.getDefault then
+            priorityName = inv.priority.getDefault()
+        end
     end
 
     if priorityName == nil or priorityName == "" then

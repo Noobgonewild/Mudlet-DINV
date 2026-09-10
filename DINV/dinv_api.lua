@@ -868,7 +868,7 @@ function api.getVersion()
     return {
         apiVersion = api.version,
         mode = api.mode,
-        dinvVersion = DINV.version,
+        dinvVersion = tostring(DINV.version),
     }
 end
 

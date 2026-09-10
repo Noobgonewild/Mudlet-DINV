@@ -6,6 +6,41 @@
 inv.usage = {}
 inv.usage.analysisJob = nil
 
+function inv.usage.isPotentialEquipment(objId)
+    local itemType = tostring(inv.items.getStatField(objId, invStatFieldType) or "")
+    if itemType == "Armor" or itemType == "Weapon" or itemType == "Light" then
+        return true
+    end
+
+    local wearable = tostring(inv.items.getStatField(objId, invStatFieldWearable) or "")
+    return wearable ~= ""
+        and wearable ~= "undefined"
+        and wearable ~= "unknown"
+        and itemType ~= "Potion"
+        and itemType ~= "Pill"
+        and itemType ~= "Food"
+        and not (itemType == "Treasure" and wearable == "hold")
+end
+
+function inv.usage.isEquipmentCandidate(objId)
+    local wearable = inv.items.getStatField(objId, invStatFieldWearable)
+    local itemType = tostring(inv.items.getStatField(objId, invStatFieldType) or "")
+    return wearable ~= nil
+        and wearable ~= ""
+        and wearable ~= "undefined"
+        and wearable ~= "unknown"
+        and itemType ~= "Potion"
+        and itemType ~= "Pill"
+        and itemType ~= "Food"
+        and not (itemType == "Treasure" and tostring(wearable) == "hold")
+end
+
+function inv.usage.warnIncompleteItem(objId)
+    local itemName = tostring(inv.items.getStatField(objId, invStatFieldName) or "Unknown")
+    dbot.warn("Skipping partially identified item " .. tostring(objId) .. " (" ..
+        itemName .. "). Run 'dinv identify " .. tostring(objId) .. "' first.")
+end
+
 function inv.usage.display(priorityName, query, endTag)
     dbot.info("Displaying usage for priority '" .. priorityName .. "'")
     if priorityName == nil or priorityName == "" then
@@ -13,11 +48,16 @@ function inv.usage.display(priorityName, query, endTag)
         return inv.tags.stop(invTagsUsage, endTag, DRL_RET_INVALID_PARAM)
     end
 
-    local normalizedQuery = tostring(query or ""):gsub("^%s+", ""):gsub("%s+$", "")
-    if normalizedQuery:match("^%d+$") then
+    local normalizedQuery = tostring(query or "")
+    normalizedQuery = select(1, string.gsub(normalizedQuery, "^%s+", ""))
+    normalizedQuery = select(1, string.gsub(normalizedQuery, "%s+$", ""))
+    local directItemId = string.match(normalizedQuery, "^(%d+)$")
+        or string.match(normalizedQuery, "^id:(%d+)$")
+        or string.match(normalizedQuery, "^id%s+(%d+)$")
+    if string.match(normalizedQuery, "^%d+$") then
         normalizedQuery = "id " .. normalizedQuery
-    elseif normalizedQuery:match("^id:%d+$") then
-        normalizedQuery = normalizedQuery:gsub("^id:", "id ")
+    elseif string.match(normalizedQuery, "^id:%d+$") then
+        normalizedQuery = select(1, string.gsub(normalizedQuery, "^id:", "id "))
     end
 
     local itemIds, retval = inv.items.search(normalizedQuery)
@@ -28,6 +68,25 @@ function inv.usage.display(priorityName, query, endTag)
     if #itemIds == 0 then
         dbot.info("No items matching '" .. (query or "") .. "' found.")
         return inv.tags.stop(invTagsUsage, endTag, DRL_RET_MISSING_ENTRY)
+    end
+
+    local eligibleItemIds = {}
+    for _, objId in ipairs(itemIds) do
+        local isPotentialEquipment = inv.usage.isPotentialEquipment(objId)
+        local isDirectItem = directItemId ~= nil and tostring(objId) == directItemId
+        if isPotentialEquipment or isDirectItem then
+            local identifyLevel = inv.items.getStatField(objId, "identifyLevel")
+            if identifyLevel ~= invIdLevelFull then
+                inv.usage.warnIncompleteItem(objId)
+            elseif isPotentialEquipment and inv.usage.isEquipmentCandidate(objId) then
+                table.insert(eligibleItemIds, objId)
+            end
+        end
+    end
+    itemIds = eligibleItemIds
+
+    if #itemIds == 0 then
+        return inv.tags.stop(invTagsUsage, endTag, DRL_RET_SUCCESS)
     end
 
     local priorities = {}
@@ -58,19 +117,9 @@ function inv.usage.display(priorityName, query, endTag)
         })
 
         for _, objId in ipairs(itemIds) do
-            local wearableField = inv.items.getStatField(objId, invStatFieldWearable)
-            local typeField = inv.items.getStatField(objId, invStatFieldType)
-
-            if wearableField and wearableField ~= "" and wearableField ~= "undefined"
-                and tostring(typeField) ~= "Potion"
-                and tostring(typeField) ~= "Pill"
-                and tostring(typeField) ~= "Food"
-                and not (tostring(typeField) == "Treasure" and tostring(wearableField) == "hold") then
-
-                for _, prio in ipairs(priorities) do
-                    local doDisplayUnused = (priorityName ~= "allUsed")
-                    inv.usage.displayItem(prio, objId, doDisplayUnused)
-                end
+            for _, prio in ipairs(priorities) do
+                local doDisplayUnused = (priorityName ~= "allUsed")
+                inv.usage.displayItem(prio, objId, doDisplayUnused)
             end
         end
 

@@ -648,7 +648,7 @@ function inv.consume.removeType(typeName)
     inv.consume.table[normalizedType] = nil
     inv.consume.save()
     inv.consume.notifyWindowChanged()
-    dbot.note('Removed consumable type "' .. normalizedType .. '"')
+    dbot.info('Removed consumable type "' .. normalizedType .. '"')
     return DRL_RET_SUCCESS
 end
 
@@ -672,10 +672,7 @@ function inv.consume.remove(typeName, itemName)
         end
 
         if targetName == "" then
-            inv.consume.table[targetType] = nil
-            inv.consume.save()
-            inv.consume.notifyWindowChanged()
-            return DRL_RET_SUCCESS
+            return inv.consume.removeType(targetType)
         end
 
         for i, entry in ipairs(inv.consume.table[targetType]) do

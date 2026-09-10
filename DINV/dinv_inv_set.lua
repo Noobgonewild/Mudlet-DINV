@@ -102,30 +102,33 @@ function inv.set.buildCandidateIndex()
 
     local weaponTypeId = (inv.items and inv.items.typeId and inv.items.typeId["Weapon"]) or 5
     for objId, item in pairs(inv.items and inv.items.table or {}) do
-        local record = { id = objId, item = item, effectMatches = {} }
-        if inv.items.getEffectTextFromStats then
-            record.effectText = inv.items.getEffectTextFromStats(item.stats or item)
-        end
-        table.insert(candidateIndex.allItems, record)
-        candidateIndex.byId[tostring(objId)] = record
-
-        local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
-        local memberships = {}
-        candidateIndex.locationMembership[objId] = memberships
-
-        for _, loc in ipairs(inv.set.wearableLocations or {}) do
-            if loc ~= "wielded" and loc ~= "second"
-                and inv.set.canWearAt(wearable, loc) then
-                memberships[loc] = true
-                table.insert(candidateIndex.byLocation[loc], record)
+        local identifyLevel = inv.items.getStatField(objId, "identifyLevel")
+        if identifyLevel == invIdLevelFull then
+            local record = { id = objId, item = item, effectMatches = {} }
+            if inv.items.getEffectTextFromStats then
+                record.effectText = inv.items.getEffectTextFromStats(item.stats or item)
             end
-        end
+            table.insert(candidateIndex.allItems, record)
+            candidateIndex.byId[tostring(objId)] = record
 
-        local typeNum = tonumber(inv.items.getStatField(objId, invStatFieldTypeNum)) or 0
-        local typeName = inv.items.getStatField(objId, invStatFieldType) or ""
-        local isWeaponType = (typeNum == weaponTypeId) or (typeName == "Weapon")
-        if inv.set.canWearAt(wearable, "wielded") or isWeaponType then
-            table.insert(candidateIndex.weapons, record)
+            local wearable = inv.items.getStatField(objId, invStatFieldWearable) or ""
+            local memberships = {}
+            candidateIndex.locationMembership[objId] = memberships
+
+            for _, loc in ipairs(inv.set.wearableLocations or {}) do
+                if loc ~= "wielded" and loc ~= "second"
+                    and inv.set.canWearAt(wearable, loc) then
+                    memberships[loc] = true
+                    table.insert(candidateIndex.byLocation[loc], record)
+                end
+            end
+
+            local typeNum = tonumber(inv.items.getStatField(objId, invStatFieldTypeNum)) or 0
+            local typeName = inv.items.getStatField(objId, invStatFieldType) or ""
+            local isWeaponType = (typeNum == weaponTypeId) or (typeName == "Weapon")
+            if inv.set.canWearAt(wearable, "wielded") or isWeaponType then
+                table.insert(candidateIndex.weapons, record)
+            end
         end
     end
 

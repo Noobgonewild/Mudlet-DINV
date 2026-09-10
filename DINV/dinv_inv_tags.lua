@@ -32,13 +32,14 @@ invTagsConsume   = invTagsConsume or "consume"
 invTagsPortal    = invTagsPortal or "portal"
 invTagsVersion   = invTagsVersion or "version"
 invTagsUnused    = invTagsUnused or "unused"
+invTagsPass      = invTagsPass or "pass"
 
 inv.tags.modules = table.concat({
     invTagsBuild, invTagsRefresh, invTagsIdentify, invTagsSearch, invTagsGet, invTagsPut,
     invTagsStore, invTagsKeyword, invTagsOrganize, invTagsSet, invTagsSnapshot,
     invTagsWeapon, invTagsPriority, invTagsAnalyze, invTagsUsage, invTagsCompare,
     invTagsCovet, invTagsBackup, invTagsReset, invTagsConsume, invTagsPortal,
-    invTagsVersion, invTagsUnused
+    invTagsVersion, invTagsUnused, invTagsPass
 }, " ")
 
 drlInvTagOn      = "on"

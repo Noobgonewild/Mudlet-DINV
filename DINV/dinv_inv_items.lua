@@ -1962,7 +1962,9 @@ function inv.items.refresh(delay, refreshLoc, endTag, callback)
     -- Try to auto-initialize if not already done
     if not inv.init.initializedActive then
         local initStart = dbot.perfNow and dbot.perfNow() or nil
-        inv.items.ensureInitialized()
+        if inv.init and inv.init.atActive then
+            inv.init.atActive()
+        end
         dbot.perf("refresh ensureInitialized", initStart)
     end
     
@@ -7090,6 +7092,13 @@ function inv.items.onInvmon(dataLine)
         inv.operations.observe(actionNum, objId, containerId, wearLoc)
     end
 
+    if inv.regen and inv.regen.onInvmon then
+        local regenOk, regenErr = pcall(inv.regen.onInvmon, actionNum, objId, wearLoc)
+        if not regenOk then
+            dbot.warn("Regen invmon handler failed: " .. tostring(regenErr))
+        end
+    end
+
     if DINV and DINV.api and DINV.api._onInventoryAction then
         pcall(DINV.api._onInventoryAction, objId, actionName, {
             previousLocation = preLocation,
@@ -7428,6 +7437,25 @@ function inv.items.matchesParsedQuery(objId, clauses, fieldOverrides)
                     if string.find(string.lower(word), string.lower(value), 1, true) ~= nil then
                         match = true
                         break
+                    end
+                end
+                if not match then
+                    local targetKw = string.lower(tostring(value))
+                    if item.keywords then
+                        for kw, enabled in pairs(item.keywords) do
+                            if enabled and (kw == targetKw or string.find(kw, targetKw, 1, true)) then
+                                match = true
+                                break
+                            end
+                        end
+                    end
+                    if not match and item.stats and item.stats.custom_keywords then
+                        for word in tostring(item.stats.custom_keywords):gmatch("%S+") do
+                            if string.find(string.lower(word), targetKw, 1, true) then
+                                match = true
+                                break
+                            end
+                        end
                     end
                 end
             elseif key == invStatFieldLeadsTo then
