@@ -2,8 +2,6 @@
 
 DINV ported from MUSHclient to Mudlet, featuring numerous enhancements, SQLite database backing, and full priority equipment set management. (Love you, Durel! We all know it and love it!)
 
-Public Repository: [Noobgonewild/Mudlet-DINV](https://github.com/Noobgonewild/Mudlet-DINV)
-
 ---
 
 ## Key Highlights
@@ -22,7 +20,7 @@ Public Repository: [Noobgonewild/Mudlet-DINV](https://github.com/Noobgonewild/Mu
 
 ### Step 1: Download the Package
 
-Download [`DINV.mpackage`](https://raw.githubusercontent.com/Noobgonewild/Mudlet-DINV/main/DINV.mpackage) from [Noobgonewild/Mudlet-DINV](https://github.com/Noobgonewild/Mudlet-DINV) to anywhere on your system (e.g., your browser's default `Downloads` folder).
+Download [`DINV.mpackage`](https://raw.githubusercontent.com/Noobgonewild/Mudlet-DINV/main/DINV.mpackage) to anywhere on your computer (such as your `Downloads` folder or Desktop).
 
 > [!TIP]
 > Do not unzip the `.mpackage` file. Mudlet installs it directly as a self-contained package.
@@ -158,39 +156,10 @@ lua openMudletHomeDir()
 
 ---
 
-## Manual / Developer Setup (From Source)
-
-If you are cloning or modifying the source repository directly rather than installing `DINV.mpackage`:
-
-```text
-<Mudlet profile directory>/
-├── dinv-database/
-│   └── <CharacterName>/
-│       └── current/dinv.db
-└── DINV/
-    ├── DINV.xml
-    ├── dinv_version.lua
-    ├── dinv_aliases.lua
-    ├── dinv_cli.lua
-    ├── dinv_database.lua
-    └── ...all other dinv_*.lua files
-```
-
-1. Clone or extract the repository.
-2. Place the `DINV` folder directly into your active Mudlet profile directory (`lua openMudletHomeDir()`).
-3. In Mudlet, open **Package Manager** (`Alt+O`) and install `<profile>/DINV/DINV.xml`.
-
-> [!WARNING]
-> The folder name must be exactly **`DINV`** (all caps). The loader relies on this exact casing to load modules on Linux and macOS.
-
----
-
 ## Troubleshooting
 
 ### Installation warning: "DINV was not loaded"
-This indicates that Mudlet could not locate the required Lua modules:
-- If you installed via `DINV.mpackage`, reinstall the package through **Package Manager** (`Alt+O`).
-- If you installed from source, verify that the folder is named exactly `DINV` (all uppercase) and sits directly inside `<profile>/DINV/`.
+This indicates that Mudlet could not locate the required Lua modules. Reinstall `DINV.mpackage` through **Package Manager** (`Alt+O`) and save your profile.
 
 ### No items appear in searches
 Run `dinv build` while connected to Aardwolf. DINV populates its database by querying your worn equipment, inventory, and carried containers.
@@ -256,8 +225,9 @@ Most informational messages can be adjusted with `dinv notify`. As always, use a
 
 ## Useful References
 
-- [Noobgonewild/Mudlet-DINV GitHub Repository](https://github.com/Noobgonewild/Mudlet-DINV)
 - [Mudlet Package Manager Documentation](https://wiki.mudlet.org/w/Manual%3APackage_Manager)
 - [Mudlet File Locations](https://wiki.mudlet.org/w/Mudlet_File_Locations)
+- [MMapper and S&D Repository](https://github.com/Noobgonewild/Mapper-and-S-D)
+- [Mudlet Scripts Repository](https://github.com/Noobgonewild/Mudlet-scripts)
 - [MCheck Addon Index](https://raw.githubusercontent.com/Noobgonewild/Mudlet-scripts/main/mcheck-index.json)
 
