@@ -8,7 +8,9 @@ DINV ported from MUSHclient to Mudlet, featuring numerous enhancements, SQLite d
 
 > [!NOTE]
 > **Download anywhere, install from anywhere!**
-> You can download `DINV.mpackage` to **any folder on your computer** (such as your `Downloads` folder or Desktop). There is **no need** to move the file into your Mudlet directory before installing, and you do **not** need to unzip or extract it. Mudlet handles package extraction and setup automatically.
+> You can download `DINV.mpackage` to **any folder on your computer** (such as your `Downloads` folder or Desktop). There is **no need** to move the file into your Mudlet directory before installing.
+> - If you download `DINV.mpackage` directly, you do **not** need to extract it; Mudlet handles package installation automatically.
+> - If you downloaded the repository archive via GitHub's **`Code` > `Download ZIP`**, **unzip / extract** that ZIP archive first on your computer to reveal `DINV.mpackage` inside. Do **not** import the repository ZIP file itself into Mudlet.
 
 > [!IMPORTANT]
 > **Your Mudlet profile does not have to be named `Aardwolf`.**
@@ -20,10 +22,14 @@ DINV ported from MUSHclient to Mudlet, featuring numerous enhancements, SQLite d
 
 ### Step 1: Download the Package
 
-Download [`DINV.mpackage`](https://raw.githubusercontent.com/Noobgonewild/Mudlet-DINV/main/DINV.mpackage) to anywhere on your computer (such as your `Downloads` folder or Desktop).
+You can obtain the package in either of two ways:
 
-> [!TIP]
-> Do not unzip the `.mpackage` file. Mudlet installs it directly as a self-contained package.
+- **Direct Download (Recommended):** Download [`DINV.mpackage`](https://raw.githubusercontent.com/Noobgonewild/Mudlet-DINV/main/DINV.mpackage) directly to anywhere on your computer (such as your `Downloads` folder or Desktop).
+- **GitHub ZIP (`Code` > `Download ZIP`):** If you downloaded the repository as a ZIP archive (`Mudlet-DINV-main.zip`), **unzip / extract** the archive first. `DINV.mpackage` is located inside the extracted folder.
+
+> [!IMPORTANT]
+> **Do not import the repository ZIP file into Mudlet.** Mudlet only installs `.mpackage` files.
+> Once you have `DINV.mpackage`, do **not** unzip or extract the `.mpackage` file itself — Mudlet installs it directly.
 
 ---
 
